@@ -1,0 +1,18 @@
+{
+  "task.received": "Task received. Parsing requirements.",
+  "task.routed": "Task routed to {agent}.",
+  "task.completed.success": "Task completed successfully. The requested {taskType} has been completed and the final deliverable is attached.",
+  "task.completed.partial": "Task completed with limitations. See the notes section for details.",
+  "task.failed": "Task could not be completed reliably. Reason: {reason}",
+  "task.unable_to_verify": "Unable to verify.",
+  "qa.validation.passed": "Validation completed. Final quality score: {score}/100.",
+  "qa.validation.failed": "Validation failed. Quality score {score}/100 is below the required threshold of {threshold}.",
+  "manager.approved": "Task approved for submission.",
+  "manager.rework_required": "Task returned for rework. Reason: {reason}",
+  "agent.status.started": "{agent}: Work started on task {taskId}.",
+  "agent.status.completed": "{agent}: Work completed on task {taskId}.",
+  "translation.completed": "Translation completed. Deliverable rendered in {locale}.",
+  "error.invalid_input": "The provided input does not meet the requirements for this task type.",
+  "error.unsupported_task": "This task type is not currently supported by any available agent.",
+  "error.internal": "An internal error occurred while processing this task. The team has been notified."
+}
