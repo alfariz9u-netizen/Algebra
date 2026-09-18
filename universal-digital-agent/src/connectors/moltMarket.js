@@ -14,11 +14,9 @@ class MoltMarketConnector {
     this.baseUrl = baseUrl.replace(/\/$/, "");
   }
 
+  // ✅ FIX: The framework expects a STRING status, not an object.
   status() {
-    if (!this.apiKey) {
-      return { connector: "moltMarket", status: "CREDENTIAL_REQUIRED", detail: "MOLTMARKET_API_KEY is not set." };
-    }
-    return { connector: "moltMarket", status: "CONNECTED", detail: `baseUrl=${this.baseUrl}` };
+    return process.env.MOLTMARKET_API_KEY ? "CONNECTED" : "CREDENTIAL_REQUIRED";
   }
 
   async _request(method, path, { body, query } = {}) {
@@ -40,7 +38,11 @@ class MoltMarketConnector {
     });
     const text = await res.text();
     let data;
-    try { data = text ? JSON.parse(text) : null; } catch { data = { raw: text }; }
+    try {
+      data = text ? JSON.parse(text) : null;
+    } catch {
+      data = { raw: text };
+    }
     if (!res.ok) {
       const err = new Error(`MoltMarket API ${method} ${path} failed: ${res.status} ${res.statusText}`);
       err.status = res.status;
@@ -50,15 +52,27 @@ class MoltMarketConnector {
     return data;
   }
 
-  async checkHealth() { return this._request("GET", "/api/health"); }
-  async browseOffers({ status = "active" } = {}) { return this._request("GET", "/api/offers", { query: { status } }); }
-  async browseJobs({ status = "open" } = {}) { return this._request("GET", "/api/jobs", { query: { status } }); }
-  async getJob(jobId) { return this._request("GET", `/api/jobs/${encodeURIComponent(jobId)}`); }
+  async checkHealth() {
+    return this._request("GET", "/api/health");
+  }
+  async browseOffers({ status = "active" } = {}) {
+    return this._request("GET", "/api/offers", { query: { status } });
+  }
+  async browseJobs({ status = "open" } = {}) {
+    return this._request("GET", "/api/jobs", { query: { status } });
+  }
+  async getJob(jobId) {
+    return this._request("GET", `/api/jobs/${encodeURIComponent(jobId)}`);
+  }
   async publishOffer({ title, description, priceUsdc, category } = {}) {
-    return this._request("POST", "/api/offers", { body: { title, description, price_usdc: priceUsdc, category } });
+    return this._request("POST", "/api/offers", {
+      body: { title, description, price_usdc: priceUsdc, category },
+    });
   }
   async createJob({ title, description, budgetUsdc } = {}) {
-    return this._request("POST", "/api/jobs", { body: { title, description, budget_usdc: budgetUsdc } });
+    return this._request("POST", "/api/jobs", {
+      body: { title, description, budget_usdc: budgetUsdc },
+    });
   }
   async bidOnJob(jobId, { amountUsdc, message, estimatedHours } = {}) {
     return this._request("POST", `/api/jobs/${encodeURIComponent(jobId)}/bids`, {
@@ -66,12 +80,16 @@ class MoltMarketConnector {
     });
   }
   async deliverWork(jobId, { content, attachments } = {}) {
-    return this._request("POST", `/api/jobs/${encodeURIComponent(jobId)}/deliveries`, { body: { content, attachments } });
+    return this._request("POST", `/api/jobs/${encodeURIComponent(jobId)}/deliveries`, {
+      body: { content, attachments },
+    });
   }
   async approveDelivery(jobId) {
     return this._request("POST", `/api/jobs/${encodeURIComponent(jobId)}/approve`);
   }
-  async getMyNotifications() { return this._request("GET", "/api/me/notifications"); }
+  async getMyNotifications() {
+    return this._request("GET", "/api/me/notifications");
+  }
 }
 
 module.exports = MoltMarketConnector;
