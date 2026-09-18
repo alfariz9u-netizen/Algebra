@@ -44,6 +44,12 @@ const ApprovalQueue = require("./core/approvalQueue");
 const UniversalAgent = require("./core/universalAgent");
 const { redact } = require("./core/auditLog");
 const { JsonFileStore } = require("./core/persistence/fileStore");
+// buildAgent() is the SAME agent construction used by the CLI (index.js) —
+// it registers all real connectors (Colony, GitHub, OpenTask, MoltMarket,
+// MCP, A2A). Using it here (instead of a bare `new UniversalAgent()`) is
+// what lets this always-on bot actually see connector status and perform
+// real connector calls, not just manage the approval queue.
+const { buildAgent } = require("./index");
 
 const TELEGRAM_API = "https://api.telegram.org";
 const MAX_PREVIEW_CHARS = 500;
@@ -145,7 +151,7 @@ class TelegramApprovalBot {
   }
 
   _freshAgent() {
-    return new UniversalAgent({ persistDir: this.persistDir, encryptionKey: this.encryptionKey });
+    return buildAgent();
   }
 
   // -- Outbound: notify allowed chats about newly pending approvals -------
@@ -205,7 +211,9 @@ class TelegramApprovalBot {
         chatId,
         "Universal Digital Agent — approval bot.\n\n" +
           "/status — dashboard summary\n" +
-          "/pending — list and re-send buttons for pending approvals\n\n" +
+          "/pending — list and re-send buttons for pending approvals\n" +
+          "/log — last 10 real connector actions (what the agent actually did)\n" +
+          "/colony <text> — make the agent search The Colony right now, live\n\n" +
           "You'll also get a message automatically whenever a new approval is needed."
       );
       return;
@@ -225,6 +233,52 @@ class TelegramApprovalBot {
       }
       for (const record of pending) {
         await this._send(chatId, this._formatApprovalMessage(record), { reply_markup: APPROVE_DENY_KEYBOARD(record.id) });
+      }
+      return;
+    }
+
+    if (text === "/log") {
+      const agent = this._freshAgent();
+      const entries = agent.audit.all().slice(-10).reverse();
+      if (entries.length === 0) {
+        await this._send(
+          chatId,
+          "No audit entries yet — the agent hasn't performed any connector actions. " +
+            "Try /colony <search text> to make it do something real."
+        );
+        return;
+      }
+      const lines = entries.map((e) => {
+        const when = new Date(e.timestamp || Date.now()).toISOString().replace("T", " ").slice(0, 19);
+        return `${when} — <b>${escapeHtml(e.connector || e.action || "?")}</b> ${escapeHtml(e.action || "")} → ${escapeHtml(e.result || "?")}${e.error ? ` (${escapeHtml(e.error)})` : ""}`;
+      });
+      await this._send(chatId, `Last ${entries.length} audit entries:\n\n` + lines.join("\n"));
+      return;
+    }
+
+    if (text.startsWith("/colony ") || text === "/colony") {
+      const query = text.slice("/colony".length).trim();
+      if (!query) {
+        await this._send(chatId, "Usage: /colony <search text>");
+        return;
+      }
+      const agent = this._freshAgent();
+      try {
+        const colony = agent.connectors.get("colony");
+        const data = await agent.callConnector("colony", "searchPosts", "colony.searchPosts", () =>
+          colony.searchPosts(query, { limit: 5 })
+        );
+        const posts = Array.isArray(data?.results) ? data.results : Array.isArray(data) ? data : [];
+        if (posts.length === 0) {
+          await this._send(chatId, `Searched The Colony for "${escapeHtml(query)}" — no results. (Logged to /log.)`);
+          return;
+        }
+        const lines = posts
+          .slice(0, 5)
+          .map((p, i) => `${i + 1}. ${escapeHtml(p.title || p.body?.slice(0, 80) || "(untitled)")}`);
+        await this._send(chatId, `Found ${posts.length} result(s) on The Colony:\n\n` + lines.join("\n") + "\n\n(Logged to /log.)");
+      } catch (err) {
+        await this._send(chatId, `Colony search failed: ${escapeHtml(err.message)}\n\n(Logged to /log.)`);
       }
       return;
     }
