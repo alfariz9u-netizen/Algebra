@@ -49,7 +49,18 @@ const { JsonFileStore } = require("./core/persistence/fileStore");
 // MCP, A2A). Using it here (instead of a bare `new UniversalAgent()`) is
 // what lets this always-on bot actually see connector status and perform
 // real connector calls, not just manage the approval queue.
-const { buildAgent } = require("./index");
+const { buildAgent, MarketplacePipeline } = require("./index");
+const openTaskStrategy = require("./core/strategies/openTask");
+const moltMarketStrategy = require("./core/strategies/moltMarket");
+
+const PIPELINE_STRATEGIES = {
+  opentask: openTaskStrategy,
+  moltmarket: moltMarketStrategy,
+};
+const PIPELINE_STRATEGIES_BY_CONNECTOR = {
+  openTask: openTaskStrategy,
+  moltMarket: moltMarketStrategy,
+};
 
 const TELEGRAM_API = "https://api.telegram.org";
 const MAX_PREVIEW_CHARS = 500;
@@ -213,7 +224,11 @@ class TelegramApprovalBot {
           "/status — dashboard summary\n" +
           "/pending — list and re-send buttons for pending approvals\n" +
           "/log — last 10 real connector actions (what the agent actually did)\n" +
-          "/colony <text> — make the agent search The Colony right now, live\n\n" +
+          "/colony <text> — make the agent search The Colony right now, live\n" +
+          "/opentask — discover open OpenTask.ai tasks and draft a proposal for the best one\n" +
+          "/moltmarket — discover open Molt Market jobs and draft a bid for the best one\n\n" +
+          "Drafted proposals need your approval (/pending) before they're actually sent — " +
+          "approving one automatically submits it to the real platform.\n\n" +
           "You'll also get a message automatically whenever a new approval is needed."
       );
       return;
@@ -283,6 +298,40 @@ class TelegramApprovalBot {
       return;
     }
 
+    for (const [cmdName, strategy] of Object.entries(PIPELINE_STRATEGIES)) {
+      if (text === `/${cmdName}`) {
+        const agent = this._freshAgent();
+        const pipeline = new MarketplacePipeline(agent);
+        await this._send(chatId, `Searching ${strategy.connectorName} for open opportunities...`);
+        try {
+          const cycle = await pipeline.runCycle(strategy, { maxOpportunities: 1 });
+          if (cycle.status === "pending_human_approval") {
+            await this._send(chatId, `Even browsing ${strategy.connectorName} needs approval at the current autonomy level. Check /pending.`);
+            return;
+          }
+          let msg = `<b>${strategy.connectorName}</b>: discovered ${cycle.discovered}, worth pursuing ${cycle.accepted}, skipped (low value) ${cycle.rejected}.`;
+          for (const r of cycle.results) {
+            if (r.outcome?.status === "pending_human_approval") {
+              msg += `\n\nDrafted a proposal for opportunity <code>${escapeHtml(String(r.opportunity.id))}</code> — needs your approval before it's sent. Check /pending.`;
+            } else if (r.outcome?.status === "success" && r.submission) {
+              msg += `\n\n✅ Submitted a bid on <code>${escapeHtml(String(r.opportunity.id))}</code>.`;
+            } else if (r.outcome?.status === "success") {
+              msg += `\n\nDrafted but not yet submitted (needs approval). Check /pending.`;
+            } else {
+              msg += `\n\n⚠️ Opportunity <code>${escapeHtml(String(r.opportunity.id))}</code>: ${escapeHtml(r.outcome?.reason || "failed")}.`;
+            }
+          }
+          if (cycle.results.length === 0) {
+            msg += "\n\nNothing met the minimum expected value to pursue right now.";
+          }
+          await this._send(chatId, msg);
+        } catch (err) {
+          await this._send(chatId, `${strategy.connectorName} cycle failed: ${escapeHtml(err.message)}`);
+        }
+        return;
+      }
+    }
+
     await this._send(chatId, "Unknown command. Try /help.");
   }
 
@@ -348,11 +397,41 @@ class TelegramApprovalBot {
     }
 
     try {
-      const result = await this._freshAgent().resumeTask(approvalId);
+      const agent = this._freshAgent();
+      const result = await agent.resumeTask(approvalId);
       const outcome = result.output
         ? `output: <code>${escapeHtml(String(result.output).slice(0, MAX_PREVIEW_CHARS))}</code>`
         : `reason: ${escapeHtml(result.reason || "-")}`;
       await this._send(chatId, `✅ Approved by ${escapeHtml(resolvedBy)} and executed.\nstatus: ${result.status}\n${outcome}`);
+
+      // If this was a marketplace-pipeline draft (has sourceConnector + a
+      // stored raw opportunity) and it succeeded, the draft alone is useless
+      // sitting in Telegram — actually submit it to the real platform now,
+      // via the exact same connector call the pipeline itself would use.
+      const sourceConnector = record.task?.sourceConnector;
+      const strategy = sourceConnector && PIPELINE_STRATEGIES_BY_CONNECTOR[sourceConnector];
+      const raw = record.task?.input?.raw;
+      if (strategy && raw && result.status === "success" && result.output) {
+        try {
+          const connector = agent.connectors.get(strategy.connectorName);
+          const submission = await agent.callConnector(
+            strategy.connectorName,
+            strategy.submitOperation,
+            strategy.submitPermission,
+            () => strategy.submit(connector, raw, result.output)
+          );
+          agent.economics.record({
+            type: "task_completed",
+            connector: strategy.connectorName,
+            revenueUsd: raw.reward_usd ?? raw.budget_usdc ?? 0,
+            costUsd: 0,
+          });
+          await this._send(chatId, `📤 Submitted to ${strategy.connectorName} for opportunity <code>${escapeHtml(String(raw.id))}</code>.`);
+        } catch (submitErr) {
+          agent.economics.record({ type: "task_failed", connector: strategy.connectorName });
+          await this._send(chatId, `⚠️ Drafted OK but submitting to ${strategy.connectorName} failed: ${escapeHtml(submitErr.message)}`);
+        }
+      }
     } catch (err) {
       await this._send(chatId, `⚠️ Approved but execution failed: ${escapeHtml(err.message)}`);
     }
