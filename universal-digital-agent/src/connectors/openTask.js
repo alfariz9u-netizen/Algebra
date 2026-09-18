@@ -1,54 +1,143 @@
 "use strict";
 
-/**
- * OpenTask.ai strategy for MarketplacePipeline. Same bid-first economic
- * logic as Molt Market: draft and submit a bid/proposal on an open task
- * rather than producing the full deliverable before any commitment exists.
- *
- * HONESTY NOTE: built from OpenTask's documented high-level API surface
- * (see connectors/openTask.js) using a conventional REST field-naming
- * guess (`reward_usd`, `title`, `description`) — not verified field-by-field
- * against a live account. Treat unexpected `undefined` values in
- * `toOpportunity`/`toTask` as a signal the real field names differ and need
- * adjusting here.
- */
-const openTaskStrategy = {
-  connectorName: "openTask",
+const UniversalAgent = require("./core/universalAgent");
+const ColonyConnector = require("./connectors/colony");
+const ArtifactCouncilConnector = require("./connectors/artifactCouncil");
+const AgencConnector = require("./connectors/agenc");
+const AgentBazaarConnector = require("./connectors/agentBazaar");
+const AzureMarketplaceConnector = require("./connectors/azureMarketplace");
 
-  discoverOperation: "discoverTasks",
-  discoverPermission: "READ_PUBLIC_WEB",
-  discover: async (connector) => {
-    const data = await connector.discoverTasks({ status: "open" });
-    return data.tasks || data.results || data || [];
-  },
+// ✅ FIX: tolerant import for OpenTaskConnector — works whether the module
+// exports the class directly (`module.exports = OpenTaskConnector`) or wraps
+// it in an object (`module.exports = { OpenTaskConnector }`).
+const _OpenTaskModule = require("./connectors/openTask");
+const OpenTaskConnector =
+  _OpenTaskModule.OpenTaskConnector ||
+  _OpenTaskModule.OpenTask ||
+  _OpenTaskModule.default ||
+  _OpenTaskModule;
 
-  toOpportunity: (raw) => ({
-    id: raw.id,
-    type: "opentask_task",
-    rewardUsd: raw.reward_usd ?? raw.budget_usd ?? null,
-    successProbability: Number(process.env.OPENTASK_DEFAULT_BID_WIN_RATE || 0.4),
-    estimatedModelCostUsd: 0,
-    platformFeeUsd: Number(process.env.OPENTASK_ESTIMATED_FEE_USD || 0),
-    riskLevel: "MEDIUM",
-  }),
+const MoltMarketConnector = require("./connectors/moltMarket");
+const GithubConnector = require("./connectors/github");
+const McpClient = require("./connectors/mcpClient");
+const A2aClient = require("./connectors/a2aClient");
 
-  toTask: (raw) => ({
-    id: `opentask-bid-${raw.id}`,
-    type: "communication",
-    input: {
-      context: `Open task on OpenTask.ai — Title: "${raw.title}". Description: ${raw.description || "n/a"}. Reward: ${raw.reward_usd ?? "unspecified"} USD.`,
-      goal: "Draft a concise, professional proposal for this task, explaining your approach and why you're a good fit.",
-      raw,
-    },
-    untrustedContent: raw.description,
-    untrustedSource: "opentask-listing",
-    sourceConnector: "openTask",
-  }),
+function buildAgent() {
+  const persistDir = process.env.PERSIST_DIR || null;
+  const agent = new UniversalAgent(persistDir ? { persistDir } : {});
 
-  submitOperation: "submitBid",
-  submitPermission: "SUBMIT_TASK",
-  submit: async (connector, raw, proposalText) =>
-    connector.submitBid(raw.id, { amountUsd: raw.reward_usd, proposal: proposalText }),
-};
+  const colony = new ColonyConnector();
+  agent.connectors.register("colony", {
+    instance: colony,
+    capabilities: ["searchPosts", "postFinding", "commentOnPost", "sendMessage"],
+    statusFn: () => colony.status(),
+  });
 
-module.exports = openTaskStrategy;
+  const artifactCouncil = new ArtifactCouncilConnector();
+  agent.connectors.register("artifactCouncil", {
+    instance: artifactCouncil,
+    capabilities: ["browseDirectory", "getArtifact"],
+    statusFn: () => artifactCouncil.status(),
+  });
+
+  const agenc = new AgencConnector();
+  agent.connectors.register("agenc", {
+    instance: agenc,
+    capabilities: ["fetchIncomingTasks", "submitDeliverable"],
+    statusFn: () => agenc.status(),
+  });
+
+  const agentBazaar = new AgentBazaarConnector();
+  agent.connectors.register("agentBazaar", {
+    instance: agentBazaar,
+    capabilities: ["fetchIncomingTasks", "submitDeliverable", "stats"],
+    statusFn: () => agentBazaar.status(),
+  });
+
+  const azure = new AzureMarketplaceConnector();
+  agent.connectors.register("azureMarketplace", {
+    instance: azure,
+    capabilities: ["fetchIncomingTasks", "submitDeliverable"],
+    statusFn: () => azure.status(),
+  });
+
+  const openTask = new OpenTaskConnector();
+  agent.connectors.register("openTask", {
+    instance: openTask,
+    capabilities: ["discoverTasks", "submitBid", "submitDeliverable"],
+    statusFn: () => openTask.status(),
+  });
+
+  const github = new GithubConnector();
+  agent.connectors.register("github", {
+    instance: github,
+    capabilities: github.capabilities,
+    statusFn: () => github.status(),
+  });
+
+  const moltMarket = new MoltMarketConnector();
+  agent.connectors.register("moltMarket", {
+    instance: moltMarket,
+    capabilities: [
+      "checkHealth",
+      "browseOffers",
+      "browseJobs",
+      "getJob",
+      "publishOffer",
+      "createJob",
+      "bidOnJob",
+      "deliverWork",
+      "approveDelivery",
+      "getMyNotifications",
+    ],
+    statusFn: () => moltMarket.status(),
+  });
+
+  const mcp = new McpClient({
+    serverUrl: process.env.MCP_SERVER_URL,
+    allowedTools: (process.env.MCP_ALLOWED_TOOLS || "").split(",").filter(Boolean),
+  });
+  agent.connectors.register("mcp", {
+    instance: mcp,
+    capabilities: ["USE_MCP_TOOL"],
+    statusFn: () => mcp.status(),
+  });
+
+  const a2a = new A2aClient();
+  agent.connectors.register("a2a", {
+    instance: a2a,
+    capabilities: ["USE_A2A"],
+    statusFn: () => a2a.status(),
+  });
+
+  return agent;
+}
+
+async function main() {
+  const agent = buildAgent();
+
+  console.log("=== Universal Digital Agent — connector status ===");
+  console.log(JSON.stringify(agent.connectors.list(), null, 2));
+
+  const demoTask = {
+    id: "demo-task-1",
+    type: "research_report",
+    input: { topic: process.argv[2] || "the current state of AI agent marketplaces" },
+  };
+
+  console.log(`\n=== Processing ${demoTask.id} ===`);
+  const result = await agent.processTask(demoTask);
+  console.log(JSON.stringify(result, null, 2));
+
+  console.log("\n=== Dashboard ===");
+  console.log(JSON.stringify(agent.dashboard(), null, 2));
+}
+
+if (require.main === module) {
+  main().catch((err) => {
+    console.error("Fatal error:", err);
+    process.exit(1);
+  });
+}
+
+module.exports = { buildAgent, MarketplacePipeline: require("./core/marketplacePipeline") };
