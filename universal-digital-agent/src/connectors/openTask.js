@@ -1,9 +1,11 @@
 "use strict";
 
 /**
- * OpenTask.ai connector — reads open tasks and submits bids.
+ * OpenTask.ai connector — real HTTP calls to https://opentask.ai/api
  * Auth: OPENTASK_API_KEY (Bearer token).
- * Base URL: https://opentask.ai/api
+ *
+ * Get the key from https://opentask.ai/account/tokens with scopes:
+ *   tasks:read, bids:write, submissions:write
  */
 
 const DEFAULT_BASE_URL = process.env.OPENTASK_BASE_URL || "https://opentask.ai/api";
@@ -14,25 +16,13 @@ class OpenTaskConnector {
     this.baseUrl = baseUrl.replace(/\/$/, "");
   }
 
+  // ✅ FIX: The framework expects a STRING status, not an object.
   status() {
-    if (!this.apiKey) {
-      return {
-        connector: "openTask",
-        status: "CREDENTIAL_REQUIRED",
-        detail: "OPENTASK_API_KEY is not set.",
-      };
-    }
-    return {
-      connector: "openTask",
-      status: "CONNECTED",
-      detail: `baseUrl=${this.baseUrl}`,
-    };
+    return process.env.OPENTASK_API_KEY ? "CONNECTED" : "CREDENTIAL_REQUIRED";
   }
 
   async _request(method, path, { body, query } = {}) {
-    if (!this.apiKey) {
-      throw new Error("OPENTASK_API_KEY is not set — cannot call OpenTask API.");
-    }
+    if (!this.apiKey) throw new Error("OPENTASK_API_KEY is not set.");
     const url = new URL(this.baseUrl + path);
     if (query) {
       for (const [k, v] of Object.entries(query)) {
@@ -48,15 +38,13 @@ class OpenTaskConnector {
       },
       body: body ? JSON.stringify(body) : undefined,
     });
-
     const text = await res.text();
-    let data = null;
+    let data;
     try {
       data = text ? JSON.parse(text) : null;
     } catch {
       data = { raw: text };
     }
-
     if (!res.ok) {
       const err = new Error(`OpenTask API ${method} ${path} failed: ${res.status} ${res.statusText}`);
       err.status = res.status;
