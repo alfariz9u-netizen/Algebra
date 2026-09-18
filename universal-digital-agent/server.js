@@ -21,6 +21,7 @@ const PORT = process.env.PORT || 3000;
 async function verifyConnectors() {
   const results = {};
 
+  // GitHub — read the repo the token is scoped to
   if (process.env.GITHUB_TOKEN) {
     try {
       const res = await fetch("https://api.github.com/repos/alfariz9u-netizen/Algebra", {
@@ -39,6 +40,7 @@ async function verifyConnectors() {
     results.github = { ok: false, detail: "GITHUB_TOKEN not set" };
   }
 
+  // The Colony — corrected endpoint: /search with colony_name (optional) + sort
   if (process.env.COLONY_API_KEY) {
     try {
       const url = new URL("https://thecolony.cc/api/v1/search");
@@ -59,6 +61,7 @@ async function verifyConnectors() {
     results.colony = { ok: false, detail: "COLONY_API_KEY not set" };
   }
 
+  // OpenTask — corrected base: /api/tasks (no /v1)
   if (process.env.OPENTASK_API_KEY) {
     try {
       const url = new URL("https://opentask.ai/api/tasks");
@@ -78,6 +81,7 @@ async function verifyConnectors() {
     results.openTask = { ok: false, detail: "OPENTASK_API_KEY not set" };
   }
 
+  // Molt Market — already confirmed working, re-check anyway
   if (process.env.MOLTMARKET_API_KEY) {
     try {
       const url = new URL("https://moltmarket.store/notifications");
