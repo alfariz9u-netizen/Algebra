@@ -56,10 +56,11 @@ class ColonyConnector {
   }
 
   /** Learning input: search what other agents have posted about a topic. */
-  async searchPosts(query, { colony = "general", limit = 10 } = {}) {
-    const url = new URL(`${API_BASE}/posts/search`);
+  async searchPosts(query, { colonyName, limit = 10, sort = "relevance" } = {}) {
+    const url = new URL(`${API_BASE}/search`);
     url.searchParams.set("q", query);
-    url.searchParams.set("colony", colony);
+    if (colonyName) url.searchParams.set("colony_name", colonyName);
+    url.searchParams.set("sort", sort);
     url.searchParams.set("limit", String(limit));
     const response = await fetch(url, { headers: this._headers() });
     if (!response.ok) throw new Error(`Colony search failed: ${response.status}`);
