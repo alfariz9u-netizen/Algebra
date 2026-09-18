@@ -1,58 +1,77 @@
 "use strict";
 
 /**
- * Molt Market strategy for MarketplacePipeline.
- *
- * Economically honest design choice: the agent does NOT produce the full
- * deliverable before winning the job — nothing is paid or guaranteed at
- * the "open job" stage. Instead it drafts and submits a BID (a proposal +
- * price), which is what a real worker on this platform actually does
- * first. Producing the finished work happens later, after a bid is
- * accepted — see `docs/setup.md` for why that step isn't auto-chained here
- * (acceptance is the job owner's decision, not something this agent can
- * poll for yet without a confirmed "my accepted jobs" endpoint).
+ * Molt Market connector — Solana-based agent-to-agent job marketplace.
+ * Auth: MOLTMARKET_API_KEY (Bearer token).
+ * Base URL: https://moltmarket.store
  */
-const moltMarketStrategy = {
-  connectorName: "moltMarket",
 
-  discoverOperation: "browseJobs",
-  discoverPermission: "READ_PUBLIC_WEB",
-  discover: async (connector) => {
-    const data = await connector.browseJobs({ status: "open" });
-    return data.jobs || data.results || [];
-  },
+const DEFAULT_BASE_URL = process.env.MOLTMARKET_BASE_URL || "https://moltmarket.store";
 
-  toOpportunity: (raw) => ({
-    id: raw.id,
-    type: "moltmarket_job",
-    rewardUsd: raw.budget_usdc ?? null,
-    successProbability: Number(process.env.MOLTMARKET_DEFAULT_BID_WIN_RATE || 0.4),
-    estimatedModelCostUsd: 0,
-    platformFeeUsd: 0,
-    riskLevel: "MEDIUM",
-  }),
+class MoltMarketConnector {
+  constructor({ apiKey = process.env.MOLTMARKET_API_KEY, baseUrl = DEFAULT_BASE_URL } = {}) {
+    this.apiKey = apiKey || null;
+    this.baseUrl = baseUrl.replace(/\/$/, "");
+  }
 
-  toTask: (raw) => ({
-    id: `moltmarket-bid-${raw.id}`,
-    type: "communication",
-    input: {
-      context: `Open job on Molt Market — Title: "${raw.title}". Description: ${raw.description || "n/a"}. Budget: ${raw.budget_usdc ?? "unspecified"} USDC.`,
-      goal: "Draft a concise, professional bid proposal for this job, explaining why you're a good fit and confirming you can meet the budget.",
-      raw,
-    },
-    untrustedContent: raw.description,
-    untrustedSource: "moltmarket-job-listing",
-    sourceConnector: "moltMarket",
-  }),
+  status() {
+    if (!this.apiKey) {
+      return { connector: "moltMarket", status: "CREDENTIAL_REQUIRED", detail: "MOLTMARKET_API_KEY is not set." };
+    }
+    return { connector: "moltMarket", status: "CONNECTED", detail: `baseUrl=${this.baseUrl}` };
+  }
 
-  submitOperation: "bidOnJob",
-  submitPermission: "SUBMIT_TASK",
-  submit: async (connector, raw, bidMessageText) =>
-    connector.bidOnJob(raw.id, {
-      amountUsdc: raw.budget_usdc,
-      message: bidMessageText,
-      estimatedHours: raw.estimated_hours || 1,
-    }),
-};
+  async _request(method, path, { body, query } = {}) {
+    if (!this.apiKey) throw new Error("MOLTMARKET_API_KEY is not set.");
+    const url = new URL(this.baseUrl + path);
+    if (query) {
+      for (const [k, v] of Object.entries(query)) {
+        if (v !== undefined && v !== null) url.searchParams.set(k, String(v));
+      }
+    }
+    const res = await fetch(url.toString(), {
+      method,
+      headers: {
+        Authorization: `Bearer ${this.apiKey}`,
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    const text = await res.text();
+    let data;
+    try { data = text ? JSON.parse(text) : null; } catch { data = { raw: text }; }
+    if (!res.ok) {
+      const err = new Error(`MoltMarket API ${method} ${path} failed: ${res.status} ${res.statusText}`);
+      err.status = res.status;
+      err.body = data;
+      throw err;
+    }
+    return data;
+  }
 
-module.exports = moltMarketStrategy;
+  async checkHealth() { return this._request("GET", "/api/health"); }
+  async browseOffers({ status = "active" } = {}) { return this._request("GET", "/api/offers", { query: { status } }); }
+  async browseJobs({ status = "open" } = {}) { return this._request("GET", "/api/jobs", { query: { status } }); }
+  async getJob(jobId) { return this._request("GET", `/api/jobs/${encodeURIComponent(jobId)}`); }
+  async publishOffer({ title, description, priceUsdc, category } = {}) {
+    return this._request("POST", "/api/offers", { body: { title, description, price_usdc: priceUsdc, category } });
+  }
+  async createJob({ title, description, budgetUsdc } = {}) {
+    return this._request("POST", "/api/jobs", { body: { title, description, budget_usdc: budgetUsdc } });
+  }
+  async bidOnJob(jobId, { amountUsdc, message, estimatedHours } = {}) {
+    return this._request("POST", `/api/jobs/${encodeURIComponent(jobId)}/bids`, {
+      body: { amount_usdc: amountUsdc, message, estimated_hours: estimatedHours },
+    });
+  }
+  async deliverWork(jobId, { content, attachments } = {}) {
+    return this._request("POST", `/api/jobs/${encodeURIComponent(jobId)}/deliveries`, { body: { content, attachments } });
+  }
+  async approveDelivery(jobId) {
+    return this._request("POST", `/api/jobs/${encodeURIComponent(jobId)}/approve`);
+  }
+  async getMyNotifications() { return this._request("GET", "/api/me/notifications"); }
+}
+
+module.exports = MoltMarketConnector;
