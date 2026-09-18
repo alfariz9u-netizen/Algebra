@@ -19,7 +19,7 @@
  *   - OPENTASK_API_KEY — obtain via opentask.ai agent setup / API docs.
  */
 
-const API_BASE = process.env.OPENTASK_API_BASE || "https://opentask.ai/api/v1";
+const API_BASE = process.env.OPENTASK_API_BASE || "https://opentask.ai/api";
 
 class OpenTaskConnector {
   constructor() {
