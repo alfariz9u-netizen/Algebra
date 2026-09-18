@@ -4,6 +4,10 @@
  * OpenTask.ai connector — real HTTP calls to https://opentask.ai/api
  * Auth: OPENTASK_API_KEY (Bearer token).
  *
+ * IMPORTANT: Write operations (bids, submissions) MUST use the
+ * /api/agent/* routes, not the public /api/* browser routes.
+ * Mixing them causes 401 "route confusion".
+ *
  * Get the key from https://opentask.ai/account/tokens with scopes:
  *   tasks:read, bids:write, submissions:write
  */
@@ -16,7 +20,7 @@ class OpenTaskConnector {
     this.baseUrl = baseUrl.replace(/\/$/, "");
   }
 
-  // ✅ FIX: The framework expects a STRING status, not an object.
+  // Framework expects a STRING status, not an object.
   status() {
     return process.env.OPENTASK_API_KEY ? "CONNECTED" : "CREDENTIAL_REQUIRED";
   }
@@ -54,28 +58,34 @@ class OpenTaskConnector {
     return data;
   }
 
+  // ---- READ (public routes are fine) -------------------------------------
+
   async discoverTasks({ status = "open", limit = 20 } = {}) {
     return this._request("GET", "/tasks", { query: { status, limit } });
   }
 
+  // ---- WRITE (must use /agent/* routes) ---------------------------------
+
   async getTask(taskId) {
-    return this._request("GET", `/tasks/${encodeURIComponent(taskId)}`);
+    return this._request("GET", `/agent/tasks/${encodeURIComponent(taskId)}`);
   }
 
-  async submitBid(taskId, { amountUsd, proposal, etaDays } = {}) {
-    return this._request("POST", `/tasks/${encodeURIComponent(taskId)}/bids`, {
+  async submitBid(taskId, { priceText, proposal, etaDays } = {}) {
+    return this._request("POST", `/agent/tasks/${encodeURIComponent(taskId)}/bids`, {
       body: {
-        amount_usd: amountUsd,
-        proposal,
-        eta_days: etaDays,
+        priceText: priceText || proposal,   // OpenTask expects "priceText"
+        etaDays: etaDays || 1,              // OpenTask expects "etaDays"
+        approach: proposal,                 // OpenTask expects "approach"
       },
     });
   }
 
-  async submitDeliverable(taskId, { content, attachments } = {}) {
-    return this._request("POST", `/tasks/${encodeURIComponent(taskId)}/submissions`, {
-      body: { content, attachments },
-    });
+  async submitDeliverable(contractId, { content, attachments } = {}) {
+    return this._request(
+      "POST",
+      `/agent/contracts/${encodeURIComponent(contractId)}/submissions`,
+      { body: { deliverableUrl: content, notes: attachments } }
+    );
   }
 }
 
