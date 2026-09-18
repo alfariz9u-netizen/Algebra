@@ -1,143 +1,94 @@
 "use strict";
 
-const UniversalAgent = require("./core/universalAgent");
-const ColonyConnector = require("./connectors/colony");
-const ArtifactCouncilConnector = require("./connectors/artifactCouncil");
-const AgencConnector = require("./connectors/agenc");
-const AgentBazaarConnector = require("./connectors/agentBazaar");
-const AzureMarketplaceConnector = require("./connectors/azureMarketplace");
+/**
+ * OpenTask.ai connector — reads open tasks and submits bids.
+ * Auth: OPENTASK_API_KEY (Bearer token).
+ * Base URL: https://opentask.ai/api
+ */
 
-// ✅ FIX: tolerant import for OpenTaskConnector — works whether the module
-// exports the class directly (`module.exports = OpenTaskConnector`) or wraps
-// it in an object (`module.exports = { OpenTaskConnector }`).
-const _OpenTaskModule = require("./connectors/openTask");
-const OpenTaskConnector =
-  _OpenTaskModule.OpenTaskConnector ||
-  _OpenTaskModule.OpenTask ||
-  _OpenTaskModule.default ||
-  _OpenTaskModule;
+const DEFAULT_BASE_URL = process.env.OPENTASK_BASE_URL || "https://opentask.ai/api";
 
-const MoltMarketConnector = require("./connectors/moltMarket");
-const GithubConnector = require("./connectors/github");
-const McpClient = require("./connectors/mcpClient");
-const A2aClient = require("./connectors/a2aClient");
+class OpenTaskConnector {
+  constructor({ apiKey = process.env.OPENTASK_API_KEY, baseUrl = DEFAULT_BASE_URL } = {}) {
+    this.apiKey = apiKey || null;
+    this.baseUrl = baseUrl.replace(/\/$/, "");
+  }
 
-function buildAgent() {
-  const persistDir = process.env.PERSIST_DIR || null;
-  const agent = new UniversalAgent(persistDir ? { persistDir } : {});
+  status() {
+    if (!this.apiKey) {
+      return {
+        connector: "openTask",
+        status: "CREDENTIAL_REQUIRED",
+        detail: "OPENTASK_API_KEY is not set.",
+      };
+    }
+    return {
+      connector: "openTask",
+      status: "CONNECTED",
+      detail: `baseUrl=${this.baseUrl}`,
+    };
+  }
 
-  const colony = new ColonyConnector();
-  agent.connectors.register("colony", {
-    instance: colony,
-    capabilities: ["searchPosts", "postFinding", "commentOnPost", "sendMessage"],
-    statusFn: () => colony.status(),
-  });
+  async _request(method, path, { body, query } = {}) {
+    if (!this.apiKey) {
+      throw new Error("OPENTASK_API_KEY is not set — cannot call OpenTask API.");
+    }
+    const url = new URL(this.baseUrl + path);
+    if (query) {
+      for (const [k, v] of Object.entries(query)) {
+        if (v !== undefined && v !== null) url.searchParams.set(k, String(v));
+      }
+    }
+    const res = await fetch(url.toString(), {
+      method,
+      headers: {
+        Authorization: `Bearer ${this.apiKey}`,
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      body: body ? JSON.stringify(body) : undefined,
+    });
 
-  const artifactCouncil = new ArtifactCouncilConnector();
-  agent.connectors.register("artifactCouncil", {
-    instance: artifactCouncil,
-    capabilities: ["browseDirectory", "getArtifact"],
-    statusFn: () => artifactCouncil.status(),
-  });
+    const text = await res.text();
+    let data = null;
+    try {
+      data = text ? JSON.parse(text) : null;
+    } catch {
+      data = { raw: text };
+    }
 
-  const agenc = new AgencConnector();
-  agent.connectors.register("agenc", {
-    instance: agenc,
-    capabilities: ["fetchIncomingTasks", "submitDeliverable"],
-    statusFn: () => agenc.status(),
-  });
+    if (!res.ok) {
+      const err = new Error(`OpenTask API ${method} ${path} failed: ${res.status} ${res.statusText}`);
+      err.status = res.status;
+      err.body = data;
+      throw err;
+    }
+    return data;
+  }
 
-  const agentBazaar = new AgentBazaarConnector();
-  agent.connectors.register("agentBazaar", {
-    instance: agentBazaar,
-    capabilities: ["fetchIncomingTasks", "submitDeliverable", "stats"],
-    statusFn: () => agentBazaar.status(),
-  });
+  async discoverTasks({ status = "open", limit = 20 } = {}) {
+    return this._request("GET", "/tasks", { query: { status, limit } });
+  }
 
-  const azure = new AzureMarketplaceConnector();
-  agent.connectors.register("azureMarketplace", {
-    instance: azure,
-    capabilities: ["fetchIncomingTasks", "submitDeliverable"],
-    statusFn: () => azure.status(),
-  });
+  async getTask(taskId) {
+    return this._request("GET", `/tasks/${encodeURIComponent(taskId)}`);
+  }
 
-  const openTask = new OpenTaskConnector();
-  agent.connectors.register("openTask", {
-    instance: openTask,
-    capabilities: ["discoverTasks", "submitBid", "submitDeliverable"],
-    statusFn: () => openTask.status(),
-  });
+  async submitBid(taskId, { amountUsd, proposal, etaDays } = {}) {
+    return this._request("POST", `/tasks/${encodeURIComponent(taskId)}/bids`, {
+      body: {
+        amount_usd: amountUsd,
+        proposal,
+        eta_days: etaDays,
+      },
+    });
+  }
 
-  const github = new GithubConnector();
-  agent.connectors.register("github", {
-    instance: github,
-    capabilities: github.capabilities,
-    statusFn: () => github.status(),
-  });
-
-  const moltMarket = new MoltMarketConnector();
-  agent.connectors.register("moltMarket", {
-    instance: moltMarket,
-    capabilities: [
-      "checkHealth",
-      "browseOffers",
-      "browseJobs",
-      "getJob",
-      "publishOffer",
-      "createJob",
-      "bidOnJob",
-      "deliverWork",
-      "approveDelivery",
-      "getMyNotifications",
-    ],
-    statusFn: () => moltMarket.status(),
-  });
-
-  const mcp = new McpClient({
-    serverUrl: process.env.MCP_SERVER_URL,
-    allowedTools: (process.env.MCP_ALLOWED_TOOLS || "").split(",").filter(Boolean),
-  });
-  agent.connectors.register("mcp", {
-    instance: mcp,
-    capabilities: ["USE_MCP_TOOL"],
-    statusFn: () => mcp.status(),
-  });
-
-  const a2a = new A2aClient();
-  agent.connectors.register("a2a", {
-    instance: a2a,
-    capabilities: ["USE_A2A"],
-    statusFn: () => a2a.status(),
-  });
-
-  return agent;
+  async submitDeliverable(taskId, { content, attachments } = {}) {
+    return this._request("POST", `/tasks/${encodeURIComponent(taskId)}/submissions`, {
+      body: { content, attachments },
+    });
+  }
 }
 
-async function main() {
-  const agent = buildAgent();
-
-  console.log("=== Universal Digital Agent — connector status ===");
-  console.log(JSON.stringify(agent.connectors.list(), null, 2));
-
-  const demoTask = {
-    id: "demo-task-1",
-    type: "research_report",
-    input: { topic: process.argv[2] || "the current state of AI agent marketplaces" },
-  };
-
-  console.log(`\n=== Processing ${demoTask.id} ===`);
-  const result = await agent.processTask(demoTask);
-  console.log(JSON.stringify(result, null, 2));
-
-  console.log("\n=== Dashboard ===");
-  console.log(JSON.stringify(agent.dashboard(), null, 2));
-}
-
-if (require.main === module) {
-  main().catch((err) => {
-    console.error("Fatal error:", err);
-    process.exit(1);
-  });
-}
-
-module.exports = { buildAgent, MarketplacePipeline: require("./core/marketplacePipeline") };
+module.exports = OpenTaskConnector;
