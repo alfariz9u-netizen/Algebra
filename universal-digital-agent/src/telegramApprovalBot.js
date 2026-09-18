@@ -224,7 +224,7 @@ class TelegramApprovalBot {
           "/status — dashboard summary\n" +
           "/pending — list and re-send buttons for pending approvals\n" +
           "/log — last 10 real connector actions (what the agent actually did)\n" +
-          "/colony <text> — make the agent search The Colony right now, live\n" +
+          "/colony [text] — make the agent search The Colony right now, live\n" +
           "/opentask — discover open OpenTask.ai tasks and draft a proposal for the best one\n" +
           "/moltmarket — discover open Molt Market jobs and draft a bid for the best one\n\n" +
           "Drafted proposals need your approval (/pending) before they're actually sent — " +
