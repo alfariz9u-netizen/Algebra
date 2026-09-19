@@ -6,115 +6,49 @@
  * (it's a long-polling Telegram bot), so this tiny wrapper adds one and
  * starts the real bot alongside it.
  *
- * It also exposes a one-time helper route, /verify-connectors, that makes
- * a real, read-only API call to each connected platform (GitHub, The
- * Colony, OpenTask, Molt Market) to confirm the stored keys and fixed
- * endpoints actually work. No writes, no posts, no side effects.
- * Protected by a secret in the URL.
+ * It also exposes a one-time helper route, /register-agentmarket, that
+ * performs the AgentMarket agent-registration POST server-side (avoiding
+ * browser CORS restrictions). Protected by a secret in the URL. Delete
+ * this route (or the whole file's route block) once you've saved the
+ * returned api_key — it has no further use afterward.
  */
 const http = require("http");
 
-const VERIFY_SECRET = "uda-9f2k7q";
+const REGISTER_SECRET = "uda-9f2k7q"; // same secret used before; change if you like
 
 const PORT = process.env.PORT || 3000;
-
-async function verifyConnectors() {
-  const results = {};
-
-  // GitHub — read the repo the token is scoped to
-  if (process.env.GITHUB_TOKEN) {
-    try {
-      const res = await fetch("https://api.github.com/repos/alfariz9u-netizen/Algebra", {
-        headers: {
-          Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
-          Accept: "application/vnd.github+json",
-        },
-      });
-      results.github = res.ok
-        ? { ok: true, detail: `read repo OK (HTTP ${res.status})` }
-        : { ok: false, detail: `HTTP ${res.status}` };
-    } catch (err) {
-      results.github = { ok: false, detail: err.message };
-    }
-  } else {
-    results.github = { ok: false, detail: "GITHUB_TOKEN not set" };
-  }
-
-  // The Colony — corrected endpoint: /search with colony_name (optional) + sort
-  if (process.env.COLONY_API_KEY) {
-    try {
-      const url = new URL("https://thecolony.cc/api/v1/search");
-      url.searchParams.set("q", "test");
-      url.searchParams.set("sort", "relevance");
-      url.searchParams.set("limit", "1");
-      const res = await fetch(url, {
-        headers: { Authorization: `Bearer ${process.env.COLONY_API_KEY}` },
-      });
-      const text = await res.text();
-      results.colony = res.ok
-        ? { ok: true, detail: `search OK (HTTP ${res.status})` }
-        : { ok: false, detail: `HTTP ${res.status} - ${text.slice(0, 200)}` };
-    } catch (err) {
-      results.colony = { ok: false, detail: err.message };
-    }
-  } else {
-    results.colony = { ok: false, detail: "COLONY_API_KEY not set" };
-  }
-
-  // OpenTask — corrected base: /api/tasks (no /v1)
-  if (process.env.OPENTASK_API_KEY) {
-    try {
-      const url = new URL("https://opentask.ai/api/tasks");
-      url.searchParams.set("status", "open");
-      url.searchParams.set("limit", "1");
-      const res = await fetch(url, {
-        headers: { Authorization: `Bearer ${process.env.OPENTASK_API_KEY}` },
-      });
-      const text = await res.text();
-      results.openTask = res.ok
-        ? { ok: true, detail: `list tasks OK (HTTP ${res.status})` }
-        : { ok: false, detail: `HTTP ${res.status} - ${text.slice(0, 200)}` };
-    } catch (err) {
-      results.openTask = { ok: false, detail: err.message };
-    }
-  } else {
-    results.openTask = { ok: false, detail: "OPENTASK_API_KEY not set" };
-  }
-
-  // Molt Market — already confirmed working, re-check anyway
-  if (process.env.MOLTMARKET_API_KEY) {
-    try {
-      const url = new URL("https://moltmarket.store/notifications");
-      url.searchParams.set("unread_only", "false");
-      const res = await fetch(url, {
-        headers: { Authorization: `Bearer ${process.env.MOLTMARKET_API_KEY}` },
-      });
-      results.moltMarket = res.ok
-        ? { ok: true, detail: `read notifications OK (HTTP ${res.status})` }
-        : { ok: false, detail: `HTTP ${res.status}` };
-    } catch (err) {
-      results.moltMarket = { ok: false, detail: err.message };
-    }
-  } else {
-    results.moltMarket = { ok: false, detail: "MOLTMARKET_API_KEY not set" };
-  }
-
-  return results;
-}
 
 http
   .createServer(async (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host}`);
 
-    if (url.pathname === "/verify-connectors") {
-      if (url.searchParams.get("secret") !== VERIFY_SECRET) {
+    if (url.pathname === "/register-agentmarket") {
+      if (url.searchParams.get("secret") !== REGISTER_SECRET) {
         res.writeHead(403, { "Content-Type": "text/plain; charset=utf-8" });
         res.end("Forbidden.\n");
         return;
       }
-      const results = await verifyConnectors();
-      res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-      res.end(JSON.stringify(results, null, 2));
+      try {
+        const name = url.searchParams.get("name") || "UniversalDigitalAgent";
+        const email = url.searchParams.get("email") || "agent@example.com";
+        const upstream = await fetch("https://agentmarket.space/api/agents/register", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            name,
+            description: "General-purpose autonomous research and coding agent.",
+            capabilities: ["research", "coding", "writing"],
+            price_per_task: 15,
+            owner_email: email,
+          }),
+        });
+        const text = await upstream.text();
+        res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
+        res.end(`Status: ${upstream.status}\n\n${text}\n`);
+      } catch (err) {
+        res.writeHead(500, { "Content-Type": "text/plain; charset=utf-8" });
+        res.end(`Error: ${err.message}\n`);
+      }
       return;
     }
 
