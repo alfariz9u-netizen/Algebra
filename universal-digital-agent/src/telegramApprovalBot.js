@@ -323,8 +323,10 @@ class TelegramApprovalBot {
               msg += `\n\nDrafted a proposal for opportunity <code>${escapeHtml(String(r.opportunity.id))}</code> — needs your approval before it's sent. Check /pending.`;
             } else if (r.outcome?.status === "success" && r.submission) {
               msg += `\n\n✅ Submitted a bid on <code>${escapeHtml(String(r.opportunity.id))}</code>.`;
+            } else if (r.outcome?.status === "success" && r.submissionError) {
+              msg += `\n\n⏭️ Drafted a proposal for <code>${escapeHtml(String(r.opportunity.id))}</code>, but did not submit it: ${escapeHtml(r.submissionError)}.`;
             } else if (r.outcome?.status === "success") {
-              msg += `\n\nDrafted but not yet submitted (needs approval). Check /pending.`;
+              msg += `\n\n✅ Submitted a bid on <code>${escapeHtml(String(r.opportunity.id))}</code>.`;
             } else {
               msg += `\n\n⚠️ Opportunity <code>${escapeHtml(String(r.opportunity.id))}</code>: ${escapeHtml(r.outcome?.reason || "failed")}.`;
             }
