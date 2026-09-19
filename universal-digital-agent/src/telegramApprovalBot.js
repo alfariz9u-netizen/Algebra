@@ -312,7 +312,7 @@ class TelegramApprovalBot {
         const pipeline = new MarketplacePipeline(agent);
         await this._send(chatId, `Searching ${strategy.connectorName} for open opportunities...`);
         try {
-          const cycle = await pipeline.runCycle(strategy, { maxOpportunities: 1 });
+          const cycle = await pipeline.runCycle(strategy, { maxOpportunities: 1, minExpectedValue: 0.01 });
           if (cycle.status === "pending_human_approval") {
             await this._send(chatId, `Even browsing ${strategy.connectorName} needs approval at the current autonomy level. Check /pending.`);
             return;
