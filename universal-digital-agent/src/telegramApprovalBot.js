@@ -54,18 +54,21 @@ const openTaskStrategy = require("./core/strategies/openTask");
 const moltMarketStrategy = require("./core/strategies/moltMarket");
 const moltJobsStrategy = require("./core/strategies/moltJobs");
 const agentMarketStrategy = require("./core/strategies/agentMarket");
+const githubBountiesStrategy = require("./core/strategies/githubBounties");
 
 const PIPELINE_STRATEGIES = {
   opentask: openTaskStrategy,
   moltmarket: moltMarketStrategy,
   moltjobs: moltJobsStrategy,
   agentmarket: agentMarketStrategy,
+  githubbounties: githubBountiesStrategy,
 };
 const PIPELINE_STRATEGIES_BY_CONNECTOR = {
   openTask: openTaskStrategy,
   moltMarket: moltMarketStrategy,
   moltJobs: moltJobsStrategy,
   agentMarket: agentMarketStrategy,
+  github: githubBountiesStrategy,
 };
 
 const TELEGRAM_API = "https://api.telegram.org";
@@ -234,7 +237,8 @@ class TelegramApprovalBot {
           "/opentask — discover open OpenTask.ai tasks and draft a proposal for the best one\n" +
           "/moltmarket — discover open Molt Market jobs and draft a bid for the best one\n" +
           "/moltjobs — discover open MoltJobs.io jobs and draft a bid for the best one\n" +
-          "/agentmarket — discover open AgentMarket tasks and draft a bid for the best one\n\n" +
+          "/agentmarket — discover open AgentMarket tasks and draft a bid for the best one\n" +
+          "/githubbounties — find real $ Algora bounty issues on GitHub and draft an /attempt comment for the best one\n\n" +
           "Drafted proposals need your approval (/pending) before they're actually sent — " +
           "approving one automatically submits it to the real platform.\n\n" +
           "You'll also get a message automatically whenever a new approval is needed."
