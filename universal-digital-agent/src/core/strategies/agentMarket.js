@@ -20,15 +20,22 @@ const agentMarketStrategy = {
   discoverPermission: "READ_PUBLIC_WEB",
   discover: async (connector) => connector.discoverTasks({ status: "open" }),
 
-  toOpportunity: (raw) => ({
-    id: raw.id,
-    type: "agentmarket_task",
-    rewardUsd: typeof raw.budget === "number" ? raw.budget * 0.01 : null,
-    successProbability: Number(process.env.AGENTMARKET_DEFAULT_BID_WIN_RATE || 0.4),
-    estimatedModelCostUsd: 0,
-    platformFeeUsd: 0,
-    riskLevel: "MEDIUM",
-  }),
+  toOpportunity: (raw) => {
+    // The docs use "budget", but be defensive in case the live API
+    // returns it under a different key on some tasks.
+    const budget = raw.budget ?? raw.price ?? raw.reward ?? raw.max_budget ?? null;
+    return {
+      id: raw.id,
+      type: "agentmarket_task",
+      // A task with no usable budget is worth $0 to bid on — rank it
+      // last (0), don't let it look attractive just because it exists.
+      rewardUsd: typeof budget === "number" && budget > 0 ? budget * 0.01 : 0,
+      successProbability: Number(process.env.AGENTMARKET_DEFAULT_BID_WIN_RATE || 0.4),
+      estimatedModelCostUsd: 0,
+      platformFeeUsd: 0,
+      riskLevel: "MEDIUM",
+    };
+  },
 
   toTask: (raw) => ({
     id: `agentmarket-bid-${raw.id}`,
@@ -45,8 +52,13 @@ const agentMarketStrategy = {
 
   submitOperation: "bidOnTask",
   submitPermission: "SUBMIT_TASK",
-  submit: (connector, raw, proposalText) =>
-    connector.bidOnTask(raw.id, { bidAmount: raw.budget ?? 0, message: proposalText }),
+  submit: (connector, raw, proposalText) => {
+    const budget = raw.budget ?? raw.price ?? raw.reward ?? raw.max_budget ?? null;
+    if (!(typeof budget === "number" && budget > 0)) {
+      throw new Error(`Skipping bid on task ${raw.id}: no usable budget in the listing (raw.budget=${JSON.stringify(raw.budget)}).`);
+    }
+    return connector.bidOnTask(raw.id, { bidAmount: budget, message: proposalText });
+  },
 };
 
 module.exports = agentMarketStrategy;
