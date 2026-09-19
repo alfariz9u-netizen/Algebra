@@ -20,6 +20,15 @@ const MIN_BUDGET_USD = Number(process.env.MOLTMARKET_MIN_BUDGET_USD || 0.01);
 // overridable in case that cap is lifted and bigger jobs start appearing.
 const BID_RATIO = Number(process.env.MOLTMARKET_BID_RATIO || 1.0);
 
+/** The job-creation example in the docs uses budget_usdc, but the browse/list
+ * response hasn't been confirmed to use the same key — be defensive rather
+ * than assume, the same lesson learned from AgentMarket's "budget" field. */
+function extractBudget(raw) {
+  const candidates = [raw.budget_usdc, raw.budgetUsdc, raw.budget, raw.amount_usdc, raw.amountUsdc];
+  const found = candidates.find((v) => typeof v === "number");
+  return typeof found === "number" ? found : null;
+}
+
 // De-dupe within this process's lifetime only (resets on redeploy/restart —
 // there's no cross-restart persistence here yet). Prevents /moltmarket
 // re-bidding the exact same still-open job every time it's run in the same
@@ -52,7 +61,7 @@ const moltMarketStrategy = {
   },
 
   toOpportunity: (raw) => {
-    const budget = typeof raw.budget_usdc === "number" ? raw.budget_usdc : null;
+    const budget = extractBudget(raw);
     const usable = typeof budget === "number" && budget >= MIN_BUDGET_USD;
     return {
       id: raw.id,
@@ -69,7 +78,7 @@ const moltMarketStrategy = {
     id: `moltmarket-bid-${raw.id}`,
     type: "communication",
     input: {
-      context: `Open job on Molt Market — Title: "${raw.title}". Description: ${raw.description || "n/a"}. Budget: ${raw.budget_usdc ?? "unspecified"} USDC.`,
+      context: `Open job on Molt Market — Title: "${raw.title}". Description: ${raw.description || "n/a"}. Budget: ${extractBudget(raw) ?? "unspecified"} USDC.`,
       goal: "Draft a concise, professional bid proposal for this job, explaining why you're a good fit and confirming you can meet the budget.",
       raw, // preserved so the post-approval auto-submit step can rebuild the real bid
     },
@@ -81,9 +90,9 @@ const moltMarketStrategy = {
   submitOperation: "bidOnJob",
   submitPermission: "SUBMIT_TASK",
   submit: async (connector, raw, bidMessageText) => {
-    const budget = typeof raw.budget_usdc === "number" ? raw.budget_usdc : null;
+    const budget = extractBudget(raw);
     if (!(typeof budget === "number" && budget >= MIN_BUDGET_USD)) {
-      throw new Error(`Skipping bid on job ${raw.id}: no usable budget (budget_usdc=${JSON.stringify(raw.budget_usdc)}).`);
+      throw new Error(`Skipping bid on job ${raw.id}: no usable budget (checked budget_usdc/budgetUsdc/budget/amount_usdc, got ${JSON.stringify(raw.budget_usdc)}).`);
     }
     const result = await connector.bidOnJob(raw.id, {
       amountUsdc: Math.round(budget * BID_RATIO * 100) / 100,
