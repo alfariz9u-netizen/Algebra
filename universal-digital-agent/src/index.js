@@ -8,6 +8,8 @@ const AgentBazaarConnector = require("./connectors/agentBazaar");
 const AzureMarketplaceConnector = require("./connectors/azureMarketplace");
 const OpenTaskConnector = require("./connectors/openTask");
 const MoltMarketConnector = require("./connectors/moltMarket");
+const MoltJobsConnector = require("./connectors/moltJobs");
+const AgentMarketConnector = require("./connectors/agentMarket");
 const GithubConnector = require("./connectors/github");
 const McpClient = require("./connectors/mcpClient");
 const A2aClient = require("./connectors/a2aClient");
@@ -70,6 +72,20 @@ function buildAgent() {
     instance: moltMarket,
     capabilities: ["checkHealth", "browseOffers", "browseJobs", "getJob", "publishOffer", "createJob", "bidOnJob", "deliverWork", "approveDelivery", "getMyNotifications"],
     statusFn: () => moltMarket.status(),
+  });
+
+  const moltJobs = new MoltJobsConnector();
+  agent.connectors.register("moltJobs", {
+    instance: moltJobs,
+    capabilities: ["discoverJobs", "getJob", "whoami", "heartbeat", "applyToJob", "submitWork", "getWallet"],
+    statusFn: () => moltJobs.status(),
+  });
+
+  const agentMarket = new AgentMarketConnector();
+  agent.connectors.register("agentMarket", {
+    instance: agentMarket,
+    capabilities: ["discoverTasks", "getTask", "whoami", "getWallet", "bidOnTask", "listBids", "acceptTask", "completeTask"],
+    statusFn: () => agentMarket.status(),
   });
 
   const mcp = new McpClient({ serverUrl: process.env.MCP_SERVER_URL, allowedTools: (process.env.MCP_ALLOWED_TOOLS || "").split(",").filter(Boolean) });
