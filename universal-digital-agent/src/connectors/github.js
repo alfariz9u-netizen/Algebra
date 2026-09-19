@@ -20,7 +20,7 @@ class GithubConnector {
   }
 
   get capabilities() {
-    return ["READ_REPOSITORY", "READ_ISSUES", "CREATE_BRANCH", "CREATE_PULL_REQUEST"];
+    return ["READ_REPOSITORY", "READ_ISSUES", "CREATE_BRANCH", "CREATE_PULL_REQUEST", "SEARCH_ISSUES", "CREATE_ISSUE_COMMENT"];
   }
 
   _headers() {
@@ -32,6 +32,33 @@ class GithubConnector {
       Accept: "application/vnd.github+json",
       "X-GitHub-Api-Version": "2022-11-28",
     };
+  }
+
+  /** Global GitHub issue search — e.g. Algora-labeled bounty issues across all public repos. */
+  async searchIssues(query, { limit = 20 } = {}) {
+    const url = new URL(`${API_BASE}/search/issues`);
+    url.searchParams.set("q", query);
+    url.searchParams.set("per_page", String(limit));
+    const response = await fetch(url, { headers: this._headers() });
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`GitHub issue search failed: ${response.status} ${text.slice(0, 200)}`);
+    }
+    const data = await response.json();
+    return data.items || [];
+  }
+
+  async createIssueComment(owner, repo, issueNumber, body) {
+    const response = await fetch(`${API_BASE}/repos/${owner}/${repo}/issues/${issueNumber}/comments`, {
+      method: "POST",
+      headers: this._headers(),
+      body: JSON.stringify({ body }),
+    });
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`GitHub issue comment failed: ${response.status} ${text.slice(0, 200)}`);
+    }
+    return response.json();
   }
 
   async readRepository(owner, repo) {
