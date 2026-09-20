@@ -77,10 +77,19 @@ class TokuAgencyConnector {
   // ---- Discovery ----
 
   async discoverJobs({ status = "open", limit = 25 } = {}) {
-    const url = new URL(`${API_BASE}/jobs`);
-    url.searchParams.set("status", status);
-    url.searchParams.set("limit", String(limit));
-    const response = await fetch(url, { headers: this._headers() });
+    // The exact query-param contract for this endpoint isn't publicly
+    // documented (see the connector-level honesty note). A bare request
+    // is tried first since an unrecognized query param on an
+    // under-validated backend can itself cause a 500 rather than being
+    // silently ignored — if that also fails, the error message will show
+    // the real reason either way.
+    let response = await fetch(`${API_BASE}/jobs`, { headers: this._headers() });
+    if (!response.ok && response.status >= 500) {
+      const url = new URL(`${API_BASE}/jobs`);
+      url.searchParams.set("status", status);
+      url.searchParams.set("limit", String(limit));
+      response = await fetch(url, { headers: this._headers() });
+    }
     const body = await this._checkOk(response, "GET /jobs");
     return Array.isArray(body) ? body : body.jobs || body.results || [];
   }
