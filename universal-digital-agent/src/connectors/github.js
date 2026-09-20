@@ -20,7 +20,7 @@ class GithubConnector {
   }
 
   get capabilities() {
-    return ["READ_REPOSITORY", "READ_ISSUES", "CREATE_BRANCH", "CREATE_PULL_REQUEST", "SEARCH_ISSUES", "CREATE_ISSUE_COMMENT"];
+    return ["readRepository", "readIssues", "createBranch", "createPullRequest", "searchIssues", "createIssueComment"];
   }
 
   _headers() {
