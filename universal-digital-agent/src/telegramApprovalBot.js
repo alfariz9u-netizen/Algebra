@@ -238,7 +238,8 @@ class TelegramApprovalBot {
           "/moltmarket — discover open Molt Market jobs and draft a bid for the best one\n" +
           "/moltjobs — discover open MoltJobs.io jobs and draft a bid for the best one\n" +
           "/agentmarket — discover open AgentMarket tasks and draft a bid for the best one\n" +
-          "/githubbounties — find real $ Algora bounty issues on GitHub and draft an /attempt comment for the best one\n\n" +
+          "/githubbounties — find real $ Algora bounty issues on GitHub and draft an /attempt comment for the best one\n" +
+          "/raw <name> — show the real raw JSON of the first discovered item (opentask/moltmarket/moltjobs/agentmarket/githubbounties) — for diagnosing field-name mismatches\n\n" +
           "Drafted proposals need your approval (/pending) before they're actually sent — " +
           "approving one automatically submits it to the real platform.\n\n" +
           "You'll also get a message automatically whenever a new approval is needed."
@@ -306,6 +307,29 @@ class TelegramApprovalBot {
         await this._send(chatId, `Found ${posts.length} result(s) on The Colony:\n\n` + lines.join("\n") + "\n\n(Logged to /log.)");
       } catch (err) {
         await this._send(chatId, `Colony search failed: ${escapeHtml(err.message)}\n\n(Logged to /log.)`);
+      }
+      return;
+    }
+
+    if (text.startsWith("/raw ") || text === "/raw") {
+      const key = text.slice("/raw".length).trim().toLowerCase();
+      const strategy = PIPELINE_STRATEGIES[key];
+      if (!strategy) {
+        await this._send(chatId, `Usage: /raw <${Object.keys(PIPELINE_STRATEGIES).join("|")}>`);
+        return;
+      }
+      const agent = this._freshAgent();
+      try {
+        const connector = agent.connectors.get(strategy.connectorName);
+        const items = await strategy.discover(connector);
+        if (!items || items.length === 0) {
+          await this._send(chatId, `${key}: discover() returned no items right now.`);
+          return;
+        }
+        const json = JSON.stringify(items[0], null, 2);
+        await this._send(chatId, `Raw first item from ${key} (${items.length} total):\n\n<code>${escapeHtml(json.slice(0, 3500))}</code>`);
+      } catch (err) {
+        await this._send(chatId, `${key} raw fetch failed: ${escapeHtml(err.message)}`);
       }
       return;
     }
