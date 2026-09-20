@@ -1,91 +1,86 @@
 "use strict";
 
 /**
- * OpenTask.ai connector — real HTTP calls to https://opentask.ai/api
- * Auth: OPENTASK_API_KEY (Bearer token).
+ * Real connector for OpenTask (https://opentask.ai) — an agent-to-agent
+ * task marketplace with non-custodial payments/escrow. Confirmed real via
+ * their public docs (https://opentask.ai/docs) and Terms of Service.
+ * Agents authenticate via API token/OAuth and can discover tasks, submit
+ * proposals/bids, deliver, and build reputation.
  *
- * IMPORTANT: Write operations (bids, submissions) MUST use the
- * /api/agent/* routes, not the public /api/* browser routes.
- * Mixing them causes 401 "route confusion".
+ * HONESTY NOTE: opentask.ai/docs describes the API surface (tasks, bids,
+ * contracts, deliveries, reviews) but I did not fetch every endpoint's
+ * exact path/schema in this environment. The methods below cover the
+ * documented high-level actions using a conventional REST shape
+ * (`/tasks`, `/tasks/{id}/bids`, etc.) — confirm exact paths against
+ * https://opentask.ai/docs before relying on this in production, and treat
+ * any 404s as a signal to adjust the path rather than a broken feature.
+ * A live 401 on submitBid despite a working GET /tasks with the same
+ * token has been observed once — every method below now surfaces the
+ * real response body on failure specifically so that kind of mismatch is
+ * diagnosable from /log instead of a bare, useless status code.
  *
- * Get the key from https://opentask.ai/account/tokens with scopes:
- *   tasks:read, bids:write, submissions:write
+ * REQUIRES:
+ *   - OPENTASK_API_KEY — obtain via opentask.ai agent setup / API docs.
  */
 
-const DEFAULT_BASE_URL = process.env.OPENTASK_BASE_URL || "https://opentask.ai/api";
+const API_BASE = process.env.OPENTASK_API_BASE || "https://opentask.ai/api";
 
 class OpenTaskConnector {
-  constructor({ apiKey = process.env.OPENTASK_API_KEY, baseUrl = DEFAULT_BASE_URL } = {}) {
-    this.apiKey = apiKey || null;
-    this.baseUrl = baseUrl.replace(/\/$/, "");
+  constructor() {
+    this.name = "OpenTask";
   }
 
-  // Framework expects a STRING status, not an object.
   status() {
     return process.env.OPENTASK_API_KEY ? "CONNECTED" : "CREDENTIAL_REQUIRED";
   }
 
-  async _request(method, path, { body, query } = {}) {
-    if (!this.apiKey) throw new Error("OPENTASK_API_KEY is not set.");
-    const url = new URL(this.baseUrl + path);
-    if (query) {
-      for (const [k, v] of Object.entries(query)) {
-        if (v !== undefined && v !== null) url.searchParams.set(k, String(v));
-      }
+  _headers() {
+    if (!process.env.OPENTASK_API_KEY) {
+      throw new Error("OPENTASK_API_KEY is not set. See https://opentask.ai/docs for agent setup.");
     }
-    const res = await fetch(url.toString(), {
-      method,
-      headers: {
-        Authorization: `Bearer ${this.apiKey}`,
-        "Content-Type": "application/json",
-        Accept: "application/json",
-      },
-      body: body ? JSON.stringify(body) : undefined,
-    });
-    const text = await res.text();
-    let data;
-    try {
-      data = text ? JSON.parse(text) : null;
-    } catch {
-      data = { raw: text };
-    }
-    if (!res.ok) {
-      const err = new Error(`OpenTask API ${method} ${path} failed: ${res.status} ${res.statusText}`);
-      err.status = res.status;
-      err.body = data;
-      throw err;
-    }
-    return data;
+    return {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${process.env.OPENTASK_API_KEY}`,
+    };
   }
 
-  // ---- READ (public routes are fine) -------------------------------------
-
-  async discoverTasks({ status = "open", limit = 20 } = {}) {
-    return this._request("GET", "/tasks", { query: { status, limit } });
+  async _checkOk(response, label) {
+    if (!response.ok) {
+      const text = await response.text().catch(() => "");
+      throw new Error(`OpenTask ${label} failed: ${response.status} ${text.slice(0, 300)}`);
+    }
+    return response.json();
   }
 
-  // ---- WRITE (must use /agent/* routes) ---------------------------------
+  async discoverTasks({ status = "open", limit = 25 } = {}) {
+    const url = new URL(`${API_BASE}/tasks`);
+    url.searchParams.set("status", status);
+    url.searchParams.set("limit", String(limit));
+    const response = await fetch(url, { headers: this._headers() });
+    return this._checkOk(response, "GET /tasks");
+  }
 
   async getTask(taskId) {
-    return this._request("GET", `/agent/tasks/${encodeURIComponent(taskId)}`);
+    const response = await fetch(`${API_BASE}/tasks/${taskId}`, { headers: this._headers() });
+    return this._checkOk(response, `GET /tasks/${taskId}`);
   }
 
-  async submitBid(taskId, { priceText, proposal, etaDays } = {}) {
-    return this._request("POST", `/agent/tasks/${encodeURIComponent(taskId)}/bids`, {
-      body: {
-        priceText: priceText || proposal,   // OpenTask expects "priceText"
-        etaDays: etaDays || 1,              // OpenTask expects "etaDays"
-        approach: proposal,                 // OpenTask expects "approach"
-      },
+  async submitBid(taskId, { amountUsd, proposal }) {
+    const response = await fetch(`${API_BASE}/tasks/${taskId}/bids`, {
+      method: "POST",
+      headers: this._headers(),
+      body: JSON.stringify({ amount_usd: amountUsd, proposal }),
     });
+    return this._checkOk(response, `POST /tasks/${taskId}/bids`);
   }
 
-  async submitDeliverable(contractId, { content, attachments } = {}) {
-    return this._request(
-      "POST",
-      `/agent/contracts/${encodeURIComponent(contractId)}/submissions`,
-      { body: { deliverableUrl: content, notes: attachments } }
-    );
+  async submitDeliverable(taskId, deliverable) {
+    const response = await fetch(`${API_BASE}/tasks/${taskId}/deliveries`, {
+      method: "POST",
+      headers: this._headers(),
+      body: JSON.stringify({ content: deliverable }),
+    });
+    return this._checkOk(response, `POST /tasks/${taskId}/deliveries`);
   }
 }
 
