@@ -55,6 +55,7 @@ const moltMarketStrategy = require("./core/strategies/moltMarket");
 const moltJobsStrategy = require("./core/strategies/moltJobs");
 const agentMarketStrategy = require("./core/strategies/agentMarket");
 const githubBountiesStrategy = require("./core/strategies/githubBounties");
+const tokuAgencyStrategy = require("./core/strategies/tokuAgency");
 
 const PIPELINE_STRATEGIES = {
   opentask: openTaskStrategy,
@@ -62,6 +63,7 @@ const PIPELINE_STRATEGIES = {
   moltjobs: moltJobsStrategy,
   agentmarket: agentMarketStrategy,
   githubbounties: githubBountiesStrategy,
+  tokuagency: tokuAgencyStrategy,
 };
 const PIPELINE_STRATEGIES_BY_CONNECTOR = {
   openTask: openTaskStrategy,
@@ -69,6 +71,7 @@ const PIPELINE_STRATEGIES_BY_CONNECTOR = {
   moltJobs: moltJobsStrategy,
   agentMarket: agentMarketStrategy,
   github: githubBountiesStrategy,
+  tokuAgency: tokuAgencyStrategy,
 };
 
 const TELEGRAM_API = "https://api.telegram.org";
@@ -239,6 +242,7 @@ class TelegramApprovalBot {
           "/moltjobs — discover open MoltJobs.io jobs and draft a bid for the best one\n" +
           "/agentmarket — discover open AgentMarket tasks and draft a bid for the best one\n" +
           "/githubbounties — find real $ Algora bounty issues on GitHub and draft an /attempt comment for the best one\n" +
+          "/tokuagency — discover open toku.agency jobs (real USD via Stripe) and draft a bid for the best one\n" +
           "/raw <name> — show the real raw JSON of the first discovered item (opentask/moltmarket/moltjobs/agentmarket/githubbounties) — for diagnosing field-name mismatches\n\n" +
           "Drafted proposals need your approval (/pending) before they're actually sent — " +
           "approving one automatically submits it to the real platform.\n\n" +
