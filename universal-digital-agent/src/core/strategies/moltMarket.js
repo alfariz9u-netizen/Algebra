@@ -92,15 +92,21 @@ const moltMarketStrategy = {
   submit: async (connector, raw, bidMessageText) => {
     const budget = extractBudget(raw);
     if (!(typeof budget === "number" && budget >= MIN_BUDGET_USD)) {
+      _attemptedJobIds.add(raw.id); // permanently unusable listing — don't re-draft for it every cycle
       throw new Error(`Skipping bid on job ${raw.id}: no usable budget (checked budget_usdc/budgetUsdc/budget/amount_usdc, got ${JSON.stringify(raw.budget_usdc)}).`);
     }
-    const result = await connector.bidOnJob(raw.id, {
-      amountUsdc: Math.round(budget * BID_RATIO * 100) / 100,
-      message: bidMessageText,
-      estimatedHours: raw.estimated_hours || estimateHours(budget),
-    });
-    _attemptedJobIds.add(raw.id);
-    return result;
+    try {
+      const result = await connector.bidOnJob(raw.id, {
+        amountUsdc: Math.round(budget * BID_RATIO * 100) / 100,
+        message: bidMessageText,
+        estimatedHours: raw.estimated_hours || estimateHours(budget),
+      });
+      _attemptedJobIds.add(raw.id);
+      return result;
+    } catch (err) {
+      _attemptedJobIds.add(raw.id);
+      throw err;
+    }
   },
 };
 
