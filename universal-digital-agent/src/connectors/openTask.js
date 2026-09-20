@@ -69,7 +69,18 @@ class OpenTaskConnector {
     const response = await fetch(`${API_BASE}/tasks/${taskId}/bids`, {
       method: "POST",
       headers: this._headers(),
-      body: JSON.stringify({ amount_usd: amountUsd, proposal }),
+      // The write-side schema for this endpoint has never been confirmed
+      // (only the /raw-verified read shape has: budgetAmount/budgetText).
+      // Send several plausible aliases for the same value defensively —
+      // a REST API that expects one of these will use it and ignore the
+      // rest; this costs nothing and avoids another round of blind guessing.
+      body: JSON.stringify({
+        amount_usd: amountUsd,
+        amountUsd,
+        budgetAmount: String(amountUsd),
+        proposal,
+        message: proposal,
+      }),
     });
     return this._checkOk(response, `POST /tasks/${taskId}/bids`);
   }
