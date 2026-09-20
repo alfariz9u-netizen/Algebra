@@ -98,14 +98,26 @@ const openTaskStrategy = {
   submit: async (connector, raw, proposalText) => {
     const reward = extractReward(raw);
     if (!(typeof reward === "number" && reward >= MIN_REWARD_USD)) {
+      _attemptedTaskIds.add(raw.id); // permanently unusable listing — don't re-draft for it every cycle
       throw new Error(`Skipping bid on task ${raw.id}: no usable reward found (checked reward_usd/budget_usd/price_usd/amount_usd, all missing or below the $${MIN_REWARD_USD} floor).`);
     }
-    const result = await connector.submitBid(raw.id, {
-      amountUsd: Math.round(reward * BID_RATIO * 100) / 100,
-      proposal: proposalText,
-    });
-    _attemptedTaskIds.add(raw.id);
-    return result;
+    try {
+      const result = await connector.submitBid(raw.id, {
+        amountUsd: Math.round(reward * BID_RATIO * 100) / 100,
+        proposal: proposalText,
+      });
+      _attemptedTaskIds.add(raw.id);
+      return result;
+    } catch (err) {
+      // Mark it attempted even on failure. A task that consistently 401s
+      // (e.g. quietly closed/expired server-side despite still listing as
+      // "open") would otherwise get re-drafted and re-attempted forever,
+      // every single /opentask run, burning LLM calls on something that
+      // will never succeed — and worse, silently blocking the pipeline
+      // from ever reaching the next-best real opportunity.
+      _attemptedTaskIds.add(raw.id);
+      throw err;
+    }
   },
 };
 
