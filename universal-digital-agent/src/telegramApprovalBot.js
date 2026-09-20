@@ -243,7 +243,8 @@ class TelegramApprovalBot {
           "/agentmarket — discover open AgentMarket tasks and draft a bid for the best one\n" +
           "/githubbounties — find real $ Algora bounty issues on GitHub and draft an /attempt comment for the best one\n" +
           "/tokuagency — discover open toku.agency jobs (real USD via Stripe) and draft a bid for the best one\n" +
-          "/raw <name> — show the real raw JSON of the first discovered item (opentask/moltmarket/moltjobs/agentmarket/githubbounties) — for diagnosing field-name mismatches\n\n" +
+          "/raw <name> — show the real raw JSON of the first discovered item (opentask/moltmarket/moltjobs/agentmarket/githubbounties/tokuagency) — for diagnosing field-name mismatches\n\n" +
+          "Automatic mode: set AUTO_RUN_ENABLED=true (env var) to have the agent run through every marketplace on its own every AUTO_RUN_INTERVAL_MINUTES (default 30), no command needed. Results are posted here with a 🔄 [auto] prefix. Off by default.\n\n" +
           "Drafted proposals need your approval (/pending) before they're actually sent — " +
           "approving one automatically submits it to the real platform.\n\n" +
           "You'll also get a message automatically whenever a new approval is needed."
@@ -340,36 +341,8 @@ class TelegramApprovalBot {
 
     for (const [cmdName, strategy] of Object.entries(PIPELINE_STRATEGIES)) {
       if (text === `/${cmdName}`) {
-        const agent = this._freshAgent();
-        const pipeline = new MarketplacePipeline(agent);
         await this._send(chatId, `Searching ${strategy.connectorName} for open opportunities...`);
-        try {
-          const cycle = await pipeline.runCycle(strategy, { maxOpportunities: 1, minExpectedValue: 0.01 });
-          if (cycle.status === "pending_human_approval") {
-            await this._send(chatId, `Even browsing ${strategy.connectorName} needs approval at the current autonomy level. Check /pending.`);
-            return;
-          }
-          let msg = `<b>${strategy.connectorName}</b>: discovered ${cycle.discovered}, worth pursuing ${cycle.accepted}, skipped (low value) ${cycle.rejected}.`;
-          for (const r of cycle.results) {
-            if (r.outcome?.status === "pending_human_approval") {
-              msg += `\n\nDrafted a proposal for opportunity <code>${escapeHtml(String(r.opportunity.id))}</code> — needs your approval before it's sent. Check /pending.`;
-            } else if (r.outcome?.status === "success" && r.submission) {
-              msg += `\n\n✅ Submitted a bid on <code>${escapeHtml(String(r.opportunity.id))}</code>.`;
-            } else if (r.outcome?.status === "success" && r.submissionError) {
-              msg += `\n\n⏭️ Drafted a proposal for <code>${escapeHtml(String(r.opportunity.id))}</code>, but did not submit it: ${escapeHtml(r.submissionError)}.`;
-            } else if (r.outcome?.status === "success") {
-              msg += `\n\n✅ Submitted a bid on <code>${escapeHtml(String(r.opportunity.id))}</code>.`;
-            } else {
-              msg += `\n\n⚠️ Opportunity <code>${escapeHtml(String(r.opportunity.id))}</code>: ${escapeHtml(r.outcome?.reason || "failed")}.`;
-            }
-          }
-          if (cycle.results.length === 0) {
-            msg += "\n\nNothing met the minimum expected value to pursue right now.";
-          }
-          await this._send(chatId, msg);
-        } catch (err) {
-          await this._send(chatId, `${strategy.connectorName} cycle failed: ${escapeHtml(err.message)}`);
-        }
+        await this._runPipelineCycleAndReport(chatId, strategy);
         return;
       }
     }
@@ -479,7 +452,86 @@ class TelegramApprovalBot {
     }
   }
 
-  // -- Long-polling loop ----------------------------------------------------
+  // -- Shared pipeline-cycle runner (used by both manual commands and the automatic scheduler) --
+
+  async _runPipelineCycleAndReport(chatId, strategy, { prefix = "" } = {}) {
+    const agent = this._freshAgent();
+    const pipeline = new MarketplacePipeline(agent);
+    try {
+      const cycle = await pipeline.runCycle(strategy, { maxOpportunities: 1, minExpectedValue: 0.01 });
+      if (cycle.status === "pending_human_approval") {
+        await this._send(chatId, `${prefix}Even browsing ${strategy.connectorName} needs approval at the current autonomy level. Check /pending.`);
+        return;
+      }
+      let msg = `${prefix}<b>${strategy.connectorName}</b>: discovered ${cycle.discovered}, worth pursuing ${cycle.accepted}, skipped (low value) ${cycle.rejected}.`;
+      for (const r of cycle.results) {
+        if (r.outcome?.status === "pending_human_approval") {
+          msg += `\n\nDrafted a proposal for opportunity <code>${escapeHtml(String(r.opportunity.id))}</code> — needs your approval before it's sent. Check /pending.`;
+        } else if (r.outcome?.status === "success" && r.submission) {
+          msg += `\n\n✅ Submitted a bid on <code>${escapeHtml(String(r.opportunity.id))}</code>.`;
+        } else if (r.outcome?.status === "success" && r.submissionError) {
+          msg += `\n\n⏭️ Drafted a proposal for <code>${escapeHtml(String(r.opportunity.id))}</code>, but did not submit it: ${escapeHtml(r.submissionError)}.`;
+        } else if (r.outcome?.status === "success") {
+          msg += `\n\n✅ Submitted a bid on <code>${escapeHtml(String(r.opportunity.id))}</code>.`;
+        } else {
+          msg += `\n\n⚠️ Opportunity <code>${escapeHtml(String(r.opportunity.id))}</code>: ${escapeHtml(r.outcome?.reason || "failed")}.`;
+        }
+      }
+      if (cycle.results.length === 0) {
+        msg += "\n\nNothing met the minimum expected value to pursue right now.";
+      }
+      // In auto mode, a totally empty/uneventful cycle isn't worth a message —
+      // avoids spamming the chat every interval when nothing is happening.
+      if (prefix && cycle.discovered === 0 && cycle.results.length === 0) return;
+      await this._send(chatId, msg);
+    } catch (err) {
+      await this._send(chatId, `${prefix}${strategy.connectorName} cycle failed: ${escapeHtml(err.message)}`);
+    }
+  }
+
+  // -- Automatic scheduler ----------------------------------------------------
+  //
+  // Off by default — set AUTO_RUN_ENABLED=true to turn it on. When enabled,
+  // every AUTO_RUN_INTERVAL_MINUTES (default 30) it runs through every
+  // configured strategy (AUTO_RUN_STRATEGIES, comma-separated command names
+  // like "opentask,moltmarket"; defaults to all registered strategies), one
+  // at a time with a short pause between them, and reports results to every
+  // allowed chat — the exact same code path /opentask etc. already use, so
+  // behavior (approval gating, budget guards, dedupe) is identical to a
+  // manual run. This is what turns the agent from "acts when you ask" into
+  // "actively watches these marketplaces on its own" — combined with
+  // AUTONOMY_LEVEL, a submission can go out with no human step in between.
+  _startAutoScheduler() {
+    if (String(process.env.AUTO_RUN_ENABLED).toLowerCase() !== "true") return;
+
+    const intervalMinutes = Number(process.env.AUTO_RUN_INTERVAL_MINUTES || 30);
+    const requestedKeys = (process.env.AUTO_RUN_STRATEGIES || "")
+      .split(",")
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean);
+    const keys = requestedKeys.length > 0 ? requestedKeys.filter((k) => PIPELINE_STRATEGIES[k]) : Object.keys(PIPELINE_STRATEGIES);
+
+    console.log(`Auto-run scheduler enabled: every ${intervalMinutes}m, strategies: ${keys.join(", ")}`);
+
+    const runOnce = async () => {
+      for (const key of keys) {
+        const strategy = PIPELINE_STRATEGIES[key];
+        for (const chatId of this.allowedChatIds) {
+          await this._runPipelineCycleAndReport(chatId, strategy, { prefix: "🔄 [auto] " });
+        }
+        await sleep(5000); // brief pause between strategies — easier on rate limits/LLM budget
+      }
+    };
+
+    this._autoRunTimer = setInterval(() => {
+      runOnce().catch((err) => console.error("Auto-run cycle failed:", err.message));
+    }, intervalMinutes * 60 * 1000);
+
+    // Also do one pass shortly after startup rather than waiting a full interval.
+    setTimeout(() => {
+      runOnce().catch((err) => console.error("Auto-run cycle failed:", err.message));
+    }, 30000);
+  }
 
   async start() {
     this._running = true;
@@ -487,6 +539,7 @@ class TelegramApprovalBot {
       this.notifyPendingApprovals().catch((err) => console.error("notifyPendingApprovals failed:", err.message));
     }, this.notifyIntervalMs);
     await this.notifyPendingApprovals();
+    this._startAutoScheduler();
 
     while (this._running) {
       let updates;
