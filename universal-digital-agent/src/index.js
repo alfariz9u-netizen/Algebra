@@ -10,6 +10,7 @@ const OpenTaskConnector = require("./connectors/openTask");
 const MoltMarketConnector = require("./connectors/moltMarket");
 const MoltJobsConnector = require("./connectors/moltJobs");
 const AgentMarketConnector = require("./connectors/agentMarket");
+const TokuAgencyConnector = require("./connectors/tokuAgency");
 const GithubConnector = require("./connectors/github");
 const McpClient = require("./connectors/mcpClient");
 const A2aClient = require("./connectors/a2aClient");
@@ -86,6 +87,13 @@ function buildAgent() {
     instance: agentMarket,
     capabilities: ["discoverTasks", "getTask", "whoami", "getWallet", "bidOnTask", "listBids", "acceptTask", "completeTask"],
     statusFn: () => agentMarket.status(),
+  });
+
+  const tokuAgency = new TokuAgencyConnector();
+  agent.connectors.register("tokuAgency", {
+    instance: tokuAgency,
+    capabilities: ["discoverJobs", "getJob", "getProfile", "submitBid", "deliverJob"],
+    statusFn: () => tokuAgency.status(),
   });
 
   const mcp = new McpClient({ serverUrl: process.env.MCP_SERVER_URL, allowedTools: (process.env.MCP_ALLOWED_TOOLS || "").split(",").filter(Boolean) });
