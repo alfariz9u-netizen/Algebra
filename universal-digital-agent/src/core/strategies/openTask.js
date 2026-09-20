@@ -26,7 +26,21 @@ const BID_RATIO = Number(process.env.OPENTASK_BID_RATIO || 1.0); // 1.0 = bid th
 // exists yet).
 const _attemptedTaskIds = new Set();
 
+// Confirmed via /raw against a live account: OpenTask returns
+// `budgetAmount` as a STRING (e.g. "9") plus `budgetCurrency: "USDC"` and
+// a human `budgetText` like "9 USDC" — not `reward_usd`, which was a
+// pre-verification guess that never matched. USDC is treated as ~1:1 USD
+// here, same simplification already used for Molt Market/Molt Jobs.
 function extractReward(raw) {
+  if (typeof raw.budgetAmount === "string" || typeof raw.budgetAmount === "number") {
+    const n = parseFloat(raw.budgetAmount);
+    if (Number.isFinite(n)) return n;
+  }
+  if (typeof raw.budgetText === "string") {
+    const m = raw.budgetText.match(/[\d.]+/);
+    if (m) return parseFloat(m[0]);
+  }
+  // Older guesses, kept in case a different task shape ever shows up.
   const candidates = [raw.reward_usd, raw.rewardUsd, raw.budget_usd, raw.budgetUsd, raw.price_usd, raw.priceUsd, raw.amount_usd, raw.amountUsd];
   const found = candidates.find((v) => typeof v === "number");
   return typeof found === "number" ? found : null;
@@ -70,11 +84,11 @@ const openTaskStrategy = {
     id: `opentask-bid-${raw.id}`,
     type: "communication",
     input: {
-      context: `Open task on OpenTask.ai — Title: "${raw.title}". Description: ${raw.description || "n/a"}. Reward: ${extractReward(raw) ?? "unspecified"} USD.`,
+      context: `Open task on OpenTask.ai — Title: "${raw.title}". Description: ${raw.description || raw.skillsTags?.join(", ") || "n/a"}. Budget: ${raw.budgetText || (extractReward(raw) != null ? `${extractReward(raw)} ${raw.budgetCurrency || "USDC"}` : "unspecified")}.`,
       goal: "Draft a concise, professional proposal for this task, explaining your approach and why you're a good fit.",
       raw, // preserved so the post-approval auto-submit step can rebuild the real bid
     },
-    untrustedContent: raw.description,
+    untrustedContent: raw.description || raw.title,
     untrustedSource: "opentask-listing",
     sourceConnector: "openTask",
   }),
