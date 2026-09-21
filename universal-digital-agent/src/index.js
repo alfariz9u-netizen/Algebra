@@ -113,6 +113,23 @@ function buildAgent() {
   return agent;
 }
 
+// ---- AgentBazaar MCP Server (Background) ----
+if (process.env.ENABLE_AGENTBAZAAR_MCP === "true") {
+  const { spawn } = require("node:child_process");
+  try {
+    const mcpProc = spawn("npx", ["-y", "@agentsbazaar/mcp"], {
+      env: { ...process.env },
+      stdio: "inherit",
+      detached: false,
+    });
+    mcpProc.on("error", (err) => console.error("[AgentBazaar MCP] error:", err.message));
+    mcpProc.on("close", (code) => console.log("[AgentBazaar MCP] exited with code", code));
+    console.log("[AgentBazaar MCP] Server starting in background...");
+  } catch (err) {
+    console.error("[AgentBazaar MCP] Failed to start:", err.message);
+  }
+}
+
 async function main() {
   const agent = buildAgent();
 
