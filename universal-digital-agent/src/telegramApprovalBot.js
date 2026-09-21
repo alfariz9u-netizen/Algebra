@@ -243,6 +243,7 @@ class TelegramApprovalBot {
           "/agentmarket — discover open AgentMarket tasks and draft a bid for the best one\n" +
           "/githubbounties — find real $ Algora bounty issues on GitHub and draft an /attempt comment for the best one\n" +
           "/tokuagency — discover open toku.agency jobs (real USD via Stripe) and draft a bid for the best one\n" +
+          "/registerbazaar — register this agent on AgentBazaar (Solana, ERC-8004 identity)\n" +
           "/raw <name> — show the real raw JSON of the first discovered item (opentask/moltmarket/moltjobs/agentmarket/githubbounties/tokuagency) — for diagnosing field-name mismatches\n\n" +
           "Automatic mode: set AUTO_RUN_ENABLED=true (env var) to have the agent run through every marketplace on its own every AUTO_RUN_INTERVAL_MINUTES (default 30), no command needed. Results are posted here with a 🔄 [auto] prefix. Off by default.\n\n" +
           "Drafted proposals need your approval (/pending) before they're actually sent — " +
@@ -312,6 +313,45 @@ class TelegramApprovalBot {
         await this._send(chatId, `Found ${posts.length} result(s) on The Colony:\n\n` + lines.join("\n") + "\n\n(Logged to /log.)");
       } catch (err) {
         await this._send(chatId, `Colony search failed: ${escapeHtml(err.message)}\n\n(Logged to /log.)`);
+      }
+      return;
+    }
+
+    // ---- AgentBazaar registration (one-shot) --------------------------------
+    if (text === "/registerbazaar") {
+      await this._send(chatId, "⏳ Registering agent on AgentBazaar (Solana)...");
+      const agent = this._freshAgent();
+      try {
+        const connector = agent.connectors.get("agentBazaar");
+        if (!connector) {
+          await this._send(chatId, "❌ agentBazaar connector is not registered.");
+          return;
+        }
+        if (!process.env.SOLANA_PRIVATE_KEY) {
+          await this._send(chatId, "❌ SOLANA_PRIVATE_KEY is not set in the environment.");
+          return;
+        }
+        const result = await connector.register({
+          name: "UniversalDigitalAgent",
+          description: "Autonomous agent for research and code",
+          skills: "research, coding, data analysis",
+          pricePerRequest: 100000,
+          ownerEmail: process.env.MOLTMARKET_EMAIL || "owner@example.com",
+        });
+        const slug = result?.agent?.slug || result?.slug || result?.agent?.name || "unknown";
+        const wallet = result?.wallet?.address || result?.walletAddress || "unknown";
+        const email = result?.email || result?.agent?.email || "unknown";
+        await this._send(
+          chatId,
+          `✅ <b>Registration successful!</b>\n` +
+            `Agent slug: <code>${escapeHtml(String(slug))}</code>\n` +
+            `Wallet: <code>${escapeHtml(String(wallet))}</code>\n` +
+            `Email: <code>${escapeHtml(String(email))}</code>\n\n` +
+            `Add these to Render → Environment:\n` +
+            `AGENTBAZAAR_AGENT_SLUG=<code>${escapeHtml(String(slug))}</code>`
+        );
+      } catch (err) {
+        await this._send(chatId, `❌ Registration failed: ${escapeHtml(err.message)}`);
       }
       return;
     }
@@ -564,6 +604,7 @@ class TelegramApprovalBot {
   stop() {
     this._running = false;
     if (this._notifyTimer) clearInterval(this._notifyTimer);
+    if (this._autoRunTimer) clearInterval(this._autoRunTimer);
   }
 }
 
