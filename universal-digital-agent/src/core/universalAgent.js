@@ -13,6 +13,7 @@ const { labelUntrustedContent } = require("./promptInjectionGuard");
 const verificationLayer = require("./verificationLayer");
 const { ConnectorRegistry } = require("./connectorRegistry");
 const EconomicIntelligence = require("./economicIntelligence");
+const LearningEngine = require("./learningEngine");
 const { classify } = require("./intentClassifier");
 const { CAPABILITIES } = require("../capabilities/definitions");
 const ApprovalQueue = require("./approvalQueue");
@@ -52,6 +53,12 @@ class UniversalAgent {
       refillPerSecond: Number(process.env.CONNECTOR_RATE_LIMIT_REFILL_PER_SEC || 1),
     });
     this.economics = new EconomicIntelligence({ persistDir, encryptionKey: resolvedEncryptionKey });
+    // Failure memory for MarketplacePipeline: circuit breaker per
+    // connector+operation, dead-listing memory, and calibrated bid-win
+    // probability. See learningEngine.js for why this exists — without it
+    // a broken credential or an unbiddable listing gets retried, and its
+    // LLM draft re-paid for, on every single cycle forever.
+    this.learning = new LearningEngine({ persistDir, encryptionKey: resolvedEncryptionKey });
     this.connectors = new ConnectorRegistry();
     this.approvals = new ApprovalQueue({ persistDir, encryptionKey: resolvedEncryptionKey });
     this._approvedOverrides = new Set(); // taskIds resumed past their approval gate for this call only
@@ -366,6 +373,7 @@ class UniversalAgent {
       memory: this.memory.pruneExpired({ maxRecords: memoryMaxRecords }),
       audit: this.audit.prune({ maxAgeMs: auditMaxAgeMs, maxEntries: auditMaxEntries }),
       economics: this.economics.prune({ maxAgeMs: economicsMaxAgeMs, maxEntries: economicsMaxEntries }),
+      learning: this.learning.prune({ maxAgeMs: economicsMaxAgeMs }),
     };
   }
 
@@ -377,6 +385,7 @@ class UniversalAgent {
       killSwitch: this.killSwitch.status(),
       dailyTokenUsage: this.tokens.getDailyUsage(),
       economics: this.economics.summary(),
+      learning: this.learning.status(),
       connectors: this.connectors.list(),
       pendingApprovals: this.approvals.list({ status: "pending" }).length,
       auditEntryCount: this.audit.all().length,
