@@ -1,26 +1,9 @@
 "use strict";
 
 /**
- * Real connector for OpenTask (https://opentask.ai) — an agent-to-agent
- * task marketplace with non-custodial payments/escrow. Confirmed real via
- * their public docs (https://opentask.ai/docs) and Terms of Service.
- * Agents authenticate via API token/OAuth and can discover tasks, submit
- * proposals/bids, deliver, and build reputation.
- *
- * HONESTY NOTE: opentask.ai/docs describes the API surface (tasks, bids,
- * contracts, deliveries, reviews) but I did not fetch every endpoint's
- * exact path/schema in this environment. The methods below cover the
- * documented high-level actions using a conventional REST shape
- * (`/tasks`, `/tasks/{id}/bids`, etc.) — confirm exact paths against
- * https://opentask.ai/docs before relying on this in production, and treat
- * any 404s as a signal to adjust the path rather than a broken feature.
- * A live 401 on submitBid despite a working GET /tasks with the same
- * token has been observed once — every method below now surfaces the
- * real response body on failure specifically so that kind of mismatch is
- * diagnosable from /log instead of a bare, useless status code.
- *
- * REQUIRES:
- *   - OPENTASK_API_KEY — obtain via opentask.ai agent setup / API docs.
+ * Real connector for OpenTask (https://opentask.ai).
+ * Route confusion fix: bearer/agent routes use /api/agent/*, NOT /api/*.
+ * Confirmed via official opentask-worker skill docs.
  */
 
 const API_BASE = process.env.OPENTASK_API_BASE || "https://opentask.ai/api";
@@ -36,7 +19,7 @@ class OpenTaskConnector {
 
   _headers() {
     if (!process.env.OPENTASK_API_KEY) {
-      throw new Error("OPENTASK_API_KEY is not set. See https://opentask.ai/docs for agent setup.");
+      throw new Error("OPENTASK_API_KEY is not set.");
     }
     return {
       "Content-Type": "application/json",
@@ -52,6 +35,8 @@ class OpenTaskConnector {
     return response.json();
   }
 
+  // ---- READ (public/browser route is fine) --------------------------------
+
   async discoverTasks({ status = "open", limit = 25 } = {}) {
     const url = new URL(`${API_BASE}/tasks`);
     url.searchParams.set("status", status);
@@ -65,33 +50,28 @@ class OpenTaskConnector {
     return this._checkOk(response, `GET /tasks/${taskId}`);
   }
 
-  async submitBid(taskId, { amountUsd, proposal }) {
-    const response = await fetch(`${API_BASE}/tasks/${taskId}/bids`, {
+  // ---- WRITE (must use /agent/* routes with bearer token) ----------------
+
+  async submitBid(taskId, { priceText, etaDays, approach }) {
+    const response = await fetch(`${API_BASE}/agent/tasks/${taskId}/bids`, {
       method: "POST",
       headers: this._headers(),
-      // The write-side schema for this endpoint has never been confirmed
-      // (only the /raw-verified read shape has: budgetAmount/budgetText).
-      // Send several plausible aliases for the same value defensively —
-      // a REST API that expects one of these will use it and ignore the
-      // rest; this costs nothing and avoids another round of blind guessing.
       body: JSON.stringify({
-        amount_usd: amountUsd,
-        amountUsd,
-        budgetAmount: String(amountUsd),
-        proposal,
-        message: proposal,
+        priceText: priceText || "negotiable",
+        etaDays: etaDays || 1,
+        approach: approach || "",
       }),
     });
-    return this._checkOk(response, `POST /tasks/${taskId}/bids`);
+    return this._checkOk(response, `POST /agent/tasks/${taskId}/bids`);
   }
 
-  async submitDeliverable(taskId, deliverable) {
-    const response = await fetch(`${API_BASE}/tasks/${taskId}/deliveries`, {
+  async submitDeliverable(contractId, { deliverableUrl, notes }) {
+    const response = await fetch(`${API_BASE}/agent/contracts/${contractId}/submissions`, {
       method: "POST",
       headers: this._headers(),
-      body: JSON.stringify({ content: deliverable }),
+      body: JSON.stringify({ deliverableUrl, notes }),
     });
-    return this._checkOk(response, `POST /tasks/${taskId}/deliveries`);
+    return this._checkOk(response, `POST /agent/contracts/${contractId}/submissions`);
   }
 }
 
