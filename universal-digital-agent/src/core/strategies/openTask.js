@@ -13,13 +13,14 @@
  * the same lesson learned the hard way on AgentMarket ("budget") and
  * Molt Market ("budget_usdc" vs "budgetUsdc"). A live 401 on the actual
  * bid submission (despite discovery working with the same token) has also
- * been observed — see connectors/openTask.js, which now surfaces the full
- * response body on any failure so that error is diagnosable instead of a
- * bare status code.
+ * been observed — the fix was route confusion: the write path is
+ * /agent/tasks/{id}/bids (bearer route), NOT /tasks/{id}/bids (browser
+ * route). See connectors/openTask.js for the corrected submitBid.
  */
 
 const MIN_REWARD_USD = Number(process.env.OPENTASK_MIN_REWARD_USD || 1);
 const BID_RATIO = Number(process.env.OPENTASK_BID_RATIO || 1.0); // 1.0 = bid the full listed reward
+const DEFAULT_ETA_DAYS = Number(process.env.OPENTASK_DEFAULT_ETA_DAYS || 1);
 
 // Session-lifetime de-dupe — avoids re-bidding the same still-open task
 // every time /opentask is run (resets on redeploy; no cross-restart store
@@ -99,17 +100,22 @@ const openTaskStrategy = {
     const reward = extractReward(raw);
     if (!(typeof reward === "number" && reward >= MIN_REWARD_USD)) {
       _attemptedTaskIds.add(raw.id); // permanently unusable listing — don't re-draft for it every cycle
-      throw new Error(`Skipping bid on task ${raw.id}: no usable reward found (checked reward_usd/budget_usd/price_usd/amount_usd, all missing or below the $${MIN_REWARD_USD} floor).`);
+      throw new Error(`Skipping bid on task ${raw.id}: no usable reward found (checked budgetAmount/budgetText/reward_usd, all missing or below the $${MIN_REWARD_USD} floor).`);
     }
     try {
+      // The connector now expects the confirmed bearer-route schema:
+      // priceText + etaDays + approach (see connectors/openTask.js, which
+      // posts to /agent/tasks/{id}/bids — the browser route at
+      // /tasks/{id}/bids always 401s for an API token).
       const result = await connector.submitBid(raw.id, {
-        amountUsd: Math.round(reward * BID_RATIO * 100) / 100,
-        proposal: proposalText,
+        priceText: `${Math.round(reward * BID_RATIO * 100) / 100} ${raw.budgetCurrency || "USDC"}`,
+        etaDays: DEFAULT_ETA_DAYS,
+        approach: proposalText,
       });
       _attemptedTaskIds.add(raw.id);
       return result;
     } catch (err) {
-      // Mark it attempted even on failure. A task that consistently 401s
+      // Mark it attempted even on failure. A task that consistently fails
       // (e.g. quietly closed/expired server-side despite still listing as
       // "open") would otherwise get re-drafted and re-attempted forever,
       // every single /opentask run, burning LLM calls on something that
