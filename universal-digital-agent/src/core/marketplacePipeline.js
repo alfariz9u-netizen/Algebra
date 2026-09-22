@@ -16,10 +16,24 @@ const riskEngine = require("./riskEngine");
  * Every step is honest about failure: a connector without credentials
  * throws from inside `callConnector`'s wrapped function and the cycle
  * reports that opportunity as failed rather than skipping it silently.
+ *
+ * LEARNING: this used to have no memory of its own failures, so a
+ * connector with no credentials (CREDENTIAL_REQUIRED), a submit endpoint
+ * rejecting every request (401 Unauthorized), or a specific listing with
+ * no usable budget field would fail the exact same way every single
+ * cycle, forever — including paying for a fresh LLM-drafted proposal each
+ * time on a submission that was always going to fail. `this.agent.learning`
+ * (a `LearningEngine`) now backs three things here: a circuit breaker that
+ * stops attempting an operation that keeps failing the same structural
+ * way (with backoff, and automatic half-open retries), a dead-opportunity
+ * memory that skips a specific listing already found unbiddable, and a
+ * calibrated success probability that lets the strategy's static guess
+ * (e.g. "40% win rate") be corrected by this connector's own real history.
  */
 class MarketplacePipeline {
   constructor(agent) {
     this.agent = agent;
+    this.learning = agent.learning;
   }
 
   /** Shared approval gate — mirrors the logic UniversalAgent.processTask uses for capabilities. */
@@ -68,31 +82,80 @@ class MarketplacePipeline {
       return { status: "pending_human_approval", stage: "discover", riskLevel: discoverApproval.riskLevel };
     }
 
-    const rawList = await this.agent.callConnector(
-      strategy.connectorName,
-      strategy.discoverOperation,
-      strategy.discoverPermission,
-      () => strategy.discover(this.agent.connectors.get(strategy.connectorName))
-    );
+    // Circuit breaker: if discovery OR submission for this connector has
+    // been failing the same structural way (CREDENTIAL_REQUIRED, 401, ...)
+    // recently, skip the whole cycle rather than repeat a guaranteed
+    // failure — including the LLM draft that would follow discovery, which
+    // is the expensive part. `checkCircuit` on the submit side is checked
+    // here too (before discovery) precisely because there is no point
+    // discovering and drafting a proposal for a submission that cannot
+    // currently succeed.
+    const discoverGate = this.learning ? this.learning.checkCircuit(strategy.connectorName, strategy.discoverOperation) : { open: false };
+    if (discoverGate.open) {
+      return { status: "skipped_circuit_open", stage: "discover", ...discoverGate };
+    }
+    const submitGate = this.learning ? this.learning.checkCircuit(strategy.connectorName, strategy.submitOperation) : { open: false };
+    if (submitGate.open) {
+      return { status: "skipped_circuit_open", stage: "submit", ...submitGate };
+    }
+
+    let rawList;
+    try {
+      rawList = await this.agent.callConnector(
+        strategy.connectorName,
+        strategy.discoverOperation,
+        strategy.discoverPermission,
+        () => strategy.discover(this.agent.connectors.get(strategy.connectorName))
+      );
+      if (this.learning) this.learning.recordSuccess(strategy.connectorName, strategy.discoverOperation);
+    } catch (err) {
+      if (this.learning) this.learning.recordFailure(strategy.connectorName, strategy.discoverOperation, err);
+      throw err;
+    }
 
     const opportunities = await Promise.all(
       rawList.map(async (raw) => normalizeOpportunity(await strategy.toOpportunity(raw), strategy.connectorName))
     );
     for (const opp of opportunities) {
       this.agent.economics.record({ type: "task_discovered", connector: strategy.connectorName });
+      // Calibrate the strategy's static win-rate guess against this
+      // connector's own observed attempt/win history (no-op — returns the
+      // strategy's own guess unchanged — until real attempts accumulate).
+      if (this.learning) opp.successProbability = this.learning.calibratedSuccessProbability(strategy.connectorName, opp.successProbability);
     }
 
     const { accepted, rejected } = rankOpportunities(opportunities, { minExpectedValue });
     for (const opp of rejected) {
-      this.agent.economics.record({ type: "task_rejected", connector: strategy.connectorName, expectedValueUsd: opp.expectedValue });
+      this.agent.economics.record({
+        type: "task_rejected",
+        connector: strategy.connectorName,
+        expectedValueUsd: opp.expectedValue,
+        reason: opp.rejectionReason,
+      });
     }
 
+    // Skip listings already known (from a previous cycle) to be
+    // structurally unbiddable — e.g. a specific job missing its budget
+    // field. This is what actually stops the "drafted a proposal, but did
+    // not submit it: no usable budget" message from repeating forever for
+    // the same recurring listing.
+    const { toProcess, skipped } = this.learning
+      ? this.learning.partitionKnownDead(strategy.connectorName, accepted)
+      : { toProcess: accepted, skipped: [] };
+
     const results = [];
-    for (const opp of accepted.slice(0, maxOpportunities)) {
+    for (const opp of toProcess.slice(0, maxOpportunities)) {
       results.push(await this._processOpportunity(strategy, opp));
     }
 
-    return { status: "completed", discovered: opportunities.length, accepted: accepted.length, rejected: rejected.length, results };
+    return {
+      status: "completed",
+      discovered: opportunities.length,
+      accepted: accepted.length,
+      rejected: rejected.length,
+      skippedKnownDead: skipped.length,
+      results,
+    };
   }
 
   async _processOpportunity(strategy, opportunity) {
@@ -124,6 +187,10 @@ class MarketplacePipeline {
         strategy.submitPermission,
         () => strategy.submit(this.agent.connectors.get(strategy.connectorName), opportunity.raw, outcome.output)
       );
+      if (this.learning) {
+        this.learning.recordSuccess(strategy.connectorName, strategy.submitOperation);
+        this.learning.recordAttempt(strategy.connectorName, { won: true });
+      }
 
       this.agent.economics.record({
         type: "task_completed",
@@ -137,6 +204,14 @@ class MarketplacePipeline {
       return { opportunity, outcome, submission, learning };
     } catch (err) {
       this.agent.economics.record({ type: "task_failed", connector: strategy.connectorName });
+      if (this.learning) {
+        this.learning.recordAttempt(strategy.connectorName, { won: false });
+        const failure = this.learning.recordFailure(strategy.connectorName, strategy.submitOperation, err);
+        // A "listing_defect" (e.g. no usable budget on this one job) never
+        // opens the connector-wide circuit — it's this specific listing
+        // that's broken, not the connector — so remember just this id.
+        if (failure.perListing) this.learning.markOpportunityDead(strategy.connectorName, opportunity.id, err.message);
+      }
       return { opportunity, outcome, submissionError: err.message };
     }
   }
@@ -208,6 +283,10 @@ class MarketplacePipeline {
       const submission = await this.agent.callConnector(connectorName, "deliverWork", "SUBMIT_TASK", () =>
         this.agent.connectors.get(connectorName).deliverWork(jobId, { content: outcome.output })
       );
+      if (this.learning) {
+        this.learning.recordSuccess(connectorName, "deliverWork");
+        this.learning.recordAttempt(connectorName, { won: true });
+      }
       this.agent.economics.record({
         type: "task_completed",
         connector: connectorName,
@@ -219,6 +298,7 @@ class MarketplacePipeline {
       return { jobId, outcome, submission, learning };
     } catch (err) {
       this.agent.economics.record({ type: "task_failed", connector: connectorName });
+      if (this.learning) this.learning.recordFailure(connectorName, "deliverWork", err);
       return { jobId, outcome, submissionError: err.message };
     }
   }
