@@ -137,6 +137,47 @@ export MCP_ALLOWED_TOOLS=tool_one,tool_two   # explicit allow-list, deny by defa
 No environment variable needed — the caller supplies a target agent's base
 URL per call (`agent.connectors.get("a2a").fetchAgentCard(url)`).
 
+#### A2A inbound — making this agent discoverable/hireable (`src/a2aServer.js`)
+
+The above is the OUTBOUND client (this agent calling another agent). To
+let OTHER agents discover and call THIS agent, run the separate inbound
+server:
+
+```bash
+export A2A_SERVER_PORT=8787
+export A2A_SERVER_PUBLIC_URL=https://your-service.onrender.com   # the URL others will reach it at
+export A2A_SERVER_SHARED_SECRET="a long random token"            # optional but recommended
+npm run a2a-server
+```
+
+Serves `GET /.well-known/agent-card.json` (public discovery — always
+unauthenticated, per spec norms: an agent that can't be found can't be
+hired) and `POST /a2a` (JSON-RPC 2.0, `message/send` only — no
+`tasks/get` polling or streaming yet). Every inbound message runs through
+the *exact same* `UniversalAgent.processTask()` pipeline as every other
+task source: risk/autonomy gate (a request that maps to a MEDIUM/HIGH-risk
+capability lands in the human approval queue, it does not auto-execute
+just because a remote agent asked), budget preflight, verification, QA —
+and the caller's text is always treated as `untrustedContent`, never as
+instructions to the framework itself. A dedicated per-IP rate limiter
+(separate from the outbound connector limiter, so a noisy public endpoint
+can't starve the agent's own marketplace bidding) and a request-size cap
+protect against abuse. Proven in `test/a2a_server.test.js`.
+
+The A2A `message/send` spec carries no payment mechanism — `rewardUsd`
+recorded for an inbound request is whatever the caller *self-reports* in
+`message.metadata.rewardUsd`, unverified. Treat this channel as reputation-
+/service-building unless payment is separately arranged (escrow, invoice,
+a platform wrapping A2A) — see the HONESTY NOTEs at the top of
+`src/a2aServer.js`.
+
+On Render specifically: the service's local disk is ephemeral by
+default — `PERSIST_DIR` state (including `LearningEngine`'s circuit
+breaker/dead-listing memory) survives within one running process but is
+wiped on every redeploy/restart unless you attach a persistent disk and
+point `PERSIST_DIR` at it. The rate limiter and shared-secret check above
+work regardless of persistence config.
+
 ## 5. Persistence (optional)
 
 ```bash
