@@ -16,6 +16,18 @@
  * been observed — the fix was route confusion: the write path is
  * /agent/tasks/{id}/bids (bearer route), NOT /tasks/{id}/bids (browser
  * route). See connectors/openTask.js for the corrected submitBid.
+ *
+ * QA FIX #1: the deliverable is drafted by the `proposal` capability (the
+ * goal literally asks for a proposal), but the task type was declared as
+ * "communication". The verification layer compares those two and rejects
+ * on mismatch. Type is now declared as "proposal" so the criteria matches
+ * what actually gets produced.
+ *
+ * QA FIX #2: even after the type fix, QA kept rejecting because the
+ * proposal read as too generic ("I can help", no concrete file names,
+ * no tools, no timeline). The goal is now a structured brief that
+ * forbids filler and mandates: named deliverable files, concrete tools,
+ * an ETA in days, and one clarifying question.
  */
 
 const MIN_REWARD_USD = Number(process.env.OPENTASK_MIN_REWARD_USD || 1);
@@ -56,6 +68,42 @@ function estimateWinRate(rewardUsd) {
   return base;
 }
 
+/**
+ * The proposal-writing brief. Structured on purpose: OpenTask's QA layer
+ * rejects generic proposals ("I can help", "I am a good fit") as
+ * unverifiable. This brief forces concrete, checkable content instead.
+ */
+function buildProposalGoal() {
+  return [
+    "Draft a concise, professional proposal for this task.",
+    "",
+    "MANDATORY STRUCTURE — the proposal MUST contain all four sections:",
+    "",
+    "1. DELIVERABLE: Name the exact file(s) you will produce.",
+    "   Example: 'openapi.yaml (OpenAPI 3.0 spec)', 'csv_to_json.py (Python 3.11 script)'.",
+    "   DO NOT write vague nouns like 'the document' or 'the solution'.",
+    "",
+    "2. EXECUTION STEPS: List 3-5 numbered, concrete steps.",
+    "   Each step must name a specific tool, library, or standard.",
+    "   Example: '1. Parse input with Python csv module. 2. Validate against",
+    "   jsonschema. 3. Run pytest suite (12 tests). 4. Package + README.'.",
+    "",
+    "3. TIMELINE: State the delivery window in days (e.g. 'Delivery in 2 days').",
+    "",
+    "4. CLARIFYING QUESTION: End with one specific question about the task",
+    "   that shows domain expertise.",
+    "",
+    "FORBIDDEN PHRASES (using any of these will cause automatic rejection):",
+    "- 'I am a good fit'",
+    "- 'I can help'",
+    "- 'I have experience'",
+    "- 'I am confident'",
+    "- Any sentence that could apply to any task on any platform.",
+    "",
+    "Tone: confident, specific, technical. Output plain text only. No markdown headers.",
+  ].join("\n");
+}
+
 const openTaskStrategy = {
   connectorName: "openTask",
 
@@ -83,10 +131,13 @@ const openTaskStrategy = {
 
   toTask: (raw) => ({
     id: `opentask-bid-${raw.id}`,
-    type: "communication",
+    // QA FIX #1: type matches the `proposal` capability that actually
+    // produces the deliverable (the goal below asks for a proposal).
+    type: "proposal",
     input: {
-      context: `Open task on OpenTask.ai — Title: "${raw.title}". Description: ${raw.description || raw.skillsTags?.join(", ") || "n/a"}. Budget: ${raw.budgetText || (extractReward(raw) != null ? `${extractReward(raw)} ${raw.budgetCurrency || "USDC"}` : "unspecified")}.`,
-      goal: "Draft a concise, professional proposal for this task, explaining your approach and why you're a good fit.",
+      context: `Open task on OpenTask.ai — Title: "${raw.title}". Description: ${raw.description || raw.skillsTags?.join(", ") || "n/a"}. Budget: ${raw.budgetText || (extractReward(raw) != null ? `${extractReward(raw)} ${raw.budgetCurrency || "USDC"}` : "unspecified")}. Required skills: ${Array.isArray(raw.skillsTags) ? raw.skillsTags.join(", ") : "n/a"}.`,
+      // QA FIX #2: structured brief forbidding generic filler.
+      goal: buildProposalGoal(),
       raw, // preserved so the post-approval auto-submit step can rebuild the real bid
     },
     untrustedContent: raw.description || raw.title,
