@@ -309,3 +309,58 @@ No network or API keys required — tests use a local fixture server shaped
 like the real Gemini/xAI APIs to verify request/response handling, plus pure
 unit tests for the deterministic subsystems (budgeting, permissions, kill
 switch, prompt-injection guard, connector honesty, audit redaction).
+
+## 9. Running everything on one free Render service
+
+`npm run a2a-server`, `npm run telegram-bot`, and the marketplace pipeline
+each ran as separate processes/scripts up to this point. Render's free
+tier gives ~750 instance-hours/month per workspace — enough for ONE
+always-on service, not several — so running all three together requires
+combining them into one process:
+
+```bash
+npm run start:combined   # src/combinedServer.js
+```
+
+This runs, in one process sharing one agent: the A2A server (the only
+listening port — this is what Render treats as "the service" and what
+should receive external health pings), the Telegram approval bot (if
+`TELEGRAM_BOT_TOKEN` is set), and a scheduler that runs one
+`MarketplacePipeline` cycle per strategy every `MARKETPLACE_CYCLE_MS`
+(default 30 minutes — matching the cadence already observed in
+production). A failure in any one of the three is caught and logged, not
+allowed to crash the others.
+
+To keep Render from spinning this down after 15 minutes of no incoming
+traffic (which would silently kill the Telegram poll loop and the
+scheduler along with the HTTP server — Render's idle timer only resets on
+inbound requests, not on background CPU activity), point a free external
+uptime monitor (UptimeRobot, cron-job.org, etc.) at:
+
+```
+GET https://<your-service>.onrender.com/healthz
+```
+
+on a schedule under 15 minutes (10-14 min is typical). Running one
+service this way uses close to the full 750 free hours for the month —
+there usually isn't headroom left for a second always-on free Render
+service on the same workspace.
+
+Set `PERSIST_DIR` for this combined process — the Telegram bot's approval
+notifications are read from the same persisted approval-queue file the
+agent writes to, even though they're in the same process now (see
+`src/combinedServer.js` for why). Render's disk is otherwise ephemeral
+across redeploys (see the MCP/A2A sections above), which doesn't affect
+this — it only needs to survive the one running process.
+
+**Watching LLM free-tier consumption**: the default marketplace cadence
+(3 strategies × 1 opportunity every 30 min, plus QA grading) is roughly
+150-200 model calls/day on its own — comfortably inside most providers'
+free daily quota. What can push it higher: an A2A inbound endpoint left
+open to the whole internet (keep `A2A_SERVER_SHARED_SECRET` set), and the
+MCP tool-use loop if enabled (keep `MCP_MAX_TOOL_ITERATIONS` low, e.g. 1-2,
+until you've watched real usage). Gemini in particular retires models on
+a strict ~12-month cycle and fully shuts the old endpoint off (no
+auto-redirect) — if calls start failing outright, check
+https://ai.google.dev/gemini-api/docs/deprecations and set `GEMINI_MODEL`
+to the current replacement.
