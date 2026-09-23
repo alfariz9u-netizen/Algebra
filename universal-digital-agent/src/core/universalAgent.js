@@ -186,10 +186,17 @@ class UniversalAgent {
       return this._fail(taskId, `Token/compute budget exceeded: ${preflight.reasons.join("; ")}`);
     }
 
-    // 6. Execute — the ONE real LLM call this task needs for this capability.
+    // 6. Execute — the ONE real LLM call this task needs for this capability,
+    // UNLESS the capability opts into tool-use (`allowsTools: true`, currently
+    // only webResearch) AND a real MCP tool server is connected — in which
+    // case a small, hard-bounded tool loop runs instead (see
+    // _executeWithTools). Every other capability, and webResearch itself when
+    // no MCP server is configured, behaves exactly as before.
     let generation;
     try {
-      generation = await this.modelRouter.generate(capability.systemPrompt, userPrompt, capability.tier);
+      generation = capability.allowsTools
+        ? await this._executeWithTools(capability, userPrompt)
+        : await this.modelRouter.generate(capability.systemPrompt, userPrompt, capability.tier);
     } catch (err) {
       this.audit.record({
         agentId: this.agentId,
@@ -352,6 +359,64 @@ class UniversalAgent {
     } catch (err) {
       this.audit.record({ agentId: this.agentId, connector: connectorName, action: operation, result: "ERROR", error: err.message, riskLevel: riskEngine.classify(permissionAction) });
       throw err;
+    }
+  }
+
+  /**
+   * Runs a capability's execution through the bounded MCP tool-use loop
+   * instead of a single plain call — only reached for a capability with
+   * `allowsTools: true` (currently just webResearch). Degrades to the
+   * exact plain `modelRouter.generate()` call at every point where tools
+   * aren't actually usable right now, rather than failing the task:
+   *   - no MCP server configured / not CONNECTED
+   *   - the connector-wide MCP circuit is open (see learningEngine.js —
+   *     MCP has been failing the same structural way recently)
+   *   - `tools/list` itself fails
+   *   - the server's advertised tools don't intersect this process's
+   *     explicit MCP_ALLOWED_TOOLS allow-list (McpClient enforces this
+   *     again per-call regardless; filtering here just avoids offering
+   *     the model a tool it will only get refused for trying)
+   *   - the tool loop throws for any other reason
+   * Every actual tool call still goes through `callConnector` (kill
+   * switch, rate limit, audit) exactly like any other connector call.
+   */
+  async _executeWithTools(capability, userPrompt) {
+    const fallback = () => this.modelRouter.generate(capability.systemPrompt, userPrompt, capability.tier);
+
+    if (this.connectors.status("mcp") !== "CONNECTED") return fallback();
+    const circuit = this.learning.checkCircuit("mcp", "callTool");
+    if (circuit.open) return fallback();
+
+    const mcp = this.connectors.get("mcp");
+    let advertised;
+    try {
+      advertised = await this.callConnector("mcp", "listTools", "USE_MCP_TOOL", () => mcp.listTools());
+    } catch (err) {
+      this.learning.recordFailure("mcp", "listTools", err);
+      return fallback();
+    }
+
+    const tools = (advertised || [])
+      .filter((t) => mcp.allowedTools.has(t.name))
+      .map((t) => ({ name: t.name, description: t.description || "", parameters: t.inputSchema || { type: "object", properties: {} } }));
+    if (tools.length === 0) return fallback();
+
+    try {
+      const result = await this.modelRouter.runToolLoop({
+        systemPrompt: capability.systemPrompt,
+        userPrompt,
+        tier: capability.tier,
+        tools,
+        executeTool: (name, args) => this.callConnector("mcp", "callTool", "USE_MCP_TOOL", () => mcp.callTool(name, args)),
+      });
+      this.learning.recordSuccess("mcp", "callTool");
+      for (const call of result.toolCallLog) {
+        this.audit.record({ agentId: this.agentId, connector: "mcp", action: `TOOL_LOOP_CALL:${call.name}`, result: call.ok ? "SUCCESS" : "ERROR", riskLevel: "MEDIUM" });
+      }
+      return result;
+    } catch (err) {
+      this.learning.recordFailure("mcp", "callTool", err);
+      return fallback();
     }
   }
 
