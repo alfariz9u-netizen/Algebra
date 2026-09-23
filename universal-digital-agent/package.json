@@ -11,6 +11,7 @@
     "start": "node src/index.js",
     "telegram-bot": "node src/telegramApprovalBot.js",
     "a2a-server": "node src/a2aServer.js",
+    "start:combined": "node src/combinedServer.js",
     "test": "node --test",
     "test:watch": "node --test --watch",
     "test:coverage": "node --test --experimental-test-coverage"
