@@ -4,12 +4,23 @@
  * Real client for the Gemini API (Google AI Studio / Generative Language API).
  * Docs: https://ai.google.dev/gemini-api/docs
  *
- * Free tier: Google AI Studio issues API keys with a genuine free quota for
- * models like gemini-2.0-flash / gemini-1.5-flash. Get a key at
+ * Free tier: Google AI Studio issues API keys with a genuine free quota
+ * (currently roughly ~1,500 requests/day for gemini-2.5-flash, but Google
+ * no longer publishes a fixed number — check the actual figure for your
+ * project at https://aistudio.google.com). Get a key at
  * https://aistudio.google.com/apikey and set GEMINI_API_KEY.
+ *
+ * MODEL LIFECYCLE WARNING: Gemini models are retired on a roughly 12-month
+ * cycle and, unlike some providers, a retired model's endpoint is fully
+ * shut down (calls fail outright), not redirected to a replacement.
+ * gemini-2.0-flash — this file's old default — was shut down June 1, 2026.
+ * If GEMINI_MODEL isn't set explicitly and calls start failing with a
+ * "model not found"-style error, check
+ * https://ai.google.dev/gemini-api/docs/deprecations for the current
+ * replacement and set GEMINI_MODEL to it.
  */
 
-const DEFAULT_MODEL = process.env.GEMINI_MODEL || "gemini-2.0-flash";
+const DEFAULT_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 const API_BASE = process.env.GEMINI_API_BASE || "https://generativelanguage.googleapis.com/v1beta";
 
 class GeminiClient {
