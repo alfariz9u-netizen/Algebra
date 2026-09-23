@@ -8,9 +8,6 @@ const AgentBazaarConnector = require("./connectors/agentBazaar");
 const AzureMarketplaceConnector = require("./connectors/azureMarketplace");
 const OpenTaskConnector = require("./connectors/openTask");
 const MoltMarketConnector = require("./connectors/moltMarket");
-const MoltJobsConnector = require("./connectors/moltJobs");
-const AgentMarketConnector = require("./connectors/agentMarket");
-const TokuAgencyConnector = require("./connectors/tokuAgency");
 const GithubConnector = require("./connectors/github");
 const McpClient = require("./connectors/mcpClient");
 const A2aClient = require("./connectors/a2aClient");
@@ -75,31 +72,12 @@ function buildAgent() {
     statusFn: () => moltMarket.status(),
   });
 
-  const moltJobs = new MoltJobsConnector();
-  agent.connectors.register("moltJobs", {
-    instance: moltJobs,
-    capabilities: ["discoverJobs", "getJob", "whoami", "heartbeat", "applyToJob", "submitWork", "getWallet"],
-    statusFn: () => moltJobs.status(),
-  });
-
-  const agentMarket = new AgentMarketConnector();
-  agent.connectors.register("agentMarket", {
-    instance: agentMarket,
-    capabilities: ["discoverTasks", "getTask", "whoami", "getWallet", "bidOnTask", "listBids", "acceptTask", "completeTask"],
-    statusFn: () => agentMarket.status(),
-  });
-
-  const tokuAgency = new TokuAgencyConnector();
-  agent.connectors.register("tokuAgency", {
-    instance: tokuAgency,
-    capabilities: ["discoverJobs", "getJob", "getProfile", "submitBid", "deliverJob"],
-    statusFn: () => tokuAgency.status(),
-  });
-
   const mcp = new McpClient({ serverUrl: process.env.MCP_SERVER_URL, allowedTools: (process.env.MCP_ALLOWED_TOOLS || "").split(",").filter(Boolean) });
   agent.connectors.register("mcp", {
     instance: mcp,
-    capabilities: ["USE_MCP_TOOL"],
+    // Operation names (matched by callConnector's supports() check), not the
+    // USE_MCP_TOOL permission constant — see universalAgent._executeWithTools.
+    capabilities: ["listTools", "callTool"],
     statusFn: () => mcp.status(),
   });
 
@@ -111,23 +89,6 @@ function buildAgent() {
   });
 
   return agent;
-}
-
-// ---- AgentBazaar MCP Server (Background) ----
-if (process.env.ENABLE_AGENTBAZAAR_MCP === "true") {
-  const { spawn } = require("node:child_process");
-  try {
-    const mcpProc = spawn("npx", ["-y", "@agentsbazaar/mcp"], {
-      env: { ...process.env },
-      stdio: "inherit",
-      detached: false,
-    });
-    mcpProc.on("error", (err) => console.error("[AgentBazaar MCP] error:", err.message));
-    mcpProc.on("close", (code) => console.log("[AgentBazaar MCP] exited with code", code));
-    console.log("[AgentBazaar MCP] Server starting in background...");
-  } catch (err) {
-    console.error("[AgentBazaar MCP] Failed to start:", err.message);
-  }
 }
 
 async function main() {
