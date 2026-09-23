@@ -27,22 +27,42 @@ class GrokClient {
   /**
    * @param {string} systemPrompt - Role/instructions for the agent.
    * @param {string} userPrompt - The task-specific content.
-   * @returns {Promise<{ text: string, raw: object }>}
+   * @param {{ tools?: Array<{name,description,parameters}>, history?: Array }} [opts] -
+   *   `tools` offers real function-calling via xAI's OpenAI-compatible API
+   *   (https://docs.x.ai/docs/guides/function-calling) — omit for a plain
+   *   single-turn call (unchanged existing behavior). `history` mirrors
+   *   geminiClient.js's provider-agnostic turn shape.
+   * @returns {Promise<{ text: string, raw: object, usage: object|null, toolCall: {name,args}|null }>}
    */
-  async generate(systemPrompt, userPrompt) {
+  async generate(systemPrompt, userPrompt, { tools, history = [] } = {}) {
     if (!this.isConfigured) {
       throw new Error("XAI_API_KEY is not set. Create one at https://console.x.ai");
     }
 
     const url = `${this.apiBase}/chat/completions`;
 
-    const body = {
-      model: this.model,
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userPrompt },
-      ],
-    };
+    const messages = [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userPrompt },
+    ];
+    let pendingCallId = null;
+    for (const turn of history) {
+      if (turn.role === "model") {
+        pendingCallId = `call_${messages.length}`;
+        messages.push({
+          role: "assistant",
+          content: null,
+          tool_calls: [{ id: pendingCallId, type: "function", function: { name: turn.toolCall.name, arguments: JSON.stringify(turn.toolCall.args || {}) } }],
+        });
+      } else if (turn.role === "tool") {
+        messages.push({ role: "tool", tool_call_id: pendingCallId, content: JSON.stringify(turn.result) });
+      }
+    }
+
+    const body = { model: this.model, messages };
+    if (tools && tools.length) {
+      body.tools = tools.map((t) => ({ type: "function", function: { name: t.name, description: t.description || "", parameters: t.parameters || { type: "object", properties: {} } } }));
+    }
 
     const response = await fetch(url, {
       method: "POST",
@@ -60,8 +80,23 @@ class GrokClient {
       throw new Error(message);
     }
 
-    const text = raw?.choices?.[0]?.message?.content || "";
-    return { text, raw };
+    const message_ = raw?.choices?.[0]?.message;
+    const toolCallRaw = message_?.tool_calls?.[0];
+    let toolCall = null;
+    if (toolCallRaw) {
+      let args = {};
+      try {
+        args = JSON.parse(toolCallRaw.function.arguments || "{}");
+      } catch {
+        args = {};
+      }
+      toolCall = { name: toolCallRaw.function.name, args };
+    }
+    const text = message_?.content || "";
+    const usage = raw?.usage
+      ? { inputTokens: raw.usage.prompt_tokens, outputTokens: raw.usage.completion_tokens, totalTokens: raw.usage.total_tokens }
+      : null;
+    return { text, raw, usage, toolCall };
   }
 }
 
