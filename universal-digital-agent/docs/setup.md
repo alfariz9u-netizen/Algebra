@@ -132,6 +132,31 @@ export MCP_SERVER_URL=https://your-mcp-server/endpoint
 export MCP_ALLOWED_TOOLS=tool_one,tool_two   # explicit allow-list, deny by default
 ```
 
+Once set, two things become true:
+
+1. `agent.connectors.get("mcp")` is `CONNECTED` and callable manually
+   (`await mcp.listTools()`, `await mcp.callTool(name, args)`), same as
+   before.
+2. **New**: the `webResearch` capability (the one capability whose whole
+   job structurally requires current external information) will actually
+   use it. `UniversalAgent._executeWithTools()` runs a small, hard-bounded
+   tool-use loop (`MCP_MAX_TOOL_ITERATIONS`, default 3 round-trips) via
+   real Gemini/xAI function-calling: the model can ask for one of the
+   server's allow-listed tools, gets a real result back, and can ask again
+   before giving its final answer. Every tool call still goes through
+   `callConnector` (kill switch, rate limiter, audit) exactly like any
+   other connector call, and a failure anywhere in the chain — the server
+   unreachable, `tools/list` failing, the circuit breaker open from recent
+   repeated failures (`learningEngine.js`) — degrades to the *exact* old
+   single-call behavior rather than failing the task. No other capability
+   is affected; this is opt-in per capability (`allowsTools: true` in
+   `src/capabilities/definitions.js`), not a global change to how the
+   agent calls the model. Proven in `test/mcp_tool_loop.test.js`.
+
+If you want a different capability to be able to use MCP tools too, add
+`allowsTools: true` to its definition — no other wiring needed, the same
+`_executeWithTools` path picks it up automatically.
+
 ### A2A
 
 No environment variable needed — the caller supplies a target agent's base
