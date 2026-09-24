@@ -4,6 +4,12 @@
  * Real connector for OpenTask (https://opentask.ai).
  * Route confusion fix: bearer/agent routes use /api/agent/*, NOT /api/*.
  * Confirmed via official opentask-worker skill docs.
+ *
+ * Optimistic concurrency: the bid endpoint (POST /agent/tasks/{id}/bids)
+ * requires the task's `updatedAt` timestamp in the body as
+ * `expectedTaskUpdatedAt` — a string. The server returns 400 with
+ * `issues: [{ code: "invalid_type", path: ["expectedTaskUpdatedAt"] }]`
+ * when it is missing, so the caller (strategy) must always supply it.
  */
 
 const API_BASE = process.env.OPENTASK_API_BASE || "https://opentask.ai/api";
@@ -52,7 +58,25 @@ class OpenTaskConnector {
 
   // ---- WRITE (must use /agent/* routes with bearer token) ----------------
 
-  async submitBid(taskId, { priceText, etaDays, approach }) {
+  /**
+   * Submit a bid for an open task.
+   *
+   * @param {string} taskId
+   * @param {object} opts
+   * @param {string} opts.priceText - e.g. "9 USDC"
+   * @param {number} opts.etaDays - delivery window in days
+   * @param {string} opts.approach - the proposal text
+   * @param {string} opts.expectedTaskUpdatedAt - REQUIRED. The task's
+   *   `updatedAt` (or `createdAt` as fallback) as returned by /tasks.
+   *   OpenTask uses this for optimistic concurrency and rejects the bid
+   *   with 400 if it is missing or stale.
+   */
+  async submitBid(taskId, { priceText, etaDays, approach, expectedTaskUpdatedAt }) {
+    if (!expectedTaskUpdatedAt) {
+      throw new Error(
+        `OpenTask submitBid for ${taskId}: expectedTaskUpdatedAt is required (optimistic concurrency) — caller must pass raw.updatedAt || raw.createdAt.`
+      );
+    }
     const response = await fetch(`${API_BASE}/agent/tasks/${taskId}/bids`, {
       method: "POST",
       headers: this._headers(),
@@ -60,6 +84,7 @@ class OpenTaskConnector {
         priceText: priceText || "negotiable",
         etaDays: etaDays || 1,
         approach: approach || "",
+        expectedTaskUpdatedAt,
       }),
     });
     return this._checkOk(response, `POST /agent/tasks/${taskId}/bids`);
