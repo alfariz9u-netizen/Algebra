@@ -3,52 +3,54 @@
 const UniversalAgent = require("./core/universalAgent");
 const ColonyConnector = require("./connectors/colony");
 const ArtifactCouncilConnector = require("./connectors/artifactCouncil");
-const AgencConnector = require("./connectors/agenc");
+const AgenCConnector = require("./connectors/agenc");
 const AgentBazaarConnector = require("./connectors/agentBazaar");
 const AzureMarketplaceConnector = require("./connectors/azureMarketplace");
 const OpenTaskConnector = require("./connectors/openTask");
-const MoltMarketConnector = require("./connectors/moltMarket");
 const GithubConnector = require("./connectors/github");
+const MoltMarketConnector = require("./connectors/moltMarket");
+const MoltJobsConnector = require("./connectors/moltJobs");
+const AgentMarketConnector = require("./connectors/agentMarket");
+const TokuAgencyConnector = require("./connectors/tokuAgency");
 const McpClient = require("./connectors/mcpClient");
 const A2aClient = require("./connectors/a2aClient");
 
 function buildAgent() {
-  const persistDir = process.env.PERSIST_DIR || null;
-  const agent = new UniversalAgent(persistDir ? { persistDir } : {});
+  const agent = new UniversalAgent();
 
   const colony = new ColonyConnector();
   agent.connectors.register("colony", {
     instance: colony,
-    capabilities: ["searchPosts", "postFinding", "commentOnPost", "sendMessage"],
+    capabilities: colony.capabilities(),
     statusFn: () => colony.status(),
   });
 
   const artifactCouncil = new ArtifactCouncilConnector();
   agent.connectors.register("artifactCouncil", {
     instance: artifactCouncil,
-    capabilities: ["browseDirectory", "getArtifact"],
+    capabilities: ["discoverTasks", "submitDeliverable"],
     statusFn: () => artifactCouncil.status(),
   });
 
-  const agenc = new AgencConnector();
+  const agenc = new AgenCConnector();
   agent.connectors.register("agenc", {
     instance: agenc,
-    capabilities: ["fetchIncomingTasks", "submitDeliverable"],
+    capabilities: ["discoverTasks", "submitBid"],
     statusFn: () => agenc.status(),
   });
 
   const agentBazaar = new AgentBazaarConnector();
   agent.connectors.register("agentBazaar", {
     instance: agentBazaar,
-    capabilities: ["fetchIncomingTasks", "submitDeliverable", "stats"],
+    capabilities: ["discoverTasks", "submitBid"],
     statusFn: () => agentBazaar.status(),
   });
 
-  const azure = new AzureMarketplaceConnector();
+  const azureMarketplace = new AzureMarketplaceConnector();
   agent.connectors.register("azureMarketplace", {
-    instance: azure,
-    capabilities: ["fetchIncomingTasks", "submitDeliverable"],
-    statusFn: () => azure.status(),
+    instance: azureMarketplace,
+    capabilities: ["discoverTasks", "submitDeliverable"],
+    statusFn: () => azureMarketplace.status(),
   });
 
   const openTask = new OpenTaskConnector();
@@ -61,15 +63,48 @@ function buildAgent() {
   const github = new GithubConnector();
   agent.connectors.register("github", {
     instance: github,
-    capabilities: github.capabilities,
+    // "searchIssues" and "createIssueComment" added for the githubBounties
+    // strategy — it shares this same connector/credential (GITHUB_TOKEN)
+    // rather than needing a separate one.
+    capabilities: ["searchRepos", "searchIssues", "createIssueComment"],
     statusFn: () => github.status(),
   });
 
   const moltMarket = new MoltMarketConnector();
   agent.connectors.register("moltMarket", {
     instance: moltMarket,
-    capabilities: ["checkHealth", "browseOffers", "browseJobs", "getJob", "publishOffer", "createJob", "bidOnJob", "deliverWork", "approveDelivery", "getMyNotifications"],
+    capabilities: ["discoverJobs", "bidOnJob"],
     statusFn: () => moltMarket.status(),
+  });
+
+  // --- Newly registered: these three connector classes already existed in
+  // src/connectors/ and their strategies in src/core/strategies/ already
+  // referenced them, but nothing wired them into the registry — meaning
+  // agent.callConnector("moltJobs"|"agentMarket"|"tokuAgency", ...) would
+  // have thrown "Unknown connector" the moment MarketplacePipeline tried
+  // to use them. Capabilities lists match each connector's actual method
+  // names exactly (this is what callConnector's supports() check matches
+  // against — see universalAgent.js).
+
+  const moltJobs = new MoltJobsConnector();
+  agent.connectors.register("moltJobs", {
+    instance: moltJobs,
+    capabilities: ["heartbeat", "discoverJobs", "applyToJob", "submitWork"],
+    statusFn: () => moltJobs.status(),
+  });
+
+  const agentMarket = new AgentMarketConnector();
+  agent.connectors.register("agentMarket", {
+    instance: agentMarket,
+    capabilities: ["discoverTasks", "bidOnTask", "acceptTask", "completeTask"],
+    statusFn: () => agentMarket.status(),
+  });
+
+  const tokuAgency = new TokuAgencyConnector();
+  agent.connectors.register("tokuAgency", {
+    instance: tokuAgency,
+    capabilities: ["discoverJobs", "submitBid", "deliverJob"],
+    statusFn: () => tokuAgency.status(),
   });
 
   const mcp = new McpClient({ serverUrl: process.env.MCP_SERVER_URL, allowedTools: (process.env.MCP_ALLOWED_TOOLS || "").split(",").filter(Boolean) });
@@ -91,31 +126,4 @@ function buildAgent() {
   return agent;
 }
 
-async function main() {
-  const agent = buildAgent();
-
-  console.log("=== Universal Digital Agent — connector status ===");
-  console.log(JSON.stringify(agent.connectors.list(), null, 2));
-
-  const demoTask = {
-    id: "demo-task-1",
-    type: "research_report",
-    input: { topic: process.argv[2] || "the current state of AI agent marketplaces" },
-  };
-
-  console.log(`\n=== Processing ${demoTask.id} ===`);
-  const result = await agent.processTask(demoTask);
-  console.log(JSON.stringify(result, null, 2));
-
-  console.log("\n=== Dashboard ===");
-  console.log(JSON.stringify(agent.dashboard(), null, 2));
-}
-
-if (require.main === module) {
-  main().catch((err) => {
-    console.error("Fatal error:", err);
-    process.exit(1);
-  });
-}
-
-module.exports = { buildAgent, MarketplacePipeline: require("./core/marketplacePipeline") };
+module.exports = { buildAgent };
