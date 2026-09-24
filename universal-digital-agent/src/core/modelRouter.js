@@ -17,28 +17,29 @@ const GroqClient = require("../llm/groqClient");
  * NOTE: "Groq" (with a q) is a different company from "Grok" (with a k,
  * xAI). Groq = fast free inference on LPU. Grok = paid xAI model.
  *
- * Tiers map to real, distinct models so "cheap" vs "strong" is a genuine
- * model choice, not a label:
- *   fast    -> groq llama-3.1-8b-instant   / gemini-3.5-flash-lite
- *   default -> groq llama-3.3-70b-versatile / gemini-3.5-flash-lite
- *   strong  -> groq llama-3.3-70b-versatile / gemini-3.5-flash-lite
+ * MODEL IDS (Sep 2026):
+ *   Groq production models (per console.groq.com/docs/models):
+ *     - openai/gpt-oss-120b       (strong/default)
+ *     - openai/gpt-oss-20b        (fast)
+ *   The previous `llama-3.3-70b-versatile` was retired on 16 Aug 2026.
  *
- * All Gemini model IDs below are current (Sep 2026) — the old
- * gemini-2.0-flash / gemini-1.5-pro IDs are shut down and would 404.
+ *   Gemini current models (Sep 2026):
+ *     - gemini-3.5-flash-lite     (all tiers — 500 req/day free)
+ *   The old gemini-1.5-pro / gemini-2.0-flash IDs are shut down.
  */
 const TIER_MODELS = {
   fast: {
-    groq: process.env.GROQ_MODEL_FAST || "llama-3.1-8b-instant",
+    groq: process.env.GROQ_MODEL_FAST || "openai/gpt-oss-20b",
     gemini: process.env.GEMINI_MODEL_FAST || "gemini-3.5-flash-lite",
     grok: process.env.GROK_MODEL_FAST || "grok-4-fast",
   },
   default: {
-    groq: process.env.GROQ_MODEL || "llama-3.3-70b-versatile",
+    groq: process.env.GROQ_MODEL || "openai/gpt-oss-120b",
     gemini: process.env.GEMINI_MODEL || "gemini-3.5-flash-lite",
     grok: process.env.GROK_MODEL || "grok-4-fast",
   },
   strong: {
-    groq: process.env.GROQ_MODEL_STRONG || "llama-3.3-70b-versatile",
+    groq: process.env.GROQ_MODEL_STRONG || "openai/gpt-oss-120b",
     gemini: process.env.GEMINI_MODEL_STRONG || "gemini-3.5-flash-lite",
     grok: process.env.GROK_MODEL_STRONG || "grok-4",
   },
@@ -89,9 +90,20 @@ class ModelRouter {
   }
 
   /**
-   * Bounded tool-use loop — see original docstring for full behavior.
-   * A tool failure does NOT throw out of the loop; the error is fed back
-   * to the model as the tool's result so it can adapt.
+   * Bounded tool-use loop (spec: "minimum necessary intelligence calls" —
+   * this is the deliberate, opt-in exception, not a default). Calls
+   * `generate()` up to `maxIterations + 1` times; whenever the model
+   * requests a tool, `executeTool(name, args)` runs it and the result is
+   * fed back for the next turn. Stops as soon as the model returns plain
+   * text instead of a tool call, or when `maxIterations` is exhausted
+   * (returns whatever text is available then, `truncated: true`) — never
+   * loops unboundedly regardless of what the model asks for.
+   *
+   * A tool failure does NOT throw out of the loop — the error is fed back
+   * to the model as the tool's result (as `{ error: message }`) so it can
+   * adapt (try different args, a different tool, or give up gracefully
+   * and answer with what it has), matching how a real tool-user would
+   * behave, rather than crashing the whole task over one bad call.
    */
   async runToolLoop({
     systemPrompt,
@@ -170,11 +182,13 @@ class ModelRouter {
     };
   }
 
-  /** Embeddings — Gemini only. */
+  /** Real embeddings, used by the semantic memory cache. Gemini only. */
   async embed(text) {
     const gemini = new GeminiClient();
     if (!gemini.isConfigured) {
-      throw new Error("Semantic cache requires GEMINI_API_KEY (embeddings are Gemini-only in this build).");
+      throw new Error(
+        "Semantic cache requires GEMINI_API_KEY (embeddings are Gemini-only in this build)."
+      );
     }
     return gemini.embed(text);
   }
