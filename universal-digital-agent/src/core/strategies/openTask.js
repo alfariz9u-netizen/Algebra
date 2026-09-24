@@ -28,6 +28,12 @@
  * no tools, no timeline). The goal is now a structured brief that
  * forbids filler and mandates: named deliverable files, concrete tools,
  * an ETA in days, and one clarifying question.
+ *
+ * QA FIX #3: the bid endpoint also requires an optimistic-concurrency
+ * token (`expectedTaskUpdatedAt`) — the server 400s with
+ * `{ issues: [{ path: ["expectedTaskUpdatedAt"] }] }` if it's missing.
+ * The submit() call below now passes raw.updatedAt (falling back to
+ * raw.createdAt) through to the connector.
  */
 
 const MIN_REWARD_USD = Number(process.env.OPENTASK_MIN_REWARD_USD || 1);
@@ -154,14 +160,22 @@ const openTaskStrategy = {
       throw new Error(`Skipping bid on task ${raw.id}: no usable reward found (checked budgetAmount/budgetText/reward_usd, all missing or below the $${MIN_REWARD_USD} floor).`);
     }
     try {
+      // QA FIX #3: the bid endpoint requires an optimistic-concurrency
+      // token — the task's own updatedAt (or createdAt as a fallback).
+      // The server 400s with `expectedTaskUpdatedAt: undefined` if this
+      // is missing.
+      const expectedTaskUpdatedAt =
+        raw.updatedAt || raw.createdAt || new Date().toISOString();
+
       // The connector now expects the confirmed bearer-route schema:
-      // priceText + etaDays + approach (see connectors/openTask.js, which
-      // posts to /agent/tasks/{id}/bids — the browser route at
-      // /tasks/{id}/bids always 401s for an API token).
+      // priceText + etaDays + approach + expectedTaskUpdatedAt (see
+      // connectors/openTask.js, which posts to /agent/tasks/{id}/bids —
+      // the browser route at /tasks/{id}/bids always 401s for an API token).
       const result = await connector.submitBid(raw.id, {
         priceText: `${Math.round(reward * BID_RATIO * 100) / 100} ${raw.budgetCurrency || "USDC"}`,
         etaDays: DEFAULT_ETA_DAYS,
         approach: proposalText,
+        expectedTaskUpdatedAt,
       });
       _attemptedTaskIds.add(raw.id);
       return result;
