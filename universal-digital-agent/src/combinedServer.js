@@ -23,8 +23,8 @@
  *   3. The marketplace bidding scheduler — runs one MarketplacePipeline
  *      cycle per configured strategy on a fixed interval
  *      (MARKETPLACE_CYCLE_MS, default 30 minutes — the cadence already
- *      observed in production). Add more strategies to the STRATEGIES
- *      array below as they're built.
+ *      observed in production). All 7 strategies this project has today
+ *      are included below; add more to STRATEGIES as they're built.
  *
  * PERSIST_DIR matters more here than in any single piece run alone: the
  * Telegram bot polls for pending approvals by reading the SAME
@@ -39,7 +39,10 @@
  * A crash in any ONE of these three is caught and logged rather than
  * taking the whole process down with it — losing the marketplace
  * scheduler to an unhandled error must not also kill the A2A server
- * that's keeping Render awake.
+ * that's keeping Render awake. Same isolation applies PER STRATEGY inside
+ * the scheduler itself: one connector with no credentials, or a circuit
+ * the learning engine has opened, never stops the other six from running
+ * their cycle this round.
  */
 
 const { buildAgent } = require("./index");
@@ -48,11 +51,15 @@ const MarketplacePipeline = require("./core/marketplacePipeline");
 const moltMarketStrategy = require("./core/strategies/moltMarket");
 const agencStrategy = require("./core/strategies/agenc");
 const openTaskStrategy = require("./core/strategies/openTask");
+const moltJobsStrategy = require("./core/strategies/moltJobs");
+const agentMarketStrategy = require("./core/strategies/agentMarket");
+const githubBountiesStrategy = require("./core/strategies/githubBounties");
+const tokuAgencyStrategy = require("./core/strategies/tokuAgency");
 
 // Render sets PORT itself; A2A_SERVER_PORT is honored too for parity with a2aServer.js run standalone.
 const PORT = Number(process.env.PORT || process.env.A2A_SERVER_PORT || 8787);
 const CYCLE_MS = Number(process.env.MARKETPLACE_CYCLE_MS || 30 * 60 * 1000);
-const STRATEGIES = [moltMarketStrategy, agencStrategy, openTaskStrategy];
+const STRATEGIES = [moltMarketStrategy, agencStrategy, openTaskStrategy, moltJobsStrategy, agentMarketStrategy, githubBountiesStrategy, tokuAgencyStrategy];
 
 function startMarketplaceScheduler(agent) {
   const pipeline = new MarketplacePipeline(agent);
@@ -115,6 +122,7 @@ function main() {
   const server = createServer(agent);
   server.listen(PORT, () => {
     console.log(`Combined server listening on port ${PORT} (A2A: POST /a2a, card: GET /.well-known/agent-card.json, health: GET /healthz).`);
+    console.log(`Auto-run scheduler enabled: every ${Math.round(CYCLE_MS / 60000)}m, strategies: ${STRATEGIES.map((s) => s.connectorName).join(", ")}`);
   });
 
   const bot = startTelegramBot();
