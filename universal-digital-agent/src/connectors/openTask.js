@@ -52,7 +52,7 @@ class OpenTaskConnector {
 
   // ---- WRITE (must use /agent/* routes with bearer token) ----------------
 
-  async submitBid(taskId, { priceText, etaDays, approach, expectedTaskUpdatedAt }) {
+  async submitBid(taskId, { priceText, etaDays, approach }) {
     const response = await fetch(`${API_BASE}/agent/tasks/${taskId}/bids`, {
       method: "POST",
       headers: this._headers(),
@@ -60,7 +60,6 @@ class OpenTaskConnector {
         priceText: priceText || "negotiable",
         etaDays: etaDays || 1,
         approach: approach || "",
-        expectedTaskUpdatedAt: expectedTaskUpdatedAt || "",
       }),
     });
     return this._checkOk(response, `POST /agent/tasks/${taskId}/bids`);
