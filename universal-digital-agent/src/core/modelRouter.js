@@ -2,29 +2,44 @@
 
 const GeminiClient = require("../llm/geminiClient");
 const GrokClient = require("../llm/grokClient");
+const GroqClient = require("../llm/groqClient");
 
 /**
  * Model Router / Gateway (spec section 6). Not hard-coded to one provider —
  * picks a provider+model tier based on requested complexity, and falls back
  * across providers if the preferred one isn't configured or fails.
  *
+ * Provider order per tier (falls back to the next on failure):
+ *   1. Groq       — free tier, 14,400 req/day (fast, no abuse flagging)
+ *   2. Gemini     — free tier, 500 req/day (gemini-3.5-flash-lite)
+ *   3. Grok       — paid, last resort
+ *
+ * NOTE: "Groq" (with a q) is a different company from "Grok" (with a k,
+ * xAI). Groq = fast free inference on LPU. Grok = paid xAI model.
+ *
  * Tiers map to real, distinct models so "cheap" vs "strong" is a genuine
  * model choice, not a label:
- *   fast   -> gemini-2.0-flash-lite / grok-4-fast   (classification, routing, simple transforms)
- *   default-> gemini-2.0-flash / grok-4-fast        (most task execution)
- *   strong -> gemini-1.5-pro / grok-4               (high-risk / high-complexity tasks)
+ *   fast    -> groq llama-3.1-8b-instant   / gemini-3.5-flash-lite
+ *   default -> groq llama-3.3-70b-versatile / gemini-3.5-flash-lite
+ *   strong  -> groq llama-3.3-70b-versatile / gemini-3.5-flash-lite
+ *
+ * All Gemini model IDs below are current (Sep 2026) — the old
+ * gemini-2.0-flash / gemini-1.5-pro IDs are shut down and would 404.
  */
 const TIER_MODELS = {
   fast: {
-    gemini: process.env.GEMINI_MODEL_FAST || "gemini-2.0-flash-lite",
+    groq: process.env.GROQ_MODEL_FAST || "llama-3.1-8b-instant",
+    gemini: process.env.GEMINI_MODEL_FAST || "gemini-3.5-flash-lite",
     grok: process.env.GROK_MODEL_FAST || "grok-4-fast",
   },
   default: {
-    gemini: process.env.GEMINI_MODEL || "gemini-2.0-flash",
+    groq: process.env.GROQ_MODEL || "llama-3.3-70b-versatile",
+    gemini: process.env.GEMINI_MODEL || "gemini-3.5-flash-lite",
     grok: process.env.GROK_MODEL || "grok-4-fast",
   },
   strong: {
-    gemini: process.env.GEMINI_MODEL_STRONG || "gemini-1.5-pro",
+    groq: process.env.GROQ_MODEL_STRONG || "llama-3.3-70b-versatile",
+    gemini: process.env.GEMINI_MODEL_STRONG || "gemini-3.5-flash-lite",
     grok: process.env.GROK_MODEL_STRONG || "grok-4",
   },
 };
@@ -36,15 +51,19 @@ class ModelRouter {
 
   _clientsForTier(tier) {
     const models = TIER_MODELS[tier] || TIER_MODELS.default;
+    const groq = new GroqClient({ model: models.groq });
     const gemini = new GeminiClient({ model: models.gemini });
     const grok = new GrokClient({ model: models.grok });
-    return this.preferred === "grok" ? [grok, gemini] : [gemini, grok];
+
+    if (this.preferred === "gemini") return [gemini, groq, grok];
+    if (this.preferred === "grok") return [grok, groq, gemini];
+    // default: groq-first
+    return [groq, gemini, grok];
   }
 
   /**
    * @param {"fast"|"default"|"strong"} tier
-   * @param {{ tools?: Array, history?: Array }} [opts] - see geminiClient.js/grokClient.js.
-   *   Omit entirely for the original plain single-call behavior.
+   * @param {{ tools?: Array, history?: Array }} [opts]
    */
   async generate(systemPrompt, userPrompt, tier = "default", opts = {}) {
     const clients = this._clientsForTier(tier);
@@ -64,28 +83,24 @@ class ModelRouter {
     }
 
     throw new Error(
-      `No LLM provider could fulfill the request (tier=${tier}). Set GEMINI_API_KEY and/or XAI_API_KEY.\n` +
+      `No LLM provider could fulfill the request (tier=${tier}). Set GROQ_API_KEY and/or GEMINI_API_KEY and/or XAI_API_KEY.\n` +
         errors.join("\n")
     );
   }
 
   /**
-   * Bounded tool-use loop (spec: "minimum necessary intelligence calls" —
-   * this is the deliberate, opt-in exception, not a default). Calls
-   * `generate()` up to `maxIterations + 1` times; whenever the model
-   * requests a tool, `executeTool(name, args)` runs it and the result is
-   * fed back for the next turn. Stops as soon as the model returns plain
-   * text instead of a tool call, or when `maxIterations` is exhausted
-   * (returns whatever text is available then, `truncated: true`) — never
-   * loops unboundedly regardless of what the model asks for.
-   *
-   * A tool failure does NOT throw out of the loop — the error is fed back
-   * to the model as the tool's result (as `{ error: message }`) so it can
-   * adapt (try different args, a different tool, or give up gracefully
-   * and answer with what it has), matching how a real tool-user would
-   * behave, rather than crashing the whole task over one bad call.
+   * Bounded tool-use loop — see original docstring for full behavior.
+   * A tool failure does NOT throw out of the loop; the error is fed back
+   * to the model as the tool's result so it can adapt.
    */
-  async runToolLoop({ systemPrompt, userPrompt, tier = "default", tools = [], executeTool, maxIterations = Number(process.env.MCP_MAX_TOOL_ITERATIONS || 3) }) {
+  async runToolLoop({
+    systemPrompt,
+    userPrompt,
+    tier = "default",
+    tools = [],
+    executeTool,
+    maxIterations = Number(process.env.MCP_MAX_TOOL_ITERATIONS || 3),
+  }) {
     const history = [];
     const totalUsage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
     const toolCallLog = [];
@@ -96,14 +111,34 @@ class ModelRouter {
       if (last.usage) {
         totalUsage.inputTokens += last.usage.inputTokens || 0;
         totalUsage.outputTokens += last.usage.outputTokens || 0;
-        totalUsage.totalTokens += last.usage.totalTokens || (last.usage.inputTokens || 0) + (last.usage.outputTokens || 0);
+        totalUsage.totalTokens +=
+          last.usage.totalTokens ||
+          (last.usage.inputTokens || 0) + (last.usage.outputTokens || 0);
       }
 
       if (!last.toolCall) {
-        return { text: last.text, usage: totalUsage, provider: last.provider, model: last.model, tier, toolCallLog, iterations: i, truncated: false };
+        return {
+          text: last.text,
+          usage: totalUsage,
+          provider: last.provider,
+          model: last.model,
+          tier,
+          toolCallLog,
+          iterations: i,
+          truncated: false,
+        };
       }
       if (i === maxIterations) {
-        return { text: last.text || "", usage: totalUsage, provider: last.provider, model: last.model, tier, toolCallLog, iterations: i, truncated: true };
+        return {
+          text: last.text || "",
+          usage: totalUsage,
+          provider: last.provider,
+          model: last.model,
+          tier,
+          toolCallLog,
+          iterations: i,
+          truncated: true,
+        };
       }
 
       let toolResult;
@@ -112,15 +147,30 @@ class ModelRouter {
         toolCallLog.push({ name: last.toolCall.name, args: last.toolCall.args, ok: true });
       } catch (err) {
         toolResult = { error: err.message };
-        toolCallLog.push({ name: last.toolCall.name, args: last.toolCall.args, ok: false, error: err.message });
+        toolCallLog.push({
+          name: last.toolCall.name,
+          args: last.toolCall.args,
+          ok: false,
+          error: err.message,
+        });
       }
       history.push({ role: "model", toolCall: last.toolCall });
       history.push({ role: "tool", name: last.toolCall.name, result: toolResult });
     }
-    return { text: last?.text || "", usage: totalUsage, provider: last?.provider, model: last?.model, tier, toolCallLog, iterations: maxIterations, truncated: true };
+
+    return {
+      text: last?.text || "",
+      usage: totalUsage,
+      provider: last?.provider,
+      model: last?.model,
+      tier,
+      toolCallLog,
+      iterations: maxIterations,
+      truncated: true,
+    };
   }
 
-  /** Real embeddings, used by the semantic memory cache. Gemini only — xAI has no public embeddings endpoint. */
+  /** Embeddings — Gemini only. */
   async embed(text) {
     const gemini = new GeminiClient();
     if (!gemini.isConfigured) {
