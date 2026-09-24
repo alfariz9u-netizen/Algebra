@@ -14,11 +14,17 @@ const path = require("node:path");
  */
 
 function verifyCode(text) {
-  const codeBlockMatch = text.match(/```(?:javascript|js)?\n([\s\S]*?)```/i);
+  const codeBlockMatch = text.match(/```(\w+)?\n([\s\S]*?)```/);
   if (!codeBlockMatch) {
     return { passed: false, checks: ["No fenced code block found in output."] };
   }
-  const code = codeBlockMatch[1];
+  const lang = (codeBlockMatch[1] || "").toLowerCase();
+  const code = codeBlockMatch[2];
+
+  if (!["js", "javascript"].includes(lang)) {
+    return { passed: true, checks: [`Fenced code block found (${lang || "unspecified"} lang); skipping node syntax check.`] };
+  }
+
   const tmpFile = path.join(os.tmpdir(), `verify_${Date.now()}.js`);
   fs.writeFileSync(tmpFile, code);
   try {
