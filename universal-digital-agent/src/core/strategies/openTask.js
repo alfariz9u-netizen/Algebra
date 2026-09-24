@@ -28,6 +28,16 @@
  * no tools, no timeline). The goal is now a structured brief that
  * forbids filler and mandates: named deliverable files, concrete tools,
  * an ETA in days, and one clarifying question.
+ *
+ * QA FIX #3: bid submission started failing with 400 "expected string,
+ * received undefined" on `expectedTaskUpdatedAt` — OpenTask's write route
+ * requires this as an optimistic-concurrency check (the bidder must echo
+ * back the task's last-known update timestamp). The exact source field
+ * name on the raw task object is unconfirmed (no docs available), so a
+ * temporary debug log is included below in `discover` to print the raw
+ * task shape once. Remove the two console.log lines once the correct
+ * field name is confirmed from the logs, and narrow the fallback chain
+ * in `submit` accordingly.
  */
 
 const MIN_REWARD_USD = Number(process.env.OPENTASK_MIN_REWARD_USD || 1);
@@ -112,6 +122,13 @@ const openTaskStrategy = {
   discover: async (connector) => {
     const data = await connector.discoverTasks({ status: "open" });
     const tasks = Array.isArray(data) ? data : data.tasks || data.results || [];
+    // TEMP DEBUG (QA FIX #3): print the raw task shape once so the correct
+    // field name for the bid's `expectedTaskUpdatedAt` can be confirmed.
+    // Remove these two lines once confirmed.
+    if (tasks.length > 0) {
+      console.log("[DEBUG openTask raw task keys]", Object.keys(tasks[0]));
+      console.log("[DEBUG openTask raw task sample]", JSON.stringify(tasks[0], null, 2));
+    }
     return tasks.filter((task) => task && task.id && !_attemptedTaskIds.has(task.id));
   },
 
@@ -155,13 +172,19 @@ const openTaskStrategy = {
     }
     try {
       // The connector now expects the confirmed bearer-route schema:
-      // priceText + etaDays + approach (see connectors/openTask.js, which
-      // posts to /agent/tasks/{id}/bids — the browser route at
-      // /tasks/{id}/bids always 401s for an API token).
+      // priceText + etaDays + approach + expectedTaskUpdatedAt (see
+      // connectors/openTask.js, which posts to /agent/tasks/{id}/bids —
+      // the browser route at /tasks/{id}/bids always 401s for an API
+      // token).
+      //
+      // QA FIX #3: expectedTaskUpdatedAt field name is unconfirmed — see
+      // the debug log in `discover` above. Narrow this fallback chain to
+      // the real field once confirmed.
       const result = await connector.submitBid(raw.id, {
         priceText: `${Math.round(reward * BID_RATIO * 100) / 100} ${raw.budgetCurrency || "USDC"}`,
         etaDays: DEFAULT_ETA_DAYS,
         approach: proposalText,
+        expectedTaskUpdatedAt: raw.updatedAt || raw.taskUpdatedAt || raw.updated_at || raw.lastUpdated || "",
       });
       _attemptedTaskIds.add(raw.id);
       return result;
