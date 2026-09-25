@@ -21,7 +21,13 @@ function buildAgent() {
   const colony = new ColonyConnector();
   agent.connectors.register("colony", {
     instance: colony,
-    capabilities: colony.capabilities(),
+    // FIX: ColonyConnector has no .capabilities() method — it never did.
+    // This threw "colony.capabilities is not a function" the instant
+    // buildAgent() ran, taking down every test/entrypoint that calls it
+    // (Telegram bot, A2A server, MCP tool loop, the combined server...).
+    // Literal list matching the connector's real methods, same convention
+    // as every other connector below.
+    capabilities: ["searchPosts", "postFinding", "commentOnPost", "sendMessage"],
     statusFn: () => colony.status(),
   });
 
