@@ -29,6 +29,16 @@ class GroqClient {
     return Boolean(this.apiKey);
   }
 
+  // Groq's real API does support OpenAI-style tool calling, but THIS
+  // client doesn't implement it (generate() below has no `tools` param) —
+  // silently ignoring a `tools` request and just answering plainly would
+  // look, from the caller's side, exactly like the model "choosing" not
+  // to use a tool. modelRouter.js checks this flag to skip this client
+  // entirely for tool-use calls, rather than risk that silent failure.
+  get supportsTools() {
+    return false;
+  }
+
   /**
    * Generate content via Groq's OpenAI-compatible chat completions API.
    */
