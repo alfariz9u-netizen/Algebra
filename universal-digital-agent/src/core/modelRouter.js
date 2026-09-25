@@ -50,16 +50,23 @@ class ModelRouter {
     this.preferred = (process.env.LLM_PROVIDER || "auto").toLowerCase();
   }
 
-  _clientsForTier(tier) {
+  _clientsForTier(tier, { requireTools = false } = {}) {
     const models = TIER_MODELS[tier] || TIER_MODELS.default;
     const groq = new GroqClient({ model: models.groq });
     const gemini = new GeminiClient({ model: models.gemini });
     const grok = new GrokClient({ model: models.grok });
 
-    if (this.preferred === "gemini") return [gemini, groq, grok];
-    if (this.preferred === "grok") return [grok, groq, gemini];
-    // default: groq-first
-    return [groq, gemini, grok];
+    const ordered =
+      this.preferred === "gemini" ? [gemini, groq, grok] : this.preferred === "grok" ? [grok, groq, gemini] : [groq, gemini, grok]; // default: groq-first
+
+    // Groq (and any future OpenAI-compatible addition here) doesn't
+    // implement function-calling in this codebase's client — see
+    // groqClient.js's supportsTools getter. Trying it first for a tool-use
+    // call would get a plain-text answer back with no error, indistinguishable
+    // from the model genuinely choosing not to use a tool. When tools are
+    // actually being offered this call, only route to providers that can
+    // honor them.
+    return requireTools ? ordered.filter((c) => c.supportsTools) : ordered;
   }
 
   /**
@@ -67,7 +74,13 @@ class ModelRouter {
    * @param {{ tools?: Array, history?: Array }} [opts]
    */
   async generate(systemPrompt, userPrompt, tier = "default", opts = {}) {
-    const clients = this._clientsForTier(tier);
+    const requireTools = Boolean(opts.tools && opts.tools.length);
+    const clients = this._clientsForTier(tier, { requireTools });
+    if (requireTools && clients.length === 0) {
+      throw new Error(
+        "A tool-use call needs a function-calling-capable provider, but none is configured. Set GEMINI_API_KEY and/or XAI_API_KEY (Groq/OpenRouter don't support tools here)."
+      );
+    }
     const errors = [];
 
     for (const client of clients) {
