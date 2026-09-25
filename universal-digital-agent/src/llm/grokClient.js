@@ -24,6 +24,11 @@ class GrokClient {
     return Boolean(this.apiKey);
   }
 
+  // See geminiClient.js's identical getter for why this exists.
+  get supportsTools() {
+    return true;
+  }
+
   /**
    * @param {string} systemPrompt - Role/instructions for the agent.
    * @param {string} userPrompt - The task-specific content.
