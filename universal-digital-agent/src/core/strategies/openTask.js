@@ -34,6 +34,12 @@
  * `{ issues: [{ path: ["expectedTaskUpdatedAt"] }] }` if it's missing.
  * The submit() call below now passes raw.updatedAt (falling back to
  * raw.createdAt) through to the connector.
+ *
+ * CONCURRENCY FIX #4: when the task changes between discovery and bid,
+ * OpenTask returns 409 with `code: "bid_task_scope_changed"` and
+ * `reloadRequired: true`. submit() now reloads the task once via
+ * getTask() and retries with the fresh updatedAt. It never loops more
+ * than once — a second 409 is treated as permanent for this task.
  */
 
 const MIN_REWARD_USD = Number(process.env.OPENTASK_MIN_REWARD_USD || 1);
@@ -159,35 +165,55 @@ const openTaskStrategy = {
       _attemptedTaskIds.add(raw.id); // permanently unusable listing — don't re-draft for it every cycle
       throw new Error(`Skipping bid on task ${raw.id}: no usable reward found (checked budgetAmount/budgetText/reward_usd, all missing or below the $${MIN_REWARD_USD} floor).`);
     }
-    try {
-      // QA FIX #3: the bid endpoint requires an optimistic-concurrency
-      // token — the task's own updatedAt (or createdAt as a fallback).
-      // The server 400s with `expectedTaskUpdatedAt: undefined` if this
-      // is missing.
-      const expectedTaskUpdatedAt =
-        raw.updatedAt || raw.createdAt || new Date().toISOString();
 
-      // The connector now expects the confirmed bearer-route schema:
-      // priceText + etaDays + approach + expectedTaskUpdatedAt (see
-      // connectors/openTask.js, which posts to /agent/tasks/{id}/bids —
-      // the browser route at /tasks/{id}/bids always 401s for an API token).
-      const result = await connector.submitBid(raw.id, {
-        priceText: `${Math.round(reward * BID_RATIO * 100) / 100} ${raw.budgetCurrency || "USDC"}`,
-        etaDays: DEFAULT_ETA_DAYS,
-        approach: proposalText,
-        expectedTaskUpdatedAt,
-      });
+    // Helper: build the bid payload for a given task snapshot.
+    const buildPayload = (snapshot) => ({
+      priceText: `${Math.round(reward * BID_RATIO * 100) / 100} ${snapshot.budgetCurrency || "USDC"}`,
+      etaDays: DEFAULT_ETA_DAYS,
+      approach: proposalText,
+      // QA FIX #3: optimistic-concurrency token.
+      expectedTaskUpdatedAt:
+        snapshot.updatedAt || snapshot.createdAt || new Date().toISOString(),
+    });
+
+    try {
+      const result = await connector.submitBid(raw.id, buildPayload(raw));
       _attemptedTaskIds.add(raw.id);
       return result;
     } catch (err) {
-      // Mark it attempted even on failure. A task that consistently fails
-      // (e.g. quietly closed/expired server-side despite still listing as
-      // "open") would otherwise get re-drafted and re-attempted forever,
-      // every single /opentask run, burning LLM calls on something that
-      // will never succeed — and worse, silently blocking the pipeline
-      // from ever reaching the next-best real opportunity.
-      _attemptedTaskIds.add(raw.id);
-      throw err;
+      // CONCURRENCY FIX #4: on 409 bid_task_scope_changed, reload the task
+      // once with the fresh updatedAt and retry. Anything else is treated
+      // as a permanent failure for this task.
+      const isScopeChange =
+        (typeof err.message === "string" &&
+          (err.message.includes("bid_task_scope_changed") || err.message.includes("409")));
+
+      if (!isScopeChange) {
+        _attemptedTaskIds.add(raw.id);
+        throw err;
+      }
+
+      console.warn(`[openTask] 409 on ${raw.id} — reloading task and retrying once with fresh updatedAt.`);
+
+      let fresh;
+      try {
+        fresh = await connector.getTask(raw.id);
+      } catch (reloadErr) {
+        _attemptedTaskIds.add(raw.id);
+        throw new Error(`Task ${raw.id} scope changed; reload failed: ${reloadErr.message}`);
+      }
+
+      // Some APIs wrap the task in { data: {...} } or { task: {...} }.
+      const freshTask = fresh?.task || fresh?.data || fresh;
+
+      try {
+        const result = await connector.submitBid(freshTask.id, buildPayload(freshTask));
+        _attemptedTaskIds.add(raw.id);
+        return result;
+      } catch (retryErr) {
+        _attemptedTaskIds.add(raw.id);
+        throw new Error(`Task ${raw.id} scope changed twice (retry also failed): ${retryErr.message}`);
+      }
     }
   },
 };
