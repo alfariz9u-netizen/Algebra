@@ -35,6 +35,11 @@ class OpenRouterClient {
     return Boolean(this.apiKey);
   }
 
+  // See groqClient.js's identical getter for why this exists and why it's false.
+  get supportsTools() {
+    return false;
+  }
+
   /**
    * Generate content via OpenRouter's OpenAI-compatible chat completions API.
    * @param {string} systemPrompt - Role/instructions for the agent.
