@@ -132,4 +132,4 @@ function buildAgent() {
   return agent;
 }
 
-module.exports = { buildAgent };
+module.exports = { buildAgent, MarketplacePipeline: require("./core/marketplacePipeline") };
