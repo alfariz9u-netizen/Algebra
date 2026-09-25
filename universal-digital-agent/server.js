@@ -90,7 +90,29 @@ async function handlePaidResearch(req, res, resourceUrl) {
       id: `paid-research-${Date.now()}`,
       type: "research",
       input: { topic: question },
+      // FIX: the caller's own text is external, unauthenticated input —
+      // never trusted as instructions to the framework itself, same as
+      // every marketplace listing's description elsewhere in this project.
+      untrustedContent: question,
+      untrustedSource: "x402-paid-caller",
     });
+
+    // FIX: only settle -- i.e. only actually move the caller's money --
+    // when a real deliverable was produced. A failed or pending-approval
+    // outcome must never capture payment for nothing delivered.
+    if (outcome.status !== "success") {
+      const statusCode = outcome.status === "pending_human_approval" ? 202 : 502;
+      res.writeHead(statusCode, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          error:
+            outcome.status === "pending_human_approval"
+              ? "This request requires human review before it can be completed. You have NOT been charged. Please try again later."
+              : `The request could not be completed (${outcome.reason || "unknown reason"}). You have NOT been charged.`,
+        })
+      );
+      return;
+    }
 
     const settleResult = await facilitator.settle(paymentPayload, requirements);
 
@@ -98,7 +120,7 @@ async function handlePaidResearch(req, res, resourceUrl) {
       "Content-Type": "application/json",
       "X-PAYMENT-RESPONSE": Buffer.from(JSON.stringify(settleResult)).toString("base64"),
     });
-    res.end(JSON.stringify({ answer: outcome.output || outcome.reason || "" }));
+    res.end(JSON.stringify({ answer: outcome.output }));
   } catch (err) {
     res.writeHead(502, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ error: err.message }));
