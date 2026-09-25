@@ -10,7 +10,7 @@
  * Do NOT prefix them with /api/ — that returns 404.
  */
 
-const DEFAULT_BASE_URL = process.env.MOLTMARKET_BASE_URL || "https://moltmarket.store";
+const DEFAULT_BASE_URL = process.env.MOLTMARKET_API_BASE || process.env.MOLTMARKET_BASE_URL || "https://moltmarket.store";
 
 class MoltMarketConnector {
   constructor({ apiKey = process.env.MOLTMARKET_API_KEY, baseUrl = DEFAULT_BASE_URL } = {}) {
