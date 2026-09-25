@@ -34,6 +34,14 @@ class GeminiClient {
     return Boolean(this.apiKey);
   }
 
+  // Real function-calling support — see generate()'s `tools` param below.
+  // modelRouter.js filters to tool-capable providers only when a call
+  // actually offers tools, so Groq/OpenRouter (which silently ignore
+  // `tools` and just answer plainly) never get picked for those calls.
+  get supportsTools() {
+    return true;
+  }
+
   /**
    * @param {string} systemPrompt - Role/instructions for the agent.
    * @param {string} userPrompt - The task-specific content.
