@@ -35,11 +35,20 @@
  * The submit() call below now passes raw.updatedAt (falling back to
  * raw.createdAt) through to the connector.
  *
- * CONCURRENCY FIX #4: when the task changes between discovery and bid,
- * OpenTask returns 409 with `code: "bid_task_scope_changed"` and
- * `reloadRequired: true`. submit() now reloads the task once via
- * getTask() and retries with the fresh updatedAt. It never loops more
- * than once — a second 409 is treated as permanent for this task.
+ * CONCURRENCY FIX #4 (revised): OpenTask can return one of TWO different
+ * 409s:
+ *   (a) `bid_task_scope_changed` — the task itself changed between
+ *       discovery and bid; the fix is to reload the task and retry once
+ *       with the fresh updatedAt.
+ *   (b) "You already have an active offer on this task. Update it
+ *       instead." — the agent already bid on this task earlier; the fix
+ *       is to UPDATE the existing bid, not submit a new one.
+ * The connector (see connectors/openTask.js) now transparently handles
+ * (b) by calling updateBid() whenever submitBid() sees that specific
+ * 409. So at THIS layer, we only need to detect (a) and handle the
+ * reload+retry. Any other 409 is treated as a permanent failure for this
+ * task and the listing is marked dead so we stop re-drafting proposals
+ * for it every cycle.
  */
 
 const MIN_REWARD_USD = Number(process.env.OPENTASK_MIN_REWARD_USD || 1);
@@ -66,7 +75,16 @@ function extractReward(raw) {
     if (m) return parseFloat(m[0]);
   }
   // Older guesses, kept in case a different task shape ever shows up.
-  const candidates = [raw.reward_usd, raw.rewardUsd, raw.budget_usd, raw.budgetUsd, raw.price_usd, raw.priceUsd, raw.amount_usd, raw.amountUsd];
+  const candidates = [
+    raw.reward_usd,
+    raw.rewardUsd,
+    raw.budget_usd,
+    raw.budgetUsd,
+    raw.price_usd,
+    raw.priceUsd,
+    raw.amount_usd,
+    raw.amountUsd,
+  ];
   const found = candidates.find((v) => typeof v === "number");
   return typeof found === "number" ? found : null;
 }
@@ -116,6 +134,24 @@ function buildProposalGoal() {
   ].join("\n");
 }
 
+/**
+ * Distinguishes the two 409 variants we care about:
+ *   - scope change: task itself changed, reload+retry applies here.
+ *   - active offer: connector already handles internally via updateBid().
+ * Anything else is treated as permanent.
+ */
+function classify409(err) {
+  const msg = String((err && (err.body || err.message)) || "").toLowerCase();
+  if (msg.includes("bid_task_scope_changed") || msg.includes("scope changed") || msg.includes("reloadRequired".toLowerCase())) {
+    return "scope_change";
+  }
+  if (msg.includes("active offer") || msg.includes("active bid") || msg.includes("update it instead") || msg.includes("already have")) {
+    return "active_offer";
+  }
+  // Unknown 409 — safest to treat as permanent so we don't spin on it.
+  return "permanent";
+}
+
 const openTaskStrategy = {
   connectorName: "openTask",
 
@@ -162,38 +198,44 @@ const openTaskStrategy = {
   submit: async (connector, raw, proposalText) => {
     const reward = extractReward(raw);
     if (!(typeof reward === "number" && reward >= MIN_REWARD_USD)) {
-      _attemptedTaskIds.add(raw.id); // permanently unusable listing — don't re-draft for it every cycle
-      throw new Error(`Skipping bid on task ${raw.id}: no usable reward found (checked budgetAmount/budgetText/reward_usd, all missing or below the $${MIN_REWARD_USD} floor).`);
+      // Permanently unusable listing — don't re-draft for it every cycle.
+      _attemptedTaskIds.add(raw.id);
+      throw new Error(
+        `Skipping bid on task ${raw.id}: no usable reward found (checked budgetAmount/budgetText/reward_usd, all missing or below the $${MIN_REWARD_USD} floor).`
+      );
     }
 
-    // Helper: build the bid payload for a given task snapshot.
+    // Build the bid payload for a given task snapshot. `expectedTaskUpdatedAt`
+    // is the optimistic-concurrency token OpenTask requires (QA FIX #3).
     const buildPayload = (snapshot) => ({
       priceText: `${Math.round(reward * BID_RATIO * 100) / 100} ${snapshot.budgetCurrency || "USDC"}`,
       etaDays: DEFAULT_ETA_DAYS,
       approach: proposalText,
-      // QA FIX #3: optimistic-concurrency token.
       expectedTaskUpdatedAt:
         snapshot.updatedAt || snapshot.createdAt || new Date().toISOString(),
     });
 
     try {
+      // First attempt — the connector itself now transparently handles the
+      // "you already have an active offer" 409 (variant b) by updating the
+      // existing bid, so a successful return here means either a fresh bid
+      // was created OR an existing one was updated. Both are correct.
       const result = await connector.submitBid(raw.id, buildPayload(raw));
       _attemptedTaskIds.add(raw.id);
       return result;
     } catch (err) {
-      // CONCURRENCY FIX #4: on 409 bid_task_scope_changed, reload the task
-      // once with the fresh updatedAt and retry. Anything else is treated
-      // as a permanent failure for this task.
-      const isScopeChange =
-        (typeof err.message === "string" &&
-          (err.message.includes("bid_task_scope_changed") || err.message.includes("409")));
+      const kind = classify409(err);
 
-      if (!isScopeChange) {
+      // Only the scope-change variant (a) is retryable at this layer: reload
+      // the task once with a fresh updatedAt, then try once more. The
+      // connector's own 409-for-active-offer handling does not apply to this
+      // variant (they are different server-side conditions).
+      if (kind !== "scope_change") {
         _attemptedTaskIds.add(raw.id);
         throw err;
       }
 
-      console.warn(`[openTask] 409 on ${raw.id} — reloading task and retrying once with fresh updatedAt.`);
+      console.warn(`[openTask] 409 scope change on ${raw.id} — reloading task and retrying once with fresh updatedAt.`);
 
       let fresh;
       try {
