@@ -23,7 +23,7 @@
  *   3. The marketplace bidding scheduler — runs one MarketplacePipeline
  *      cycle per configured strategy on a fixed interval
  *      (MARKETPLACE_CYCLE_MS, default 30 minutes — the cadence already
- *      observed in production). All 7 strategies this project has today
+ *      observed in production). All strategies this project has today
  *      are included below; add more to STRATEGIES as they're built.
  *
  * PERSIST_DIR matters more here than in any single piece run alone: the
@@ -55,11 +55,27 @@ const moltJobsStrategy = require("./core/strategies/moltJobs");
 const agentMarketStrategy = require("./core/strategies/agentMarket");
 const githubBountiesStrategy = require("./core/strategies/githubBounties");
 const tokuAgencyStrategy = require("./core/strategies/tokuAgency");
+const moltbookStrategy = require("./core/strategies/moltbook"); // ← جديد: بناء السمعة
 
 // Render sets PORT itself; A2A_SERVER_PORT is honored too for parity with a2aServer.js run standalone.
 const PORT = Number(process.env.PORT || process.env.A2A_SERVER_PORT || 8787);
 const CYCLE_MS = Number(process.env.MARKETPLACE_CYCLE_MS || 30 * 60 * 1000);
-const STRATEGIES = [moltMarketStrategy, agencStrategy, openTaskStrategy, moltJobsStrategy, agentMarketStrategy, githubBountiesStrategy, tokuAgencyStrategy];
+
+// moltbookStrategy is appended last: it is pure reputation-building
+// (rewardUsd=0, reputationValue>0), so it should not displace or delay
+// any of the earning strategies above it in a single round. It also uses
+// its own MOLTBOOK_POSTS_PER_CYCLE (default 3) to bound how many posts
+// it engages with per cycle, independent of MAX_OPPORTUNITIES.
+const STRATEGIES = [
+  moltMarketStrategy,
+  agencStrategy,
+  openTaskStrategy,
+  moltJobsStrategy,
+  agentMarketStrategy,
+  githubBountiesStrategy,
+  tokuAgencyStrategy,
+  moltbookStrategy, // ← جديد
+];
 
 function startMarketplaceScheduler(agent) {
   const pipeline = new MarketplacePipeline(agent);
