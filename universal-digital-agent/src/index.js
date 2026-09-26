@@ -1,162 +1,138 @@
 "use strict";
 
-const UniversalAgent = require("./core/universalAgent");
-const ColonyConnector = require("./connectors/colony");
-const ArtifactCouncilConnector = require("./connectors/artifactCouncil");
-const AgenCConnector = require("./connectors/agenc");
-const AgentBazaarConnector = require("./connectors/agentBazaar");
-const AzureMarketplaceConnector = require("./connectors/azureMarketplace");
-const OpenTaskConnector = require("./connectors/openTask");
-const GithubConnector = require("./connectors/github");
-const MoltMarketConnector = require("./connectors/moltMarket");
-const MoltJobsConnector = require("./connectors/moltJobs");
-const AgentMarketConnector = require("./connectors/agentMarket");
-const TokuAgencyConnector = require("./connectors/tokuAgency");
-const McpClient = require("./connectors/mcpClient");
-const A2aClient = require("./connectors/a2aClient");
+/**
+ * Real connector for MoltJobs (https://moltjobs.io) — an API-first job
+ * marketplace for autonomous agents, with USDC settlement via on-chain
+ * escrow on Base L2 and a Turnkey-managed non-custodial wallet created
+ * automatically for every registered agent (no manual wallet funding
+ * required to start bidding — unlike AgenC/AgentBazaar on Solana).
+ *
+ * Docs used to build this: https://moltjobs.io/docs
+ *
+ * REQUIRES:
+ *   - MOLTJOBS_API_KEY  — from app.moltjobs.io/agents/new (register agent,
+ *                         "no credit card required", ~30 seconds)
+ *   - MOLTJOBS_AGENT_ID — optional; shown alongside the API key on the
+ *                         dashboard. Some endpoints (apply/heartbeat) take
+ *                         an explicit agentId; if unset, this connector
+ *                         omits it and relies on the token identifying
+ *                         the agent (whichever the live API expects,
+ *                         errors below always include the raw response
+ *                         body so a mismatch is easy to spot in /log).
+ *
+ * New agents get 10 free bids/month before needing purchased credits.
+ */
 
-function buildAgent() {
-  const agent = new UniversalAgent();
+const API_BASE = process.env.MOLTJOBS_API_BASE || "https://api.moltjobs.io/v1";
 
-  const colony = new ColonyConnector();
-  agent.connectors.register("colony", {
-    instance: colony,
-    capabilities: ["searchPosts", "postFinding", "commentOnPost", "sendMessage"],
-    statusFn: () => colony.status(),
-  });
+class MoltJobsConnector {
+  constructor() {
+    this.name = "MoltJobs";
+  }
 
-  // CONFIRMED from artifactCouncil.js: exposes browseDirectory + getArtifact.
-  const artifactCouncil = new ArtifactCouncilConnector();
-  agent.connectors.register("artifactCouncil", {
-    instance: artifactCouncil,
-    capabilities: ["browseDirectory", "getArtifact"],
-    statusFn: () => artifactCouncil.status(),
-  });
+  status() {
+    return process.env.MOLTJOBS_API_KEY ? "CONNECTED" : "CREDENTIAL_REQUIRED";
+  }
 
-  // CONFIRMED from the strategy using fetchIncomingTasks/submitDeliverable.
-  const agenc = new AgenCConnector();
-  agent.connectors.register("agenc", {
-    instance: agenc,
-    capabilities: ["fetchIncomingTasks", "submitDeliverable"],
-    statusFn: () => agenc.status(),
-  });
+  _headers(extra = {}) {
+    if (!process.env.MOLTJOBS_API_KEY) {
+      throw new Error("MOLTJOBS_API_KEY is not set. Register a free agent at https://app.moltjobs.io/agents/new first.");
+    }
+    return {
+      "Content-Type": "application/json",
+      // FIX: MoltJobs authenticates via X-Api-Key (confirmed at
+      // moltjobs.io/docs — "Agent authenticates with API Key
+      // X-Api-Key: mj_live_abc123..."), NOT a Bearer token. The wrong
+      // header was silently causing every authenticated call (bidding,
+      // heartbeat, wallet) to be rejected before it ever reached the real
+      // route — surfacing as a confusing 404 "Cannot POST /v1/jobs/.../apply"
+      // rather than an auth error, because MoltJobs' gateway returns a
+      // blanket not-found for unauthenticated requests rather than leaking
+      // which routes exist.
+      "X-Api-Key": process.env.MOLTJOBS_API_KEY,
+      ...extra,
+    };
+  }
 
-  // CONFIRMED from agentBazaar.js: exposes fetchIncomingTasks, submitDeliverable, stats.
-  const agentBazaar = new AgentBazaarConnector();
-  agent.connectors.register("agentBazaar", {
-    instance: agentBazaar,
-    capabilities: ["fetchIncomingTasks", "submitDeliverable", "stats"],
-    statusFn: () => agentBazaar.status(),
-  });
+  /** Every response is wrapped as { data: ... } per MoltJobs' API convention. */
+  async _unwrap(response, label) {
+    const text = await response.text();
+    let body;
+    try {
+      body = text ? JSON.parse(text) : {};
+    } catch {
+      body = { raw: text };
+    }
+    if (!response.ok) {
+      // Always surface the real response body, not just the status code —
+      // this is what actually lets you diagnose a 401/422/etc instead of
+      // guessing blind (learned the hard way debugging other connectors).
+      throw new Error(`MoltJobs ${label} failed: ${response.status} ${JSON.stringify(body).slice(0, 300)}`);
+    }
+    return "data" in body ? body.data : body;
+  }
 
-  const azureMarketplace = new AzureMarketplaceConnector();
-  agent.connectors.register("azureMarketplace", {
-    instance: azureMarketplace,
-    capabilities: ["discoverTasks", "submitDeliverable"],
-    statusFn: () => azureMarketplace.status(),
-  });
+  // ---- Discovery (read-only) ----
 
-  // CONFIRMED from openTask.js: discoverTasks, getTask, submitBid, submitDeliverable.
-  const openTask = new OpenTaskConnector();
-  agent.connectors.register("openTask", {
-    instance: openTask,
-    capabilities: ["discoverTasks", "getTask", "submitBid", "submitDeliverable"],
-    statusFn: () => openTask.status(),
-  });
+  async discoverJobs({ status = "OPEN", vertical, limit = 20 } = {}) {
+    const url = new URL(`${API_BASE}/jobs`);
+    url.searchParams.set("status", status);
+    if (vertical) url.searchParams.set("vertical", vertical);
+    url.searchParams.set("limit", String(limit));
+    const response = await fetch(url, { headers: this._headers() });
+    return this._unwrap(response, "GET /jobs");
+  }
 
-  const github = new GithubConnector();
-  agent.connectors.register("github", {
-    instance: github,
-    capabilities: ["searchRepos", "searchIssues", "createIssueComment"],
-    statusFn: () => github.status(),
-  });
+  async getJob(jobId) {
+    const response = await fetch(`${API_BASE}/jobs/${jobId}`, { headers: this._headers() });
+    return this._unwrap(response, `GET /jobs/${jobId}`);
+  }
 
-  // CONFIRMED from moltMarket.js: the full method list below.
-  const moltMarket = new MoltMarketConnector();
-  agent.connectors.register("moltMarket", {
-    instance: moltMarket,
-    capabilities: [
-      "browseJobs",
-      "getJob",
-      "bidOnJob",
-      "deliverWork",
-      "checkHealth",
-      "browseOffers",
-      "publishOffer",
-      "createJob",
-      "approveDelivery",
-      "getMyNotifications",
-      "getMyReviews",
-      "getMyPayments",
-      "getMyRevenue",
-    ],
-    statusFn: () => moltMarket.status(),
-  });
+  async whoami() {
+    const response = await fetch(`${API_BASE}/agents/me`, { headers: this._headers() });
+    return this._unwrap(response, "GET /agents/me");
+  }
 
-  // CONFIRMED from moltJobs.js: heartbeat, discoverJobs, getJob, whoami,
-  // applyToJob, submitWork, getWallet.
-  const moltJobs = new MoltJobsConnector();
-  agent.connectors.register("moltJobs", {
-    instance: moltJobs,
-    capabilities: [
-      "heartbeat",
-      "discoverJobs",
-      "getJob",
-      "whoami",
-      "applyToJob",
-      "submitWork",
-      "getWallet",
-    ],
-    statusFn: () => moltJobs.status(),
-  });
+  // ---- Presence (required for the agent to be eligible to bid) ----
 
-  // CONFIRMED from agentMarket.js: discoverTasks, getTask, whoami, getWallet,
-  // bidOnTask, listBids, acceptTask, completeTask.
-  const agentMarket = new AgentMarketConnector();
-  agent.connectors.register("agentMarket", {
-    instance: agentMarket,
-    capabilities: [
-      "discoverTasks",
-      "getTask",
-      "whoami",
-      "getWallet",
-      "bidOnTask",
-      "listBids",
-      "acceptTask",
-      "completeTask",
-    ],
-    statusFn: () => agentMarket.status(),
-  });
+  /** Agents auto-activate with 30-minute presence windows — call this before bidding. */
+  async heartbeat() {
+    const agentId = process.env.MOLTJOBS_AGENT_ID;
+    const path = agentId ? `/agents/${agentId}/heartbeat` : "/agents/me/heartbeat";
+    const response = await fetch(`${API_BASE}${path}`, { method: "POST", headers: this._headers() });
+    return this._unwrap(response, "POST heartbeat");
+  }
 
-  // UNCONFIRMED — assume discoverJobs / submitBid / deliverJob for now.
-  // If TokuAgency strategy complains about "getJob" or "getProfile",
-  // add those to the list (the strategy file referenced them earlier).
-  const tokuAgency = new TokuAgencyConnector();
-  agent.connectors.register("tokuAgency", {
-    instance: tokuAgency,
-    capabilities: ["discoverJobs", "getJob", "getProfile", "submitBid", "deliverJob"],
-    statusFn: () => tokuAgency.status(),
-  });
+  // ---- Bidding ----
 
-  const mcp = new McpClient({
-    serverUrl: process.env.MCP_SERVER_URL,
-    allowedTools: (process.env.MCP_ALLOWED_TOOLS || "").split(",").filter(Boolean),
-  });
-  agent.connectors.register("mcp", {
-    instance: mcp,
-    capabilities: ["listTools", "callTool"],
-    statusFn: () => mcp.status(),
-  });
+  async applyToJob(jobId, { bidAmount, message } = {}) {
+    const body = { bidAmount, message };
+    if (process.env.MOLTJOBS_AGENT_ID) body.agentId = process.env.MOLTJOBS_AGENT_ID;
+    const response = await fetch(`${API_BASE}/jobs/${jobId}/apply`, {
+      method: "POST",
+      headers: this._headers(),
+      body: JSON.stringify(body),
+    });
+    return this._unwrap(response, `POST /jobs/${jobId}/apply`);
+  }
 
-  // CONFIRMED from a2aClient.js: fetchAgentCard, validateAgentCard, sendMessage.
-  const a2a = new A2aClient();
-  agent.connectors.register("a2a", {
-    instance: a2a,
-    capabilities: ["fetchAgentCard", "validateAgentCard", "sendMessage"],
-    statusFn: () => a2a.status(),
-  });
+  // ---- Delivery (after a bid is accepted) ----
 
-  return agent;
+  async submitWork(jobId, { outputData, proofUrl } = {}) {
+    const response = await fetch(`${API_BASE}/jobs/${jobId}/submit`, {
+      method: "PATCH",
+      headers: this._headers(),
+      body: JSON.stringify({ outputData, proofUrl }),
+    });
+    return this._unwrap(response, `PATCH /jobs/${jobId}/submit`);
+  }
+
+  // ---- Wallet (read-only balance check; withdrawal intentionally not wired into the pipeline) ----
+
+  async getWallet() {
+    const response = await fetch(`${API_BASE}/wallets/me`, { headers: this._headers() });
+    return this._unwrap(response, "GET /wallets/me");
+  }
 }
 
-module.exports = { buildAgent, MarketplacePipeline: require("./core/marketplacePipeline") };
+module.exports = MoltJobsConnector;
