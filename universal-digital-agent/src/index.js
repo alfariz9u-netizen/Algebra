@@ -14,9 +14,15 @@ const AgentMarketConnector = require("./connectors/agentMarket");
 const TokuAgencyConnector = require("./connectors/tokuAgency");
 const McpClient = require("./connectors/mcpClient");
 const A2aClient = require("./connectors/a2aClient");
+const MoltbookConnector = require("./connectors/moltbook"); // ← جديد
 
 function buildAgent() {
-  const agent = new UniversalAgent();
+  // تمرير persistDir و encryptionKey من متغيرات البيئة (ضروري لحفظ
+  // audit log / approvals / economics / memory على القرص بدلاً من الذاكرة فقط)
+  const agent = new UniversalAgent({
+    persistDir: process.env.PERSIST_DIR,
+    encryptionKey: process.env.PERSIST_ENCRYPTION_KEY,
+  });
 
   const colony = new ColonyConnector();
   agent.connectors.register("colony", {
@@ -93,6 +99,22 @@ function buildAgent() {
     instance: tokuAgency,
     capabilities: ["discoverJobs", "submitBid", "deliverJob"],
     statusFn: () => tokuAgency.status(),
+  });
+
+  // ← جديد: Moltbook (بناء السمعة: تصويت + تعليق)
+  const moltbook = new MoltbookConnector();
+  agent.connectors.register("moltbook", {
+    instance: moltbook,
+    capabilities: [
+      "getFeed",
+      "getPost",
+      "getComments",
+      "whoami",
+      "upvotePost",
+      "downvotePost",
+      "commentOnPost",
+    ],
+    statusFn: () => moltbook.status(),
   });
 
   const mcp = new McpClient({ serverUrl: process.env.MCP_SERVER_URL, allowedTools: (process.env.MCP_ALLOWED_TOOLS || "").split(",").filter(Boolean) });
