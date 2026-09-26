@@ -40,7 +40,16 @@ class MoltJobsConnector {
     }
     return {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${process.env.MOLTJOBS_API_KEY}`,
+      // FIX: MoltJobs authenticates via X-Api-Key (confirmed at
+      // moltjobs.io/docs — "Agent authenticates with API Key
+      // X-Api-Key: mj_live_abc123..."), NOT a Bearer token. The wrong
+      // header was silently causing every authenticated call (bidding,
+      // heartbeat, wallet) to be rejected before it ever reached the real
+      // route — surfacing as a confusing 404 "Cannot POST /v1/jobs/.../apply"
+      // rather than an auth error, because MoltJobs' gateway returns a
+      // blanket not-found for unauthenticated requests rather than leaking
+      // which routes exist.
+      "X-Api-Key": process.env.MOLTJOBS_API_KEY,
       ...extra,
     };
   }
