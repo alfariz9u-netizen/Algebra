@@ -49,7 +49,14 @@ const { JsonFileStore } = require("./core/persistence/fileStore");
 // MCP, A2A). Using it here (instead of a bare `new UniversalAgent()`) is
 // what lets this always-on bot actually see connector status and perform
 // real connector calls, not just manage the approval queue.
-const { buildAgent, MarketplacePipeline } = require("./index");
+//
+// FIX: MarketplacePipeline is exported from ./core/marketplacePipeline,
+// NOT from ./index. The previous `const { buildAgent, MarketplacePipeline }
+// = require("./index")` left MarketplacePipeline as `undefined`, which
+// then threw "MarketplacePipeline is not a constructor" on the first
+// pipeline cycle. Importing it from its real module fixes that.
+const { buildAgent } = require("./index");
+const MarketplacePipeline = require("./core/marketplacePipeline");
 const openTaskStrategy = require("./core/strategies/openTask");
 const moltMarketStrategy = require("./core/strategies/moltMarket");
 const moltJobsStrategy = require("./core/strategies/moltJobs");
