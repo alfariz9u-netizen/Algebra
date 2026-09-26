@@ -165,6 +165,16 @@ class MarketplacePipeline {
     const outcome = await this.agent.processTask(task);
 
     if (outcome.status === "pending_human_approval") {
+      // FIX: without this, an opportunity queued for human approval had NO
+      // memory attached to it at all — next cycle, discover() finds the
+      // exact same listing again, drafts it AGAIN via a real LLM call, and
+      // queues a SECOND duplicate pending approval. Observed in production:
+      // the same two opportunities re-drafted every single cycle for
+      // hours, piling up duplicate /pending entries, because nothing
+      // marked them as "already handled." Marking dead here is correct in
+      // BOTH outcomes once a human acts on it: approved → it gets
+      // submitted and is done; rejected → it shouldn't be retried anyway.
+      if (this.learning) this.learning.markOpportunityDead(strategy.connectorName, opportunity.id, "awaiting/resolved via human approval queue — never re-drafted once queued");
       // The capability itself (e.g. "communication") was already held for
       // approval at the current autonomy level — nothing to submit yet.
       return { opportunity, outcome, submission: { status: "pending_human_approval", riskLevel: outcome.riskLevel } };
@@ -172,6 +182,12 @@ class MarketplacePipeline {
 
     if (outcome.status !== "success") {
       this.agent.economics.record({ type: "task_failed", connector: strategy.connectorName });
+      // FIX: same class of bug — a verification/QA failure was never
+      // remembered either, so the identical listing got re-drafted (a
+      // fresh LLM call every time) and re-failed QA on repeat, sometimes
+      // for a structural reason (e.g. the verifier expects something this
+      // task type can never produce) that no amount of re-drafting fixes.
+      if (this.learning) this.learning.markOpportunityDead(strategy.connectorName, opportunity.id, `verification/QA failed: ${outcome.reason || "unknown"}`);
       return { opportunity, outcome };
     }
 
