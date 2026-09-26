@@ -21,6 +21,15 @@ function normalizeOpportunity(raw, sourceConnector) {
     estimatedCompletionMinutes: raw.estimatedCompletionMinutes ?? raw.estimatedEffortMinutes ?? null,
     riskLevel: raw.riskLevel || "MEDIUM",
     reputationValue: raw.reputationValue ?? 0,
+    // Explicitly distinguishes "this listing has a known reward of $0" from
+    // "this listing's reward is unknown/missing" (rewardUsd null). Without
+    // this, a listing with no usable budget field scores expectedValue ~= 0,
+    // which used to pass a minExpectedValue of 0 and get ACCEPTED — meaning
+    // a real LLM call drafted a full proposal for it, only for submit() to
+    // then discover it can't actually be bid on ("no usable budget in the
+    // listing") and throw the draft away. Every cycle, forever, for the
+    // same recurring listing. See rankOpportunities below.
+    hasKnownReward: raw.rewardUsd != null,
     raw,
   };
 }
@@ -44,8 +53,13 @@ function rankOpportunities(opportunities, { minExpectedValue = 0 } = {}) {
   const scored = opportunities.map((o) => ({ ...o, expectedValue: expectedValue(o), totalCost: totalCost(o) }));
   scored.sort((a, b) => b.expectedValue - a.expectedValue);
 
-  const accepted = scored.filter((o) => o.expectedValue >= minExpectedValue);
-  const rejected = scored.filter((o) => o.expectedValue < minExpectedValue);
+  // A listing whose reward is unknown (as opposed to a known low/zero
+  // value) is rejected regardless of minExpectedValue — see
+  // normalizeOpportunity's hasKnownReward comment above.
+  const accepted = scored.filter((o) => o.hasKnownReward !== false && o.expectedValue >= minExpectedValue);
+  const rejected = scored
+    .filter((o) => o.hasKnownReward === false || o.expectedValue < minExpectedValue)
+    .map((o) => ({ ...o, rejectionReason: o.hasKnownReward === false ? "insufficient_listing_data" : "low_expected_value" }));
 
   return { accepted, rejected };
 }
