@@ -24,17 +24,22 @@
  * signaled interest. Treat a submitted "/attempt" as a lead, not a
  * finished job.
  *
- * FIX — owner/repo/number extraction:
- * The previous version only looked at `raw.repository_url` and `raw.number`
- * — but GitHub's search-issues response doesn't always populate
- * `repository_url` on the object as returned to callers (some code paths
- * strip it, some endpoints rename it). Symptom in production:
- *   github createIssueComment → ERROR
- *   (Could not determine owner/repo for issue undefined — skipping comment.)
- * The two fallbacks below try every known field name for the repo URL and
- * the issue number before giving up, and toTask() now logs exactly which
- * fields were missing when extraction fails — so a future failure names
- * the missing field instead of printing `undefined`.
+ * FIX #1 — owner/repo/number extraction in toTask():
+ * The previous version only looked at `raw.repository_url` and `raw.number`.
+ * extractRepoIdentity() now tries every known field name (repository_url,
+ * repository.url, repository.html_url, url, html_url) and both API and HTML
+ * URL shapes, and names the missing field(s) precisely instead of printing
+ * `undefined`.
+ *
+ * FIX #2 — owner/repo/number extraction in submit():
+ * The pipeline passes `opportunity.raw` (the ORIGINAL GitHub issue object)
+ * to submit(), NOT the enhanced `task.input.raw` that toTask() builds. The
+ * original issue has NO `.owner`/`.repo` fields — GitHub puts them inside
+ * `repository_url`/`html_url`/`url`. Previous submit() read `raw.owner`
+ * directly and therefore ALWAYS threw "Could not determine owner/repo"
+ * even when toTask() had successfully resolved them.
+ * submit() now calls extractRepoIdentity(raw) itself, exactly like toTask()
+ * does, so it gets the same values that were used to build the goal text.
  */
 
 const MIN_BOUNTY_USD = Number(process.env.GITHUB_BOUNTY_MIN_USD || 20);
@@ -47,8 +52,9 @@ function parseBountyUsd(issue) {
 
 /**
  * Extract { owner, repo, number } from a GitHub issue object, trying every
- * documented field name. Returns null on any missing piece, plus the
- * reason, so the caller can log a precise diagnostic instead of `undefined`.
+ * documented field name. Returns the resolved values plus a `missing` list
+ * of any pieces that couldn't be found, so callers can log precise
+ * diagnostics instead of `undefined`.
  *
  * GitHub API reference (search issues response) — relevant fields:
  *   repository_url: "https://api.github.com/repos/OWNER/REPO"
@@ -166,21 +172,28 @@ const githubBountiesStrategy = {
   submitOperation: "createIssueComment",
   submitPermission: "SUBMIT_TASK",
   submit: (connector, raw, commentText) => {
-    // raw.owner/raw.repo/raw.number were resolved by toTask() and travel
-    // with the task. If they're still missing here, something upstream
-    // dropped them — fail loudly with a specific message.
-    if (!raw.owner || !raw.repo) {
+    // FIX: `raw` here is the ORIGINAL GitHub issue object (opportunity.raw
+    // from the pipeline), NOT the enhanced `task.input.raw` that toTask()
+    // builds. The original issue never has `.owner` / `.repo` fields —
+    // GitHub puts them inside `repository_url` / `html_url` / `url`. So
+    // submit() must re-extract them here with the same helper toTask()
+    // uses, instead of reading raw.owner / raw.repo which are always
+    // undefined at this layer.
+    const { owner, repo, number, missing } = extractRepoIdentity(raw);
+
+    if (!owner || !repo) {
       throw new Error(
         `Could not determine owner/repo for issue id=${raw.id} number=${raw.number} — skipping comment. ` +
-          `Check that the search-issues response includes repository_url, repository.url, url, or html_url.`
+          `Missing: ${missing.join(", ")}. ` +
+          `Available keys: [${Object.keys(raw).slice(0, 30).join(", ")}]`
       );
     }
-    if (!raw.number) {
+    if (!number) {
       throw new Error(
-        `Could not determine issue number for issue id=${raw.id} (owner=${raw.owner}, repo=${raw.repo}) — skipping comment.`
+        `Could not determine issue number for issue id=${raw.id} (owner=${owner}, repo=${repo}) — skipping comment.`
       );
     }
-    return connector.createIssueComment(raw.owner, raw.repo, raw.number, commentText);
+    return connector.createIssueComment(owner, repo, number, commentText);
   },
 };
 
