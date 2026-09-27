@@ -6,11 +6,14 @@
  * FIX #1 — no more duplicate comments on the same post (sort:"new" + Sets).
  * FIX #2 — at most ONE comment per cycle.
  * FIX #3 — varied comment openings (banned phrases).
- * FIX #4 — solve the Moltbook verification challenge:
- *   Every published comment must be verified by solving an obfuscated
- *   math word problem within ~30s, otherwise the comment stays invisible.
- *   submit() now: commentOnPost → extractChallenge → solveChallenge →
- *   verifyChallenge. Without this, karma stayed at 0 forever.
+ * FIX #4 — solve the Moltbook verification challenge (commentOnPost →
+ *   extractChallenge → solveChallenge → verifyChallenge).
+ *
+ * FIX #5 — diagnostic logging for the challenge flow. We kept seeing
+ * "moltbook commentOnPost → SUCCESS" without any follow-up verifyChallenge
+ * line, so we couldn't tell whether (a) the response had no challenge, or
+ * (b) extractChallenge silently failed. The console.log lines below make
+ * that visible from Render logs alone.
  */
 
 const REWARD_PER_ACTION_USD = 0;
@@ -113,12 +116,25 @@ const moltbookStrategy = {
       return connector.upvotePost(postId);
     }
 
+    // FIX #5: diagnostic logging around the challenge flow. These lines
+    // make it obvious from Render logs whether the response carried a
+    // challenge and whether verification succeeded — we were previously
+    // blind to the exact failure mode.
     const commentResponse = await connector.commentOnPost(postId, { content: draftText });
+
+    const hasChallenge = Boolean(commentResponse && commentResponse.verification);
+    console.log(`[moltbook] comment posted for ${postId} — challenge present: ${hasChallenge}`);
 
     const challenge = connector.extractChallenge(commentResponse);
     if (challenge) {
+      console.log(`[moltbook] solving challenge: ${String(challenge.challenge || "").slice(0, 100)}...`);
       const answer = connector.solveChallenge(challenge.challenge);
+      console.log(`[moltbook] computed answer: ${answer}`);
       await connector.verifyChallenge(challenge.code, answer);
+      console.log(`[moltbook] verifyChallenge SUCCESS for ${postId}`);
+    } else {
+      // This is the case we kept guessing about. Now it's explicit.
+      console.log(`[moltbook] no challenge returned for ${postId} — comment is published immediately.`);
     }
 
     _commentedPostIds.add(postId);
