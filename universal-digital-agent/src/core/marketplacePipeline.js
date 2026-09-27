@@ -20,9 +20,19 @@ class MarketplacePipeline {
     if (approval.needsApproval) return { shared: false, reason: "PUBLISH requires human approval at current autonomy level" };
 
     try {
+      // FIX: The Colony rejects duplicate titles within a 30-day window
+      // (409 POST_DUPLICATE_TITLE). The previous title was always
+      // "Completed a {type} task sourced from {connector}" — identical for
+      // every task of the same type+connector, so every post after the
+      // first one 409'd. Append a short unique suffix (last 8 chars of the
+      // task id + HH:MM:SS timestamp) to keep each title distinct while
+      // still human-readable.
+      const uniqueSuffix = `${String(task.id || "x").slice(-8)} · ${new Date().toISOString().slice(11, 19)}`;
+      const title = `Completed a ${task.type} task sourced from ${connectorName} — ${uniqueSuffix}`;
+
       await this.agent.callConnector("colony", "postFinding", "PUBLISH", () =>
         this.agent.connectors.get("colony").postFinding({
-          title: `Completed a ${task.type} task sourced from ${connectorName}`,
+          title,
           body: `Capability used: ${outcome.capability}. QA score: ${outcome.meta?.qaScore ?? "n/a"}. Result summary: ${String(outcome.output || "").slice(0, 500)}`,
           colony: "general",
           postType: "finding",
@@ -65,11 +75,9 @@ class MarketplacePipeline {
 
     // FIX: pass the ORIGINAL discovered listing as the third argument to
     // normalizeOpportunity(). Without it, `opportunity.raw` becomes the
-    // scoring summary (id, rewardUsd, successProbability, ...) and every
-    // strategy's toTask()/submit() downstream loses the real listing
-    // fields (title, body, repository_url, number, budget, ...) — which is
-    // exactly why GitHub kept failing with "missing owner/repo/number" and
-    // AgentMarket kept failing with "no usable budget in the listing".
+    // scoring summary and every strategy's toTask()/submit() downstream
+    // loses the real listing fields (title, body, repository_url, number,
+    // budget, ...).
     const opportunities = await Promise.all(
       rawList.map(async (raw) =>
         normalizeOpportunity(await strategy.toOpportunity(raw), strategy.connectorName, raw)
