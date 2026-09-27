@@ -11,13 +11,15 @@
  * `issues: [{ code: "invalid_type", path: ["expectedTaskUpdatedAt"] }]`
  * when it is missing, so the caller (strategy) must always supply it.
  *
- * 409 handling (added): when OpenTask returns 409 "You already have an
- * active offer on this task. Update it instead.", the agent was previously
- * failing silently and re-drafting the same proposal every cycle forever.
- * submitBid now detects that specific 409 and transparently calls
- * updateBid() instead, so the active offer is refreshed rather than
- * duplicated. updateBid() uses PATCH on the same /bids route — the
- * documented way to modify your existing active bid on a task.
+ * BID-EDITING FIX: OpenTask has NO endpoint to edit an existing bid's
+ * priceText/etaDays/approach. The docs (termo.ai/skills/opentask) only
+ * support:
+ *   - POST  /api/agent/tasks/:taskId/bids        → create a new bid
+ *   - PATCH /api/agent/bids/:bidId {action:"withdraw"} → withdraw a bid
+ *   - PATCH /api/agent/bids/:bidId {action:"reject"}   → reject (task owner only)
+ * To "update" a bid, you must withdraw the old one (by bidId) and POST a
+ * fresh one. Earlier code tried PATCH /agent/tasks/:taskId/bids, which
+ * returns 405 Method Not Allowed. That is fixed here.
  */
 
 const API_BASE = process.env.OPENTASK_API_BASE || "https://opentask.ai/api";
@@ -49,24 +51,11 @@ class OpenTaskConnector {
       err.body = text;
       throw err;
     }
-    // 204 No Content has no body.
     if (response.status === 204) return {};
     return response.json().catch(() => ({}));
   }
 
-  /** True when an error is the specific "you already have an active bid" 409. */
-  _isActiveBidConflict(err) {
-    if (!err || err.status !== 409) return false;
-    const body = String(err.body || err.message || "").toLowerCase();
-    return (
-      body.includes("active offer") ||
-      body.includes("active bid") ||
-      body.includes("already have") ||
-      body.includes("update it instead")
-    );
-  }
-
-  // ---- READ (public/browser route is fine) --------------------------------
+  // ---- READ ---------------------------------------------------------------
 
   async discoverTasks({ status = "open", limit = 25 } = {}) {
     const url = new URL(`${API_BASE}/tasks`);
@@ -81,63 +70,32 @@ class OpenTaskConnector {
     return this._checkOk(response, `GET /tasks/${taskId}`);
   }
 
-  // ---- WRITE (must use /agent/* routes with bearer token) ----------------
+  /**
+   * List the agent's own bids. Needed because withdrawing a bid requires
+   * the bidId, not the taskId — and the only way to discover the bidId for
+   * a task you already bid on is to list your bids and match by taskId.
+   * Docs: GET /api/agent/bids?status=active (scope bids:read).
+   */
+  async getMyActiveBids({ status = "active", limit = 50 } = {}) {
+    const url = new URL(`${API_BASE}/agent/bids`);
+    if (status) url.searchParams.set("status", status);
+    url.searchParams.set("limit", String(limit));
+    const response = await fetch(url, { headers: this._headers() });
+    const data = await this._checkOk(response, "GET /agent/bids");
+    return Array.isArray(data) ? data : data.bids || data.results || [];
+  }
+
+  // ---- WRITE --------------------------------------------------------------
 
   /**
-   * Submit a new bid for an open task.
-   *
-   * On 409 "already have an active offer", this transparently falls through
-   * to updateBid() with the same payload, so callers never have to handle
-   * the conflict themselves — the end result is always "your active bid on
-   * this task reflects the latest proposal".
-   *
-   * @param {string} taskId
-   * @param {object} opts
-   * @param {string} opts.priceText - e.g. "9 USDC"
-   * @param {number} opts.etaDays - delivery window in days
-   * @param {string} opts.approach - the proposal text
-   * @param {string} opts.expectedTaskUpdatedAt - REQUIRED. The task's
-   *   `updatedAt` (or `createdAt` as fallback) as returned by /tasks.
+   * Create a NEW bid for an open task.
+   * The caller is responsible for handling 409 scope-change (reload + retry)
+   * and 409 active-offer (withdraw existing + resubmit) — see strategies/openTask.js.
    */
   async submitBid(taskId, { priceText, etaDays, approach, expectedTaskUpdatedAt } = {}) {
     if (!expectedTaskUpdatedAt) {
       throw new Error(
-        `OpenTask submitBid for ${taskId}: expectedTaskUpdatedAt is required (optimistic concurrency) — caller must pass raw.updatedAt || raw.createdAt.`
-      );
-    }
-    const payload = {
-      priceText: priceText || "negotiable",
-      etaDays: etaDays || 1,
-      approach: approach || "",
-      expectedTaskUpdatedAt,
-    };
-
-    let response;
-    try {
-      response = await fetch(`${API_BASE}/agent/tasks/${taskId}/bids`, {
-        method: "POST",
-        headers: this._headers(),
-        body: JSON.stringify(payload),
-      });
-      return await this._checkOk(response, `POST /agent/tasks/${taskId}/bids`);
-    } catch (err) {
-      if (this._isActiveBidConflict(err)) {
-        // We already have an active bid on this task — update it instead.
-        return this.updateBid(taskId, payload);
-      }
-      throw err;
-    }
-  }
-
-  /**
-   * Update the agent's currently active bid on a task.
-   * Uses PATCH on the same /bids route with the same payload shape as
-   * submitBid — the documented way to modify an existing active bid.
-   */
-  async updateBid(taskId, { priceText, etaDays, approach, expectedTaskUpdatedAt } = {}) {
-    if (!expectedTaskUpdatedAt) {
-      throw new Error(
-        `OpenTask updateBid for ${taskId}: expectedTaskUpdatedAt is required (optimistic concurrency) — caller must pass raw.updatedAt || raw.createdAt.`
+        `OpenTask submitBid for ${taskId}: expectedTaskUpdatedAt is required — caller must pass raw.updatedAt || raw.createdAt.`
       );
     }
     const payload = {
@@ -147,11 +105,24 @@ class OpenTaskConnector {
       expectedTaskUpdatedAt,
     };
     const response = await fetch(`${API_BASE}/agent/tasks/${taskId}/bids`, {
-      method: "PATCH",
+      method: "POST",
       headers: this._headers(),
       body: JSON.stringify(payload),
     });
-    return this._checkOk(response, `PATCH /agent/tasks/${taskId}/bids`);
+    return this._checkOk(response, `POST /agent/tasks/${taskId}/bids`);
+  }
+
+  /**
+   * Withdraw the agent's active bid by its bidId.
+   * Docs: PATCH /api/agent/bids/:bidId with body {action: "withdraw"}.
+   */
+  async withdrawBid(bidId) {
+    const response = await fetch(`${API_BASE}/agent/bids/${bidId}`, {
+      method: "PATCH",
+      headers: this._headers(),
+      body: JSON.stringify({ action: "withdraw" }),
+    });
+    return this._checkOk(response, `PATCH /agent/bids/${bidId}`);
   }
 
   async submitDeliverable(contractId, { deliverableUrl, notes } = {}) {
