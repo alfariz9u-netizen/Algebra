@@ -3,6 +3,20 @@
 const { normalizeOpportunity, rankOpportunities } = require("./opportunityEngine");
 const riskEngine = require("./riskEngine");
 
+/**
+ * The Colony enforces "max 10 create posts per 60 minutes" (429
+ * RATE_LIMIT_CREATE_POST). The pipeline calls _shareLearning() after
+ * every successful task, so a single cycle with multiple tasks can fire
+ * several posts within seconds and trip the limit — which is what we saw
+ * in production (two 429s in a row, retry_after=475s).
+ *
+ * The cooldown below spaces Colony posts out to stay safely under that
+ * cap. Default 6 minutes → at most 10 posts per 60 minutes. Override via
+ * COLONY_POST_COOLDOWN_MS if the platform's window changes.
+ */
+let _lastColonyPostAt = 0;
+const COLONY_POST_COOLDOWN_MS = Number(process.env.COLONY_POST_COOLDOWN_MS || 6 * 60 * 1000);
+
 class MarketplacePipeline {
   constructor(agent) {
     this.agent = agent;
@@ -15,18 +29,29 @@ class MarketplacePipeline {
   }
 
   async _shareLearning(connectorName, task, outcome) {
-    if (this.agent.connectors.status("colony") !== "CONNECTED") return { shared: false, reason: "colony not connected" };
+    if (this.agent.connectors.status("colony") !== "CONNECTED") {
+      return { shared: false, reason: "colony not connected" };
+    }
+
+    // FIX: rate-limit Colony posts. Without this, a cycle with 2+ tasks
+    // fires 2+ posts within seconds and trips the server's 10/60min cap
+    // (429 RATE_LIMIT_CREATE_POST). Cooldown below keeps us under it.
+    const now = Date.now();
+    if (now - _lastColonyPostAt < COLONY_POST_COOLDOWN_MS) {
+      const remaining = Math.round((COLONY_POST_COOLDOWN_MS - (now - _lastColonyPostAt)) / 1000);
+      return { shared: false, reason: `colony post cooldown (${remaining}s remaining)` };
+    }
+
     const approval = this._checkApproval("PUBLISH");
-    if (approval.needsApproval) return { shared: false, reason: "PUBLISH requires human approval at current autonomy level" };
+    if (approval.needsApproval) {
+      return { shared: false, reason: "PUBLISH requires human approval at current autonomy level" };
+    }
 
     try {
-      // FIX: The Colony rejects duplicate titles within a 30-day window
-      // (409 POST_DUPLICATE_TITLE). The previous title was always
-      // "Completed a {type} task sourced from {connector}" — identical for
-      // every task of the same type+connector, so every post after the
-      // first one 409'd. Append a short unique suffix (last 8 chars of the
-      // task id + HH:MM:SS timestamp) to keep each title distinct while
-      // still human-readable.
+      // Unique title (last 8 chars of task id + HH:MM:SS) so The Colony's
+      // 30-day duplicate-title guard doesn't reject it. The previous title
+      // was always "Completed a {type} task sourced from {connector}" —
+      // identical for every task of the same type+connector.
       const uniqueSuffix = `${String(task.id || "x").slice(-8)} · ${new Date().toISOString().slice(11, 19)}`;
       const title = `Completed a ${task.type} task sourced from ${connectorName} — ${uniqueSuffix}`;
 
@@ -38,6 +63,10 @@ class MarketplacePipeline {
           postType: "finding",
         })
       );
+
+      // Only update the cooldown timestamp on SUCCESS — a failed post
+      // shouldn't block the next attempt.
+      _lastColonyPostAt = Date.now();
       return { shared: true };
     } catch (err) {
       return { shared: false, reason: err.message };
