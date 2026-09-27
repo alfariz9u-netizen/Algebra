@@ -9,21 +9,38 @@
  *
  * BUDGET-FIELD FIX: live production logs showed the connector returning
  * listings where `raw.budget` was undefined AND none of the previous
- * fallbacks (`price`/`reward`/`max_budget`) were present either — meaning
- * the actual field name for the reward is different again. Rather than
- * guess a single alternative, this version:
- *   1. Scans a much wider alias list (budget, budgetAmount, budgetCredits,
- *      price, reward, amount, credits, max_budget, maxBudget, value,
- *      payout, prize).
- *   2. When it still can't find a numeric value, logs the actual top-level
- *      keys present in `raw` (one line, capped) so the next cycle's log
- *      tells us the real field name without needing to re-instrument.
- *   3. Rejects the opportunity at toOpportunity() time (rewardUsd=0, so
- *      rankOpportunities filters it out) instead of letting it through,
- *      paying for an LLM-drafted proposal, then failing at submit time —
- *      the exact cycle that kept repeating for task
- *      2542f7d6-d36a-49cd-ad33-0b1e05bbbd1b.
+ * fallbacks (`price`/`reward`/`max_budget`) were present either. This
+ * version scans a much wider alias list (budget, budgetAmount,
+ * budgetCredits, price, reward, amount, credits, max_budget, maxBudget,
+ * value, payout, prize), logs the actual top-level keys when none match,
+ * and rejects the opportunity at toOpportunity() time (rewardUsd=0, so
+ * rankOpportunities filters it out) instead of paying for an LLM-drafted
+ * proposal that would then fail at submit time.
+ *
+ * 409 "ALREADY BID" FIX: AgentMarket returns
+ *   409 {"success":false,"error":"You have already bid on this task"}
+ * when the agent has an active bid on the task from a previous cycle.
+ * This is NOT a failure — our bid is still pending — but the old submit()
+ * treated it as one, which:
+ *   1. recorded a task_failed in economics,
+ *   2. marked the opportunity dead in LearningEngine,
+ *   3. and (because there's no circuit breaker reset) kept the task
+ *      looking "broken" for the next 30 minutes.
+ * Now submit() recognizes the 409-already-bid response and returns it as
+ * a successful submission, so the pipeline records task_completed and
+ * moves on. _attemptedTaskIds prevents re-bidding on the same task
+ * within a single process lifetime anyway.
  */
+
+const MIN_BUDGET_CREDITS = Number(process.env.AGENTMARKET_MIN_BUDGET_CREDITS || 1);
+
+// Process-lifetime dedupe: once we've bid on (or been told we already
+// bid on) a task, don't draft another proposal for it in this session.
+const _attemptedTaskIds = new Set();
+
+// Process-lifetime set — prevents the same diagnostic from spamming the
+// logs on every 30-minute cycle for the same recurring broken listing.
+const _loggedMissingBudgetIds = new Set();
 
 function findBudgetCredits(raw) {
   const aliases = [
@@ -61,12 +78,28 @@ function describeRawKeys(raw) {
   return Object.keys(raw).slice(0, 30).join(", ");
 }
 
+/** True when the error is AgentMarket's "you already have an active bid" 409. */
+function isAlreadyBidError(err) {
+  const msg = String((err && err.message) || "").toLowerCase();
+  return (
+    msg.includes("409") &&
+    (msg.includes("already bid") ||
+      msg.includes("already have bid") ||
+      msg.includes("you have already bid") ||
+      msg.includes("already have an active bid"))
+  );
+}
+
 const agentMarketStrategy = {
   connectorName: "agentMarket",
 
   discoverOperation: "discoverTasks",
   discoverPermission: "READ_PUBLIC_WEB",
-  discover: async (connector) => connector.discoverTasks({ status: "open" }),
+  discover: async (connector) => {
+    const tasks = await connector.discoverTasks({ status: "open" });
+    const list = Array.isArray(tasks) ? tasks : tasks.data || [];
+    return list.filter((t) => t && t.id && !_attemptedTaskIds.has(t.id));
+  },
 
   toOpportunity: (raw) => {
     const credits = findBudgetCredits(raw);
@@ -115,20 +148,47 @@ const agentMarketStrategy = {
 
   submitOperation: "bidOnTask",
   submitPermission: "SUBMIT_TASK",
-  submit: (connector, raw, proposalText) => {
+  submit: async (connector, raw, proposalText) => {
     const credits = findBudgetCredits(raw);
-    if (credits === null) {
+    if (credits === null || credits < MIN_BUDGET_CREDITS) {
+      _attemptedTaskIds.add(raw.id);
       throw new Error(
         `Skipping bid on task ${raw.id}: no usable budget found in the listing. ` +
           `Available keys: [${describeRawKeys(raw)}].`
       );
     }
-    return connector.bidOnTask(raw.id, { bidAmount: credits, message: proposalText });
+
+    try {
+      const result = await connector.bidOnTask(raw.id, {
+        bidAmount: credits,
+        message: proposalText,
+      });
+      _attemptedTaskIds.add(raw.id);
+      return result;
+    } catch (err) {
+      // FIX: 409 "You have already bid on this task" is NOT a failure —
+      // our previous bid is still active on the platform. Treat it as a
+      // successful submission so:
+      //   1. the pipeline records task_completed (not task_failed),
+      //   2. the economics summary stays accurate,
+      //   3. LearningEngine's dead-opportunity memory doesn't mark the
+      //      task as broken.
+      // _attemptedTaskIds also ensures we don't re-draft a proposal for
+      // the same task within this session.
+      if (isAlreadyBidError(err)) {
+        _attemptedTaskIds.add(raw.id);
+        return {
+          alreadyBid: true,
+          taskId: raw.id,
+          message: "Existing active bid confirmed (409 already-bid treated as success).",
+        };
+      }
+      // Any other error is a real failure — mark the task attempted so we
+      // don't keep re-drafting for it, then rethrow.
+      _attemptedTaskIds.add(raw.id);
+      throw err;
+    }
   },
 };
-
-// Process-lifetime set — prevents the same diagnostic from spamming the
-// logs on every 30-minute cycle for the same recurring broken listing.
-const _loggedMissingBudgetIds = new Set();
 
 module.exports = agentMarketStrategy;
