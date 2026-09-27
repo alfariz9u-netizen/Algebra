@@ -63,8 +63,17 @@ class MarketplacePipeline {
       throw err;
     }
 
+    // FIX: pass the ORIGINAL discovered listing as the third argument to
+    // normalizeOpportunity(). Without it, `opportunity.raw` becomes the
+    // scoring summary (id, rewardUsd, successProbability, ...) and every
+    // strategy's toTask()/submit() downstream loses the real listing
+    // fields (title, body, repository_url, number, budget, ...) — which is
+    // exactly why GitHub kept failing with "missing owner/repo/number" and
+    // AgentMarket kept failing with "no usable budget in the listing".
     const opportunities = await Promise.all(
-      rawList.map(async (raw) => normalizeOpportunity(await strategy.toOpportunity(raw), strategy.connectorName))
+      rawList.map(async (raw) =>
+        normalizeOpportunity(await strategy.toOpportunity(raw), strategy.connectorName, raw)
+      )
     );
     for (const opp of opportunities) {
       this.agent.economics.record({ type: "task_discovered", connector: strategy.connectorName });
