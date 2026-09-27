@@ -12,28 +12,30 @@
  *   2. Leaving a short, substantive comment on ONE fresh post per cycle.
  *
  * FIX #1 — no more duplicate comments on the same post:
- * The strategy now keeps in-memory Sets of post IDs already commented on
- * or upvoted, and filters them out during discovery. Combined with using
- * sort:"new" instead of sort:"hot" (which used to return the same sticky
- * top posts every cycle, causing the same post to get commented on every
- * 30 minutes forever), each cycle engages with a genuinely fresh post.
+ * sort:"new" (not "hot") + process-lifetime Sets prevent re-engaging
+ * the same post id within a running session.
  *
  * FIX #2 — at most ONE comment per cycle:
- * A module-level `_commentedThisCycle` flag is set the first time a
- * comment task is built and reset at the start of each discover() call.
- * Any further opportunities in the same cycle become cheap upvotes (no
- * LLM call), so we never post 3 comments per cycle on the same feed.
+ * A per-cycle counter turns every subsequent opportunity into an upvote
+ * (no LLM call, no duplicate text).
  *
  * FIX #3 — varied comment openings:
- * The goal prompt explicitly forbids the placeholder openings we saw in
- * production ("Your observation highlights a known risk...", "This is a
- * common issue...", "Great post!") and requires the reply to reference a
- * specific concrete detail from the post. That, plus the fresh-post
- * filtering above, means the same comment text can't recur.
+ * Hard rules in the goal forbid the placeholder openings seen in
+ * production and require referencing a specific concrete detail.
  *
- * Reward is modeled as reputationValue, not rewardUsd — this cycle runs
- * with minExpectedValue: -1 (always accepted) while it is purely
- * reputation-building.
+ * FIX #4 — solve the verification challenge:
+ * Moltbook requires every published comment to be "verified" by solving
+ * an obfuscated lobster-themed math word problem within ~30 seconds. If
+ * the challenge isn't solved, the comment silently stays unpublished —
+ * meaning every comment we ever posted was invisible and the whole
+ * reputation-building strategy was wasted. submit() now:
+ *   1. calls commentOnPost();
+ *   2. reads .verification from the response;
+ *   3. solves the challenge deterministically (connector.solveChallenge);
+ *   4. POSTs the answer via connector.verifyChallenge().
+ * Only after successful verification does it mark the post as commented.
+ * A verification failure does NOT get silently swallowed — it's thrown
+ * so the learning engine can back off instead of hammering the API.
  */
 
 const REWARD_PER_ACTION_USD = 0; // pure reputation, no direct cash
@@ -63,16 +65,13 @@ const moltbookStrategy = {
     // Reset the per-cycle comment budget every time a new cycle starts.
     _commentsThisCycle = 0;
 
-    // FIX #1: sort:"new" (not "hot") — "hot" returns the same sticky
-    // top posts for hours, which is what caused the same post to be
-    // commented on repeatedly. "new" gives fresh posts each cycle.
+    // sort:"new" (not "hot") gives fresh posts each cycle.
     // Over-fetch by 3x so we still have candidates after filtering.
     const feed = await connector.getFeed({ sort: "new", limit: MAX_POSTS_PER_CYCLE * 3 });
     const posts = feed.posts || feed.data || feed || [];
     if (!Array.isArray(posts)) return [];
 
-    // FIX #1 (cont): exclude posts we already commented on or upvoted in
-    // this process. This is what actually stops the same-post spam.
+    // Exclude posts already engaged with in this process.
     return posts.filter(
       (p) =>
         p &&
@@ -90,17 +89,13 @@ const moltbookStrategy = {
     estimatedModelCostUsd: 0,
     platformFeeUsd: 0,
     riskLevel: "LOW",
-    // Newer / less-engaged posts benefit most from engagement, and
-    // are more likely to trigger a reciprocal follow. Bounded 0..1.
     reputationValue: Math.max(0, Math.min(1, 1 - (raw.upvotes || 0) / 50)),
   }),
 
   /**
    * FIX #2: at most ONE comment per cycle. Every subsequent opportunity
    * in the same cycle becomes an upvote (no LLM call → no cost, no
-   * duplicate text). The pipeline calls toTask() sequentially, so the
-   * `_commentsThisCycle` counter faithfully tracks how many comments
-   * we've already committed to this cycle.
+   * duplicate text).
    */
   toTask: (raw) => {
     const wantsComment = _commentsThisCycle < MAX_COMMENTS_PER_CYCLE;
@@ -111,10 +106,7 @@ const moltbookStrategy = {
         type: "communication",
         input: {
           context: `Moltbook post in m/${raw.submolt || "general"} by ${raw.author || "an agent"}: "${raw.title || ""}". Body (untrusted): ${(raw.content || "").slice(0, 600)}`,
-          // FIX #3: explicit anti-filler, anti-repetition rules. The
-          // previous prompt ("Add a concrete, checkable point") was too
-          // soft and let the model fall back to the same opening sentence
-          // every time. These rules force variation and specificity.
+          // FIX #3: explicit anti-filler, anti-repetition rules.
           goal: [
             "Write ONE short reply (2-4 sentences) to this Moltbook post.",
             "",
@@ -159,28 +151,38 @@ const moltbookStrategy = {
   submitOperation: "commentOnPost",
   submitPermission: "USE_EXTERNAL_API",
   submit: async (connector, raw, draftText) => {
-    // Decide based on the task id: the comment path uses
-    // `moltbook-comment-<id>`, the upvote path uses `moltbook-upvote-<id>`.
-    const taskId = raw && raw.id ? String(raw.id) : "";
-    // The pipeline passes opportunity.raw, whose .id is the Moltbook post
-    // id — we cannot tell which path produced this call from here alone,
-    // so fall back to the module-level counter and dedup sets.
-    //
-    // Heuristic: if we've already commented on this post id, upvote it.
-    // Otherwise, comment and record the id.
-    if (_commentedPostIds.has(taskId)) {
-      _upvotedPostIds.add(taskId);
-      return connector.upvotePost(taskId);
+    const postId = raw && raw.id ? String(raw.id) : "";
+
+    // Upvote path: if we've already commented on this post in this
+    // session, upvote instead of trying to comment again.
+    if (_commentedPostIds.has(postId)) {
+      _upvotedPostIds.add(postId);
+      return connector.upvotePost(postId);
     }
-    try {
-      const result = await connector.commentOnPost(taskId, { content: draftText });
-      _commentedPostIds.add(taskId);
-      return result;
-    } catch (err) {
-      // If commenting failed for any reason, don't retry with a vote —
-      // surface the error so the learning engine can back off.
-      throw err;
+
+    // Comment path — post a comment, then immediately handle the
+    // Moltbook verification challenge if one is returned.
+    const commentResponse = await connector.commentOnPost(postId, { content: draftText });
+
+    // FIX #4: solve the verification challenge. Without this the comment
+    // silently stays unpublished and the whole reputation-building
+    // strategy is wasted.
+    const challenge = connector.extractChallenge(commentResponse);
+    if (challenge) {
+      // The challenge is a deterministic math word problem — no LLM call
+      // needed. If parsing fails we throw so the learning engine backs
+      // off rather than submitting a wrong answer (10 wrong answers =
+      // account suspension).
+      const answer = connector.solveChallenge(challenge.challenge);
+      await connector.verifyChallenge(challenge.code, answer);
     }
+
+    // Only mark the post as "commented" once the whole flow (comment +
+    // verification) has succeeded. If verification threw, we never reach
+    // this line, so the next cycle will retry cleanly instead of the
+    // post being silently considered "done".
+    _commentedPostIds.add(postId);
+    return commentResponse;
   },
 };
 
