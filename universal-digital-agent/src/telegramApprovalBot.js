@@ -29,6 +29,14 @@
  * global `fetch` (Node >=18), no external dependency, same convention
  * already used by src/connectors/*.js.
  *
+ * FIX — Colony search response shape:
+ * The Colony's /search endpoint returns { items: [...], total, users: [...] },
+ * NOT { results: [...] }. The old code only checked `results` and a bare
+ * array, so every successful search rendered as "no results" — the API
+ * was fine, the parser was wrong. This version checks `items` first, then
+ * falls back to `results` / bare array, and also renders author + colony +
+ * post_type so the output is actually useful.
+ *
  * Usage:
  *   export TELEGRAM_BOT_TOKEN="123456:ABC..."        # from @BotFather
  *   export TELEGRAM_ALLOWED_CHAT_IDS="111111,222222" # message the bot once,
@@ -63,6 +71,7 @@ const moltJobsStrategy = require("./core/strategies/moltJobs");
 const agentMarketStrategy = require("./core/strategies/agentMarket");
 const githubBountiesStrategy = require("./core/strategies/githubBounties");
 const tokuAgencyStrategy = require("./core/strategies/tokuAgency");
+const moltbookStrategy = require("./core/strategies/moltbook"); // ← أضف هذا إذا لم يكن موجوداً
 
 const PIPELINE_STRATEGIES = {
   opentask: openTaskStrategy,
@@ -71,6 +80,7 @@ const PIPELINE_STRATEGIES = {
   agentmarket: agentMarketStrategy,
   githubbounties: githubBountiesStrategy,
   tokuagency: tokuAgencyStrategy,
+  moltbook: moltbookStrategy, // ← اختياري، للتوحيد مع combinedServer
 };
 const PIPELINE_STRATEGIES_BY_CONNECTOR = {
   openTask: openTaskStrategy,
@@ -79,6 +89,7 @@ const PIPELINE_STRATEGIES_BY_CONNECTOR = {
   agentMarket: agentMarketStrategy,
   github: githubBountiesStrategy,
   tokuAgency: tokuAgencyStrategy,
+  moltbook: moltbookStrategy,
 };
 
 const TELEGRAM_API = "https://api.telegram.org";
@@ -297,6 +308,7 @@ class TelegramApprovalBot {
       return;
     }
 
+    // ---- /colony <query> — FIXED response parsing ----
     if (text.startsWith("/colony ") || text === "/colony") {
       const query = text.slice("/colony".length).trim();
       if (!query) {
@@ -309,15 +321,42 @@ class TelegramApprovalBot {
         const data = await agent.callConnector("colony", "searchPosts", "colony.searchPosts", () =>
           colony.searchPosts(query, { limit: 5 })
         );
-        const posts = Array.isArray(data?.results) ? data.results : Array.isArray(data) ? data : [];
+
+        // FIX: The Colony's /search endpoint returns { items: [...], total,
+        // users: [...] } — NOT { results: [...] }. The old code only
+        // checked `results` (and a bare array), so every successful search
+        // was rendered as "no results". Check `items` FIRST, then fall
+        // back to `results` / bare array for safety.
+        const posts =
+          Array.isArray(data?.items) ? data.items :
+          Array.isArray(data?.results) ? data.results :
+          Array.isArray(data) ? data : [];
+
         if (posts.length === 0) {
-          await this._send(chatId, `Searched The Colony for "${escapeHtml(query)}" — no results. (Logged to /log.)`);
+          await this._send(
+            chatId,
+            `Searched The Colony for "${escapeHtml(query)}" — no matching posts. (Logged to /log.)`
+          );
           return;
         }
-        const lines = posts
-          .slice(0, 5)
-          .map((p, i) => `${i + 1}. ${escapeHtml(p.title || p.body?.slice(0, 80) || "(untitled)")}`);
-        await this._send(chatId, `Found ${posts.length} result(s) on The Colony:\n\n` + lines.join("\n") + "\n\n(Logged to /log.)");
+
+        // Rich, still-short preview: author, karma, colony, type, title.
+        const lines = posts.slice(0, 5).map((p, i) => {
+          const author = p.author?.username || "unknown";
+          const karma = typeof p.author?.karma === "number" ? `(k=${p.author.karma})` : "";
+          const colonyName = p.colony_name || "?";
+          const ptype = p.post_type || "post";
+          const title = (p.title || p.body || "(untitled)").slice(0, 90);
+          return `${i + 1}. <b>${escapeHtml(title)}</b>\n   <i>${escapeHtml(author)}</i> ${karma} · ${escapeHtml(colonyName)} · ${escapeHtml(ptype)}`;
+        });
+
+        const total = typeof data?.total === "number" ? ` (of ${data.total} total)` : "";
+        await this._send(
+          chatId,
+          `Found ${posts.length} result(s) on The Colony${total}:\n\n` +
+            lines.join("\n\n") +
+            "\n\n(Logged to /log.)"
+        );
       } catch (err) {
         await this._send(chatId, `Colony search failed: ${escapeHtml(err.message)}\n\n(Logged to /log.)`);
       }
