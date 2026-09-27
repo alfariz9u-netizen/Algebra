@@ -1,30 +1,38 @@
 "use strict";
 
 /**
- * Real connector for The Colony (https://thecolony.cc) — the AI agent
- * internet. Free to register, free to read, free to post.
+ * Real connector for The Colony (https://thecolony.cc) — "the AI agent
+ * internet." A social network where AI agents post findings, discuss ideas,
+ * and DM each other. Free to register, free to read, free to post.
  *
- * AUTH FIX (the 401 root cause — confirmed from the official openapi.json):
- * The opaque col_… API key is NOT a bearer credential. The Colony's own
- * /auth/rotate-key docs state: "sending the key itself returns 401
- * AUTH_INVALID_TOKEN". Every authenticated request must instead carry a
- * short-lived JWT obtained by exchanging the key:
+ * AUTH FIX (the 401 root cause — confirmed from /auth/token docs and a
+ * live REQBIN response):
+ * The opaque col_… API key is NOT a bearer credential. The Colony requires
+ * a two-step exchange:
  *     POST /api/v1/auth/token  { "api_key": "col_…" }
- *       → { "access_token": "<JWT>", "token_type": "bearer" }
- * The JWT is valid for 24h. _authedFetch caches it in-process and, on any
- * 401, mints a fresh one and retries the request exactly once.
+ *       → { "access_token": "<JWT>", ... }
+ * The JWT is valid for 24 hours and must be sent as the Authorization
+ * bearer on all WRITE endpoints. Sending the raw col_ key directly returns
+ * 401 AUTH_INVALID_TOKEN — which is exactly what the old code did, so
+ * postFinding() failed on every call while searchPosts() appeared to work
+ * (read endpoints don't require auth at all).
  *
- * NOTE ON READ ENDPOINTS: The Colony explicitly documents that read
- * endpoints (search, browse posts, list colonies) work WITHOUT auth. So
- * searchPosts() never needed the key in the first place — which is why it
- * appeared to "work" while postFinding() 401'd on every call.
- *
- * POST SHAPE FIX (also from openapi.json / API guide):
+ * POST SHAPE FIX (confirmed from a live REQBIN response):
  * POST /api/v1/posts requires:
  *     { colony_id: "<UUID>", post_type: "finding", title, body }
- * NOT { colony: "<name>", type: "..." } — the field is colony_id and it
- * must be a UUID, not a colony name. resolveColonyId() handles the
- * name→UUID lookup via GET /api/v1/colonies.
+ * NOT { colony: "<name>", type: "..." } — the field is colony_id, it must
+ * be a UUID, and it's `post_type` (not `type`). resolveColonyId() handles
+ * the name → UUID lookup via GET /api/v1/colonies (cached).
+ *
+ * SEARCH RESPONSE FIX (confirmed from a live REQBIN response):
+ * GET /api/v1/search?q=… returns { items: [...], total: N, users: [...] }.
+ * The old code looked for `results`, so every search rendered as
+ * "no results" — the API was fine, the parser was wrong.
+ *
+ * REQUIRES:
+ *   - COLONY_API_KEY — register for free at https://thecolony.cc/connect-agent
+ *     (or via POST /api/v1/auth/register from src/connectors/colony.js's
+ *     static register() method).
  */
 
 const API_BASE = process.env.COLONY_API_BASE || "https://thecolony.cc/api/v1";
@@ -33,9 +41,11 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 class ColonyConnector {
   constructor() {
     this.name = "The Colony";
+    // In-memory JWT cache. Tokens are valid 24h; we re-exchange on 401.
     this._jwt = null;
     this._jwtExpiresAt = 0;
-    this._colonyCache = null; // name/slug → UUID, populated lazily
+    // Colony name/slug → UUID cache, populated lazily on first post.
+    this._colonyCache = null;
   }
 
   status() {
@@ -45,8 +55,8 @@ class ColonyConnector {
   // ---- Authentication ----------------------------------------------------
 
   /**
-   * Exchange COLONY_API_KEY for a 24h JWT. Cached in-process. Called
-   * automatically by _authedFetch; callers never invoke it directly.
+   * Exchange the raw col_… API key for a 24-hour JWT. Cached in-process.
+   * Called automatically by _authedFetch; callers never invoke it directly.
    * Pass force=true to bypass the cache after a 401.
    */
   async _getToken(force = false) {
@@ -76,14 +86,15 @@ class ColonyConnector {
       );
     }
     this._jwt = token;
-    // Refresh 5 minutes before the documented 24h expiry.
+    // Refresh 5 minutes before the documented 24h expiry to avoid
+    // edge-case 401s from clock skew or server-side revocation.
     this._jwtExpiresAt = now + 24 * 60 * 60 * 1000 - 5 * 60 * 1000;
     return token;
   }
 
   /**
    * Authenticated fetch: attaches the JWT, and on 401 mints a fresh one
-   * and retries once. All authenticated methods go through this.
+   * and retries once. Every write method below goes through this.
    */
   async _authedFetch(url, options = {}) {
     const doFetch = (token) =>
@@ -122,7 +133,9 @@ class ColonyConnector {
       }),
     });
     const data = await response.json();
-    if (!response.ok) throw new Error(data.error || `Registration failed: ${response.status}`);
+    if (!response.ok) {
+      throw new Error(data.error || `Registration failed: ${response.status}`);
+    }
     return data; // { api_key: "col_…", id, username, ... }
   }
 
@@ -130,12 +143,11 @@ class ColonyConnector {
 
   /**
    * Full-text search across posts and users.
-   * Docs: GET /api/v1/search?q=…  → { results: [...], total: N }
+   * Confirmed shape from a live response:
+   *   { items: [...], total: N, has_more: bool, users: [...] }
    *
-   * Note: this endpoint works WITHOUT auth. We still send the JWT when
-   * we have one (harmless), but the call succeeds even before the token
-   * exchange — which is why this was the only Colony operation that ever
-   * "worked" before the auth fix.
+   * Read endpoints don't need auth — but we still try with a JWT first
+   * (harmless), and fall back to unauthenticated on 401.
    */
   async searchPosts(query, { colonyName, limit = 10, sort = "relevance" } = {}) {
     const url = new URL(`${API_BASE}/search`);
@@ -144,10 +156,9 @@ class ColonyConnector {
     if (sort) url.searchParams.set("sort", sort);
     url.searchParams.set("limit", String(limit));
 
-    // Try authenticated first (works even if endpoint is public); on a
-    // 401 (shouldn't happen here) fall back to unauthenticated.
     let response = await this._authedFetch(url);
     if (response.status === 401) {
+      // Read endpoints should work unauthenticated — retry without auth.
       response = await fetch(url, { headers: { "Content-Type": "application/json" } });
     }
     if (!response.ok) {
@@ -156,19 +167,31 @@ class ColonyConnector {
     }
     const data = await response.json();
 
-    // One-shot shape log — the first search on every deploy tells us the
-    // real top-level keys, so a future "no results" bug is debuggable
-    // from logs alone instead of guesswork.
+    // One-shot shape log — first search per process prints the top-level
+    // keys so a future "no results" bug is debuggable from logs alone.
     if (!globalThis.__colonySearchShapeLogged) {
       globalThis.__colonySearchShapeLogged = true;
       const shape = Array.isArray(data)
         ? `array(${data.length})`
         : `object[${Object.keys(data).slice(0, 15).join(",")}]`;
-      const resultCount = Array.isArray(data?.results) ? data.results.length : "n/a";
-      console.log(`[colony] /search shape=${shape} results.length=${resultCount}`);
+      const count = Array.isArray(data?.items) ? data.items.length : "n/a";
+      console.log(`[colony] /search shape=${shape} items.length=${count}`);
     }
 
-    return data;
+    // Normalize to a bare array for the caller. The Colony uses `items`
+    // (confirmed), but we defensively accept `results` and a bare array too.
+    const items =
+      Array.isArray(data?.items) ? data.items :
+      Array.isArray(data?.results) ? data.results :
+      Array.isArray(data) ? data : [];
+
+    // Preserve top-level metadata by returning an object with `.items`
+    // AND making it array-like for callers that just want the list.
+    if (typeof data === "object" && data !== null && !Array.isArray(data)) {
+      data.items = items;
+      return data;
+    }
+    return { items, total: items.length };
   }
 
   /** List colonies (communities). Returns [{ id, name, slug, ... }]. */
@@ -179,7 +202,7 @@ class ColonyConnector {
       throw new Error(`Colony list colonies failed: ${response.status} ${text.slice(0, 200)}`);
     }
     const data = await response.json();
-    // Docs: GET /api/v1/colonies returns a bare JSON ARRAY.
+    // Colony docs: GET /api/v1/colonies returns a bare JSON array.
     return Array.isArray(data) ? data : data.colonies || data.items || [];
   }
 
@@ -190,7 +213,7 @@ class ColonyConnector {
       this._colonyCache = await this.listColonies();
     }
     const match = this._colonyCache.find(
-      (c) => c.name === nameOrId || c.slug === nameOrId
+      (c) => c.name === nameOrId || c.slug === nameOrId || c.display_name === nameOrId
     );
     if (!match || !match.id) {
       const available = this._colonyCache
@@ -204,21 +227,37 @@ class ColonyConnector {
     return match.id;
   }
 
+  /** Get a specific post by id (with full body and comments count). */
+  async getPost(postId) {
+    const response = await this._authedFetch(`${API_BASE}/posts/${postId}`);
+    if (!response.ok) {
+      const text = await response.text().catch(() => "");
+      throw new Error(`Colony getPost failed: ${response.status} ${text.slice(0, 200)}`);
+    }
+    return response.json();
+  }
+
   // ---- Write (auth required) ---------------------------------------------
 
   /**
    * Share a finding on The Colony.
-   * Docs: POST /api/v1/posts  { colony_id, post_type, title, body }
+   * Confirmed shape: { colony_id: "<UUID>", post_type: "finding", title, body }.
    * post_type ∈ { finding, question, analysis, discussion, poll, human_request }.
+   *
+   * `colony` may be either a UUID or a colony name/slug. If it's a name, we
+   * resolve it to a UUID via listColonies() (cached after the first call).
    */
   async postFinding({ title, body, colony = "general", postType = "finding" }) {
+    if (!title || !title.trim()) throw new Error("Colony postFinding: title is required.");
+    if (!body || !body.trim()) throw new Error("Colony postFinding: body is required.");
+
     const colonyId = await this._resolveColonyId(colony);
     const response = await this._authedFetch(`${API_BASE}/posts`, {
       method: "POST",
       body: JSON.stringify({
         colony_id: colonyId,
         post_type: postType,
-        title,
+        title: title.slice(0, 300),
         body,
       }),
     });
@@ -229,7 +268,9 @@ class ColonyConnector {
     return response.json();
   }
 
+  /** Comment on an existing post. */
   async commentOnPost(postId, body) {
+    if (!body || !body.trim()) throw new Error("Colony commentOnPost: body is required.");
     const response = await this._authedFetch(`${API_BASE}/posts/${postId}/comments`, {
       method: "POST",
       body: JSON.stringify({ body }),
@@ -241,7 +282,10 @@ class ColonyConnector {
     return response.json();
   }
 
+  /** Send a direct message to another Colony user. */
   async sendMessage(userId, body) {
+    if (!userId) throw new Error("Colony sendMessage: userId is required.");
+    if (!body || !body.trim()) throw new Error("Colony sendMessage: body is required.");
     const response = await this._authedFetch(`${API_BASE}/messages`, {
       method: "POST",
       body: JSON.stringify({ user_id: userId, body }),
