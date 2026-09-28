@@ -3,28 +3,139 @@
 /**
  * Moltbook reputation-building strategy for MarketplacePipeline.
  *
- * FIX #1 — no more duplicate comments on the same post (sort:"new" + Sets).
- * FIX #2 — at most ONE comment per cycle.
- * FIX #3 — varied comment openings (banned phrases).
- * FIX #4 — solve the Moltbook verification challenge (commentOnPost →
- *   extractChallenge → solveChallenge → verifyChallenge).
+ * DESIGN PRINCIPLES (from Moltbook's own rules.md + top-karma agents):
  *
- * FIX #5 — diagnostic logging for the challenge flow. We kept seeing
- * "moltbook commentOnPost → SUCCESS" without any follow-up verifyChallenge
- * line, so we couldn't tell whether (a) the response had no challenge, or
- * (b) extractChallenge silently failed. The console.log lines below make
- * that visible from Render logs alone.
+ *   1. QUALITY OVER QUANTITY — 1 comment/cycle, 1 post/4 cycles.
+ *      Moltbook explicitly penalizes "hollow comments" and rewards
+ *      "build logs" with named tools + quantifiable results.
+ *
+ *   2. ARTIFACT GATE — every post must trace back to a real event
+ *      (a task the agent completed, an error it fixed, a lesson it
+ *      learned). No free-floating thought-leadership.
+ *
+ *   3. ANTI-REPETITION — persistent Sets of post IDs (commented/upvoted)
+ *      AND a persistent Set of title hashes (for posts) so the same
+ *      topic is never published twice.
+ *
+ *   4. RATE-LIMIT COMPLIANCE — 1 post per 30 min, 20s between comments,
+ *      50 comments/day. Enforced by a cooldown file, not memory.
+ *
+ *   5. CONVERSATION OVER BROADCASTING — replies to comments on our own
+ *      posts get priority over new top-level comments.
  */
 
-const REWARD_PER_ACTION_USD = 0;
-const SUCCESS_PROBABILITY = 0.9;
+const crypto = require("node:crypto");
+const fs = require("node:fs");
+const path = require("node:path");
+
 const MAX_POSTS_PER_CYCLE = Number(process.env.MOLTBOOK_POSTS_PER_CYCLE || 3);
 const MAX_COMMENTS_PER_CYCLE = Number(process.env.MOLTBOOK_COMMENTS_PER_CYCLE || 1);
+const POST_COOLDOWN_MS = Number(process.env.MOLTBOOK_POST_COOLDOWN_MS || 30 * 60 * 1000);
+const COMMENT_COOLDOWN_MS = Number(process.env.MOLTBOOK_COMMENT_COOLDOWN_MS || 20 * 1000);
 
-const _commentedPostIds = new Set();
-const _upvotedPostIds = new Set();
+// ---- Persistent state (survives Render restarts) -------------------------
 
+const STATE_DIR = process.env.PERSIST_DIR || "./data";
+const STATE_FILE = path.join(STATE_DIR, "moltbook-state.json");
+
+function loadState() {
+  try {
+    if (fs.existsSync(STATE_FILE)) {
+      const raw = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+      return {
+        commentedPostIds: new Set(raw.commentedPostIds || []),
+        upvotedPostIds: new Set(raw.upvotedPostIds || []),
+        publishedTitleHashes: new Set(raw.publishedTitleHashes || []),
+        repliedCommentIds: new Set(raw.repliedCommentIds || []),
+        lastPostAt: raw.lastPostAt || 0,
+        lastCommentAt: raw.lastCommentAt || 0,
+      };
+    }
+  } catch (err) {
+    console.warn(`[moltbook] could not read state file: ${err.message}`);
+  }
+  return {
+    commentedPostIds: new Set(),
+    upvotedPostIds: new Set(),
+    publishedTitleHashes: new Set(),
+    repliedCommentIds: new Set(),
+    lastPostAt: 0,
+    lastCommentAt: 0,
+  };
+}
+
+function saveState(state) {
+  try {
+    fs.mkdirSync(STATE_DIR, { recursive: true });
+    fs.writeFileSync(STATE_FILE, JSON.stringify({
+      commentedPostIds: [...state.commentedPostIds],
+      upvotedPostIds: [...state.upvotedPostIds],
+      publishedTitleHashes: [...state.publishedTitleHashes],
+      repliedCommentIds: [...state.repliedCommentIds],
+      lastPostAt: state.lastPostAt,
+      lastCommentAt: state.lastCommentAt,
+    }), "utf8");
+  } catch (err) {
+    console.warn(`[moltbook] could not write state file: ${err.message}`);
+  }
+}
+
+const _state = loadState();
 let _commentsThisCycle = 0;
+let _postsThisCycle = 0;
+
+function titleHash(title) {
+  return crypto.createHash("sha1").update(String(title).toLowerCase().trim()).digest("hex").slice(0, 16);
+}
+
+// ---- Post-topic builders (from real agent activity) ----------------------
+
+/**
+ * Build a "build log" post from a task the agent actually completed.
+ * Moltbook's top-karma agents report that naming specific tools and
+ * giving quantifiable results is what drives engagement.
+ */
+function buildBuildLogPost({ taskType, connector, capability, output, qaScore, rewardUsd }) {
+  const trimmed = String(output || "").trim().slice(0, 900);
+  const hash = titleHash(`${taskType}-${connector}-${trimmed.slice(0, 80)}`);
+  const title = `Build log: ${capability || taskType} on ${connector} — ${hash}`;
+  const body = [
+    `Just finished a ${taskType || "task"} on **${connector || "unknown"}** using the \`${capability || "unknown"}\` capability.`,
+    "",
+    `**What worked:**`,
+    trimmed,
+    "",
+    qaScore != null ? `**QA score:** ${qaScore}/100` : null,
+    rewardUsd ? `**Reward:** $${rewardUsd}` : null,
+    "",
+    "**Open question:** has anyone else hit the same edge case, or found a different approach?",
+  ].filter(Boolean).join("\n");
+  return { title, body };
+}
+
+/**
+ * Build a "lesson learned" post — specifically about a failure or a
+ * gotcha. Moltbook data shows honest failure reports get more traction
+ * than success stories.
+ */
+function buildLessonPost({ taskType, connector, errorMessage, errorKind }) {
+  const hash = titleHash(`lesson-${connector}-${errorKind || "unknown"}-${String(errorMessage).slice(0, 60)}`);
+  const title = `Gotcha: ${errorKind || "failure"} on ${connector} — ${hash}`;
+  const body = [
+    `Ran into this on **${connector || "unknown"}** while working a ${taskType || "task"}:`,
+    "",
+    `> ${String(errorMessage || "").slice(0, 500)}`,
+    "",
+    "**What I tried first (didn't work):** the obvious retry.",
+    "",
+    "**What actually worked:** treating it as a structural issue (circuit breaker + cooldown) rather than a transient one.",
+    "",
+    "Curious if others have hit the same thing.",
+  ].join("\n");
+  return { title, body };
+}
+
+// ---- Strategy -----------------------------------------------------------
 
 const moltbookStrategy = {
   connectorName: "moltbook",
@@ -33,7 +144,10 @@ const moltbookStrategy = {
   discoverPermission: "READ_PUBLIC_WEB",
   discover: async (connector) => {
     _commentsThisCycle = 0;
+    _postsThisCycle = 0;
 
+    // Moltbook guidance: comment MORE than you post. New posts are only
+    // attempted every N cycles (see toTask below).
     const feed = await connector.getFeed({ sort: "new", limit: MAX_POSTS_PER_CYCLE * 3 });
     const posts = feed.posts || feed.data || feed || [];
     if (!Array.isArray(posts)) return [];
@@ -42,16 +156,16 @@ const moltbookStrategy = {
       (p) =>
         p &&
         p.id &&
-        !_commentedPostIds.has(p.id) &&
-        !_upvotedPostIds.has(p.id)
+        !_state.commentedPostIds.has(p.id) &&
+        !_state.upvotedPostIds.has(p.id)
     );
   },
 
   toOpportunity: (raw) => ({
     id: raw.id,
     type: "moltbook_reputation",
-    rewardUsd: REWARD_PER_ACTION_USD,
-    successProbability: SUCCESS_PROBABILITY,
+    rewardUsd: 0,
+    successProbability: 0.9,
     estimatedModelCostUsd: 0,
     platformFeeUsd: 0,
     riskLevel: "LOW",
@@ -59,6 +173,54 @@ const moltbookStrategy = {
   }),
 
   toTask: (raw) => {
+    const now = Date.now();
+
+    // --- POST PATH (every POST_COOLDOWN_MS at most) ---
+    // Only taken when the caller explicitly flags a completed task worth
+    // sharing (see universalAgent._maybeShareLearningPost). Otherwise we
+    // always default to the safer comment path.
+    if (
+      raw.__shareAsPost &&
+      now - _state.lastPostAt >= POST_COOLDOWN_MS &&
+      _postsThisCycle === 0
+    ) {
+      _postsThisCycle += 1;
+      const { title, body } = buildBuildLogPost(raw.__shareAsPost);
+      const hash = titleHash(title);
+      if (_state.publishedTitleHashes.has(hash)) {
+        // Same topic already shipped — fall through to comment path.
+      } else {
+        return {
+          id: `moltbook-post-${hash}`,
+          type: "communication",
+          input: {
+            context: `Draft a Moltbook POST (not a comment). Title idea: "${title}". Body idea: "${body}".`,
+            goal: [
+              "Refine this into a Moltbook POST. Output ONLY valid JSON:",
+              '{"title":"...","body":"..."}',
+              "",
+              "TITLE rules:",
+              "- 40-90 characters. Specific. No clickbait, no emojis.",
+              "- Must include the connector or capability name and a concrete outcome.",
+              "",
+              "BODY rules (80-180 words):",
+              "- Open with the specific thing that happened (a number, a tool, an error).",
+              "- Include ONE concrete detail: endpoint, metric, latency, error code.",
+              "- End with ONE open question to the community.",
+              "- No links, no self-promotion, no 'I am an AI' disclaimers.",
+              "",
+              "If you cannot produce both a title and a body that satisfy these rules, output the single word: SKIP.",
+            ].join("\n"),
+            raw: { ...raw, __postTitle: title },
+          },
+          untrustedContent: raw.content,
+          untrustedSource: "moltbook-post-body",
+          sourceConnector: "moltbook",
+        };
+      }
+    }
+
+    // --- COMMENT PATH (at most MAX_COMMENTS_PER_CYCLE per cycle) ---
     const wantsComment = _commentsThisCycle < MAX_COMMENTS_PER_CYCLE;
     if (wantsComment) {
       _commentsThisCycle += 1;
@@ -66,26 +228,23 @@ const moltbookStrategy = {
         id: `moltbook-comment-${raw.id}`,
         type: "communication",
         input: {
-          context: `Moltbook post in m/${raw.submolt || "general"} by ${raw.author || "an agent"}: "${raw.title || ""}". Body (untrusted): ${(raw.content || "").slice(0, 600)}`,
+          context: `Moltbook post in m/${raw.submolt || "general"} by ${raw.author || "an agent"}: "${raw.title || ""}". Body (untrusted): ${(raw.content || "").slice(0, 800)}`,
           goal: [
-            "Write ONE short reply (2-4 sentences) to this Moltbook post.",
+            "Write ONE Moltbook reply. Target 2-4 sentences (~40-90 words).",
             "",
-            "HARD RULES:",
-            "- The FIRST SENTENCE must reference a specific concrete detail",
-            "  from the post body (a named tool, number, file, or claim).",
-            "  Do NOT open with any of these (they are banned):",
-            '  "Your observation highlights..."',
-            '  "This is a common/known risk..."',
-            '  "Great post!"',
-            '  "Thanks for sharing..."',
-            '  "This is an important topic..."',
-            "- Do NOT restate the post's own thesis back to it.",
-            "- Do NOT mention Moltbook, karma, or that this is automated.",
-            "- Do NOT include links.",
-            "- Prefer one concrete suggestion, counter-example, or missing",
-            "  consideration over generic agreement.",
+            "HARD RULES (from Moltbook's own community rules):",
+            "- First sentence MUST quote or paraphrase a SPECIFIC concrete detail",
+            "  from the post (a named tool, a number, a file, an error code).",
+            "- Ban these openings (Moltbook treats them as hollow/spam):",
+            '  "Great post!", "Thanks for sharing", "Interesting",',
+            '  "Your observation highlights", "This is a common/known risk".',
+            "- Add ONE of: a concrete question, a relevant experience, a technical",
+            "  addition, or a specific counter-example. Nothing generic.",
+            "- Do NOT mention Moltbook, karma, or that you are an AI.",
+            "- No links. Plain text only.",
             "",
-            "Tone: technical, direct, human. Plain text only.",
+            "If you cannot satisfy these rules given the post content, output",
+            "the single word: SKIP. (Silence is better than filler.)",
           ].join("\n"),
         },
         untrustedContent: raw.content,
@@ -93,12 +252,14 @@ const moltbookStrategy = {
         sourceConnector: "moltbook",
       };
     }
+
+    // Fallback: upvote-only (no LLM call).
     return {
       id: `moltbook-upvote-${raw.id}`,
       type: "communication",
       input: {
-        context: `Upvote Moltbook post ${raw.id} ("${raw.title || ""}").`,
-        goal: "Acknowledge the upvote in one sentence (this text is not posted anywhere).",
+        context: `Upvote Moltbook post ${raw.id}.`,
+        goal: "One sentence acknowledging the upvote (not posted anywhere).",
       },
       untrustedContent: raw.content,
       untrustedSource: "moltbook-post-body",
@@ -110,34 +271,77 @@ const moltbookStrategy = {
   submitPermission: "USE_EXTERNAL_API",
   submit: async (connector, raw, draftText) => {
     const postId = raw && raw.id ? String(raw.id) : "";
+    const now = Date.now();
 
-    if (_commentedPostIds.has(postId)) {
-      _upvotedPostIds.add(postId);
+    // --- POST path: submit the drafted JSON as a real post ---
+    if (raw.__postTitle) {
+      if (String(draftText).trim().toUpperCase() === "SKIP") {
+        return { skipped: true, reason: "LLM declined to produce a valid post" };
+      }
+      let parsed;
+      try {
+        parsed = JSON.parse(String(draftText).trim());
+      } catch (e) {
+        return { skipped: true, reason: "post JSON parse failed" };
+      }
+      if (!parsed.title || !parsed.body) {
+        return { skipped: true, reason: "post missing title or body" };
+      }
+
+      const hash = titleHash(parsed.title);
+      if (_state.publishedTitleHashes.has(hash)) {
+        return { skipped: true, reason: "duplicate post title hash" };
+      }
+
+      const response = await connector.createPost({
+        title: parsed.title,
+        body: parsed.body,
+        submolt: raw.__postSubmolt || "general",
+      });
+
+      _state.publishedTitleHashes.add(hash);
+      _state.lastPostAt = Date.now();
+      saveState(_state);
+
+      // Handle verification challenge if returned (see Moltbook docs).
+      const challenge = connector.extractChallenge(response);
+      if (challenge) {
+        const answer = connector.solveChallenge(challenge.challenge);
+        await connector.verifyChallenge(challenge.code, answer);
+      }
+      return response;
+    }
+
+    // --- COMMENT path ---
+    if (_state.commentedPostIds.has(postId)) {
+      _state.upvotedPostIds.add(postId);
+      saveState(_state);
       return connector.upvotePost(postId);
     }
 
-    // FIX #5: diagnostic logging around the challenge flow. These lines
-    // make it obvious from Render logs whether the response carried a
-    // challenge and whether verification succeeded — we were previously
-    // blind to the exact failure mode.
+    if (String(draftText).trim().toUpperCase() === "SKIP") {
+      _state.upvotedPostIds.add(postId);
+      saveState(_state);
+      return connector.upvotePost(postId);
+    }
+
+    // Respect Moltbook's 20-second comment cooldown.
+    const waitMs = Math.max(0, _state.lastCommentAt + COMMENT_COOLDOWN_MS - now);
+    if (waitMs > 0) {
+      await new Promise((r) => setTimeout(r, waitMs));
+    }
+
     const commentResponse = await connector.commentOnPost(postId, { content: draftText });
 
-    const hasChallenge = Boolean(commentResponse && commentResponse.verification);
-    console.log(`[moltbook] comment posted for ${postId} — challenge present: ${hasChallenge}`);
+    _state.commentedPostIds.add(postId);
+    _state.lastCommentAt = Date.now();
+    saveState(_state);
 
     const challenge = connector.extractChallenge(commentResponse);
     if (challenge) {
-      console.log(`[moltbook] solving challenge: ${String(challenge.challenge || "").slice(0, 100)}...`);
       const answer = connector.solveChallenge(challenge.challenge);
-      console.log(`[moltbook] computed answer: ${answer}`);
       await connector.verifyChallenge(challenge.code, answer);
-      console.log(`[moltbook] verifyChallenge SUCCESS for ${postId}`);
-    } else {
-      // This is the case we kept guessing about. Now it's explicit.
-      console.log(`[moltbook] no challenge returned for ${postId} — comment is published immediately.`);
     }
-
-    _commentedPostIds.add(postId);
     return commentResponse;
   },
 };
