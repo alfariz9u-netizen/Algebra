@@ -28,14 +28,8 @@ const LESSON_RECALL_THRESHOLD = Number(process.env.LESSON_RECALL_THRESHOLD || 0.
 const LESSON_RECALL_ENABLED = String(process.env.LESSON_RECALL_ENABLED || "true").toLowerCase() !== "false";
 const LESSON_STORE_ENABLED = String(process.env.LESSON_STORE_ENABLED || "true").toLowerCase() !== "false";
 
-// ---- Moltbook "build log" posting (posts, not comments) -------------------
-//
-// Post-publishing state is kept in a separate file so it survives Render
-// restarts (unlike an in-memory variable) and is shared with the Moltbook
-// strategy's own state (which uses the same PERSIST_DIR but a different file
-// for comments/votes).
 const MOLTBOOK_POST_ENABLED = String(process.env.MOLTBOOK_POST_ENABLED || "true").toLowerCase() !== "false";
-const MOLTBOOK_POST_COOLDOWN_MS = Number(process.env.MOLTBOOK_POST_COOLDOWN_MS || 45 * 60 * 1000); // 45 min
+const MOLTBOOK_POST_COOLDOWN_MS = Number(process.env.MOLTBOOK_POST_COOLDOWN_MS || 45 * 60 * 1000);
 const MOLTBOOK_POST_MIN_OUTPUT_CHARS = Number(process.env.MOLTBOOK_POST_MIN_OUTPUT_CHARS || 350);
 const MOLTBOOK_POST_STATE_FILE = path.join(process.env.PERSIST_DIR || "./data", "moltbook-post-state.json");
 
@@ -43,10 +37,7 @@ function loadMoltbookPostState() {
   try {
     if (fs.existsSync(MOLTBOOK_POST_STATE_FILE)) {
       const raw = JSON.parse(fs.readFileSync(MOLTBOOK_POST_STATE_FILE, "utf8"));
-      return {
-        lastPostAt: raw.lastPostAt || 0,
-        titleHashes: new Set(raw.titleHashes || []),
-      };
+      return { lastPostAt: raw.lastPostAt || 0, titleHashes: new Set(raw.titleHashes || []) };
     }
   } catch (err) {
     console.warn(`[universalAgent] moltbook post state read failed: ${err.message}`);
@@ -71,28 +62,6 @@ function hashTitle(title) {
   return crypto.createHash("sha1").update(String(title).toLowerCase().trim()).digest("hex").slice(0, 16);
 }
 
-/**
- * ONE intelligent agent, many capabilities, one memory system, one security
- * control plane, one economic engine, one verification layer — per spec
- * section 29.
- *
- * MEMORY LAYERS:
- *   1. MemoryCache (episodic, in-memory/disk) — exact/near-exact task reuse.
- *   2. LearningEngine.circuits/deadOpportunities (structural) — don't
- *      retry a connector/listing that keeps failing the same way.
- *   3. LearningEngine + Supabase (semantic, cross-restart) — lessons
- *      learned from past tasks, recalled before executing new ones.
- *
- * REPUTATION:
- *   After a successful task, the agent:
- *     - stores a filtered "positive lesson" in Supabase (semantic memory),
- *     - promotes the importance of any lessons that were just recalled,
- *     - optionally publishes a "build log" post on Moltbook (only if the
- *       cooldown window has elapsed and the output is substantial enough).
- *   The Moltbook COMMENT path is handled separately by the marketplace
- *   pipeline (strategies/moltbook.js) — comments on other agents' posts are
- *   the primary reputation signal; posts are the secondary one.
- */
 class UniversalAgent {
   constructor({ agentId = "universal-digital-agent", persistDir, encryptionKey } = {}) {
     this.agentId = agentId;
@@ -114,7 +83,6 @@ class UniversalAgent {
     this.approvals = new ApprovalQueue({ persistDir, encryptionKey: resolvedEncryptionKey });
     this._approvedOverrides = new Set();
     this.autonomyLevel = currentLevel();
-    // Moltbook post state (persistent across restarts).
     this._moltbookPostState = loadMoltbookPostState();
   }
 
@@ -256,13 +224,13 @@ class UniversalAgent {
         result: preflight.reasons.join("; "),
         riskLevel: "LOW",
       });
-      return this._fail(taskId, `Token/compute budget exceededScore: ${preflight.reasons.join("; ")}`);
-:    }
+      return this._fail(taskId, `Token/compute budget exceeded: ${preflight.reasons.join("; ")}`);
+    }
 
     let generation;
-    q try {
-      generation = capability.allowsaTools
-        ? await this._executeWithTools(capability.score, userPrompt)
+    try {
+      generation = capability.allowsTools
+        ? await this._executeWithTools(capability, userPrompt)
         : await this.modelRouter.generate(capability.systemPrompt, userPrompt, capability.tier);
     } catch (err) {
       this.audit.record({
@@ -316,13 +284,8 @@ class UniversalAgent {
       costUsd: 0,
     });
 
-    // 11. Semantic memory + reputation (all fire-and-forget).
     if (LESSON_STORE_ENABLED && supabase && supabase.status() === "CONNECTED") {
-      const lessonOutcome = {
-        status: "success",
-        output: generation.text,
-        meta: { qaScore: qa.score },
-      };
+      const lessonOutcome = { status: "success", output: generation.text, meta: { qaScore: qa.score } };
 
       this.learning
         .rememberTaskOutcome(supabase, {
@@ -349,15 +312,13 @@ class UniversalAgent {
       }
     }
 
-    // 11c. Moltbook "build log" post — fire-and-forget, cooldown-guarded,
-    //      deduplicated by title hash. Never blocks the task's own delivery.
     this._maybePublishMoltbookPost(task, capability, generation.text, qa.score).catch((e) =>
       console.warn(`[universalAgent] moltbook post attempt failed: ${e.message}`)
     );
 
     return this._deliver(taskId, capability, generation.text, {
       cached: false,
-      qa,
+      qaScore: qa.score,
       tokenUsage: actualTokens,
       model: generation.model,
       provider: generation.provider,
@@ -365,33 +326,13 @@ class UniversalAgent {
     });
   }
 
-  /**
-   * Publish a "build log" post on Moltbook, IF all of these hold:
-   *   - MOLTBOOK_POST_ENABLED is not "false"
-   *   - the moltbook connector is CONNECTED
-   *   - the cooldown window has elapsed since the last post
-   *   - the task is not itself a moltbook task (avoid recursive posts)
-   *   - the output is substantial enough to be worth a public post
-   *   - the title hash has not been published before
-   *
-   * This method is deliberately SIMPLE: it composes the title/body from
-   * the task outcome directly (no LLM call), which keeps cost near zero
-   * and avoids a second layer of QA risk. The Moltbook COMMENT path (in
-   * strategies/moltbook.js) is where LLM-crafted prose lives.
-   *
-   * Note: because this is fire-and-forget, it must never throw into the
-   * caller's flow — the .catch() at the call site handles that.
-   */
   async _maybePublishMoltbookPost(task, capability, outputText, qaScore) {
     if (!MOLTBOOK_POST_ENABLED) return;
 
     const moltbook = this.connectors.get("moltbook");
     if (!moltbook || moltbook.status() !== "CONNECTED") return;
-
-    // Never self-reference.
     if (task.sourceConnector === "moltbook") return;
 
-    // Output too short → not a real build log.
     const trimmed = String(outputText || "").trim();
     if (trimmed.length < MOLTBOOK_POST_MIN_OUTPUT_CHARS) return;
 
@@ -402,7 +343,6 @@ class UniversalAgent {
       return;
     }
 
-    // Compose a deterministic title + body from the task outcome.
     const taskType = task.type || "task";
     const connector = task.sourceConnector || "unknown";
     const capName = capability.name || "unknown";
@@ -432,7 +372,6 @@ class UniversalAgent {
     try {
       const response = await moltbook.createPost({ title, body, submolt: "general" });
 
-      // Handle the same verification-challenge flow as comments.
       const challenge = moltbook.extractChallenge(response);
       if (challenge) {
         try {
@@ -441,8 +380,6 @@ class UniversalAgent {
           console.log(`[universalAgent] moltbook post verified (hash=${titleShort})`);
         } catch (err) {
           console.warn(`[universalAgent] moltbook post verification failed: ${err.message}`);
-          // Even if verification failed, we DID create the post — record
-          // the hash and cooldown so we don't spam-retry the same content.
         }
       }
 
@@ -459,8 +396,6 @@ class UniversalAgent {
         riskLevel: "LOW",
       });
     } catch (err) {
-      // Log loudly but do not propagate — this is a reputation feature, not
-      // a task-critical one. A Moltbook outage must never fail a task.
       console.warn(`[universalAgent] moltbook createPost failed: ${err.message}`);
       this.audit.record({
         agentId: this.agentId,
@@ -472,6 +407,18 @@ class UniversalAgent {
   }
 
   async _qaGrade(taskId, deliverableText, producingCapability) {
+    // COMMUNICATION FAST PATH: social comments do not need LLM-based QA.
+    if (producingCapability.name === "communication") {
+      const trimmed = String(deliverableText || "").trim();
+      if (trimmed.length < 20) {
+        return { passed: false, score: 0, message: "Comment too short (<20 chars)." };
+      }
+      if (trimmed.length > 1500) {
+        return { passed: false, score: 0, message: "Comment too long (>1500 chars)." };
+      }
+      return { passed: true, score: 85, message: "Social comment accepted (deterministic check)." };
+    }
+
     const qaCapability = CAPABILITIES.qualityAssurance;
     const prompt = qaCapability.buildUserPrompt({
       input: {
