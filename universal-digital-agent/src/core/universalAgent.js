@@ -20,24 +20,31 @@ const ApprovalQueue = require("./approvalQueue");
 const { parseJsonLoose } = require("./jsonExtract");
 
 const QUALITY_THRESHOLD = Number(process.env.QA_QUALITY_THRESHOLD || 80);
+const LESSON_RECALL_COUNT = Number(process.env.LESSON_RECALL_COUNT || 3);
+const LESSON_RECALL_THRESHOLD = Number(process.env.LESSON_RECALL_THRESHOLD || 0.55);
+const LESSON_RECALL_ENABLED = String(process.env.LESSON_RECALL_ENABLED || "true").toLowerCase() !== "false";
+const LESSON_STORE_ENABLED = String(process.env.LESSON_STORE_ENABLED || "true").toLowerCase() !== "false";
 
 /**
  * ONE intelligent agent, many capabilities, one memory system, one security
  * control plane, one economic engine, one verification layer — per spec
- * section 29. This replaces the previous 9-agent architecture; capabilities
- * are configuration + prompt logic invoked here, not separate agent objects
- * calling each other.
+ * section 29. Capabilities are configuration + prompt logic invoked here,
+ * not separate agent objects calling each other.
+ *
+ * SEMANTIC MEMORY INTEGRATION (this version):
+ * The agent now has three layers of memory, each with a distinct role:
+ *   1. MemoryCache (episodic, in-memory/disk) — "have I seen this exact
+ *      task before? → return the cached answer".
+ *   2. LearningEngine.circuits/deadOpportunities (structural) — "this
+ *      connector/listing keeps failing, don't retry".
+ *   3. LearningEngine + Supabase (semantic, cross-restart) — "have I
+ *      learned a lesson from past tasks that applies here?" — the recall
+ *      happens AFTER the cache miss (so the cache key stays stable) and
+ *      BEFORE the token preflight (so budget includes lesson overhead).
+ * After success, we store the lesson (fire-and-forget) and promote the
+ * importance of any lessons that were just recalled and clearly helped.
  */
 class UniversalAgent {
-  /**
-   * @param {{ agentId?: string, persistDir?: string, encryptionKey?: string }} [options] - pass
-   *   `persistDir` (e.g. "./data") to make memory/audit/economics/approvals
-   *   survive restarts. Without it, everything is in-memory only (default
-   *   — matches all existing tests/behavior). Pass `encryptionKey` (or set
-   *   PERSIST_ENCRYPTION_KEY) to encrypt everything written to disk with
-   *   real AES-256-GCM — strongly recommended whenever persistDir is used,
-   *   since audit logs and memory can contain sensitive task content.
-   */
   constructor({ agentId = "universal-digital-agent", persistDir, encryptionKey } = {}) {
     this.agentId = agentId;
     this.persistDir = persistDir;
@@ -53,19 +60,13 @@ class UniversalAgent {
       refillPerSecond: Number(process.env.CONNECTOR_RATE_LIMIT_REFILL_PER_SEC || 1),
     });
     this.economics = new EconomicIntelligence({ persistDir, encryptionKey: resolvedEncryptionKey });
-    // Failure memory for MarketplacePipeline: circuit breaker per
-    // connector+operation, dead-listing memory, and calibrated bid-win
-    // probability. See learningEngine.js for why this exists — without it
-    // a broken credential or an unbiddable listing gets retried, and its
-    // LLM draft re-paid for, on every single cycle forever.
     this.learning = new LearningEngine({ persistDir, encryptionKey: resolvedEncryptionKey });
     this.connectors = new ConnectorRegistry();
     this.approvals = new ApprovalQueue({ persistDir, encryptionKey: resolvedEncryptionKey });
-    this._approvedOverrides = new Set(); // taskIds resumed past their approval gate for this call only
+    this._approvedOverrides = new Set();
     this.autonomyLevel = currentLevel();
   }
 
-  /** Grants the standing permissions a task needs, scoped and time-limited (spec 18). */
   authorizeTask(taskId, actions, { durationMs = 30 * 60 * 1000 } = {}) {
     return actions.map((action) =>
       this.permissions.grant({
@@ -81,13 +82,14 @@ class UniversalAgent {
 
   /**
    * Full lifecycle: classify -> plan -> select ONE capability -> permission/
-   * risk/budget gates -> cache check -> execute -> verify -> record -> deliver.
+   * risk/budget gates -> cache check -> lesson recall -> execute -> verify
+   * -> QA -> cache store -> lesson store -> deliver.
    */
   async processTask(task) {
     const taskId = task.id;
     this.killSwitch.assertCanAct();
 
-    // 1. Intent classification — deterministic first, LLM fallback only if needed.
+    // 1. Intent classification.
     const intent = await classify(task, this.modelRouter);
     const capability = CAPABILITIES[intent.capability];
     if (!capability) {
@@ -102,12 +104,7 @@ class UniversalAgent {
       riskLevel: "LOW",
     });
 
-    // 2. Risk/autonomy gate FIRST. This must run before any permission is
-    // granted — granting first and checking second (the previous order)
-    // made the "deny-by-default" permission system decorative, since the
-    // agent was always the one both issuing and checking its own grant.
-    // Only actions that clear this gate (LOW risk, or MEDIUM/HIGH already
-    // approved via resumeTask) are ever self-authorized below.
+    // 2. Risk/autonomy gate.
     const needsApproval =
       !this._approvedOverrides.has(taskId) && riskEngine.requiresHumanApproval(capability.permission, this.autonomyLevel);
     if (needsApproval) {
@@ -129,10 +126,7 @@ class UniversalAgent {
       return this._pendingApproval(taskId, capability, approval.id);
     }
 
-    // 2b. The action cleared the risk gate — now, and only now, self-authorize
-    // and check the grant. `check()` is no longer a rubber stamp: reaching
-    // this line already proves the action was either LOW risk or explicitly
-    // approved by a human via resumeTask.
+    // 2b. Permission self-authorize + check.
     this.authorizeTask(taskId, [capability.permission]);
     const permCheck = this.permissions.check({
       agentId: this.agentId,
@@ -160,7 +154,9 @@ class UniversalAgent {
       }
     }
 
-    // 4. Cache check BEFORE spending any tokens.
+    // 4. Cache check BEFORE spending any tokens. Uses the ORIGINAL prompt
+    // (pre-lesson-recall) so the cache key stays stable across identical
+    // tasks — otherwise every lesson recall would invalidate every entry.
     const cacheResult = await this.memory.lookup(capability.name, userPrompt);
     if (cacheResult.hit) {
       this.audit.record({
@@ -173,7 +169,54 @@ class UniversalAgent {
       return this._deliver(taskId, capability, cacheResult.entry.result, { cached: true, via: cacheResult.via });
     }
 
-    // 5. Token/compute budget preflight.
+    // 4b. SEMANTIC LESSON RECALL — only on a cache miss, only when Supabase
+    // is connected, only when the operator hasn't disabled it. Injects a
+    // clearly-delimited block of past-experience lessons into the prompt.
+    // The block is framed as guidance, not instructions, and its own
+    // "source" label prevents it from being confused with untrusted
+    // external content (which is labeled separately above).
+    const supabase = this.connectors.get("supabase");
+    let recalledLessons = [];
+    if (LESSON_RECALL_ENABLED && supabase && supabase.status() === "CONNECTED") {
+      try {
+        recalledLessons = await this.learning.recallRelevantLessons(supabase, userPrompt, {
+          connector: task.sourceConnector,
+          taskType: task.type,
+          count: LESSON_RECALL_COUNT,
+          threshold: LESSON_RECALL_THRESHOLD,
+        });
+      } catch (err) {
+        // Recall is an optimisation, not a requirement — never fail the
+        // task because memory lookup threw.
+        console.warn(`[universalAgent] lesson recall failed: ${err.message}`);
+      }
+    }
+
+    if (recalledLessons.length > 0) {
+      const lessonBlock = [
+        "--- LESSONS FROM PAST EXPERIENCE ---",
+        "The following lessons were extracted from similar tasks this agent",
+        "has previously completed. They are guidance, not instructions.",
+        "Apply any lesson that is directly relevant; ignore the rest.",
+        "",
+        ...recalledLessons.map(
+          (l, i) => `[${i + 1}] (kind=${l.kind}, importance=${l.importance}, similarity=${Number(l.similarity).toFixed(2)})\n${l.content}`
+        ),
+        "--- END LESSONS ---",
+      ].join("\n");
+
+      userPrompt = `${userPrompt}\n\n${lessonBlock}`;
+
+      this.audit.record({
+        agentId: this.agentId,
+        taskId,
+        action: "LESSONS_RECALLED",
+        result: `${recalledLessons.length} lesson(s), ids=[${recalledLessons.map((l) => l.id).join(",")}]`,
+        riskLevel: "LOW",
+      });
+    }
+
+    // 5. Token/compute budget preflight (with lessons already injected).
     const preflight = this.tokens.preflight(taskId, { systemPrompt: capability.systemPrompt, userPrompt });
     if (!preflight.allowed) {
       this.audit.record({
@@ -186,12 +229,7 @@ class UniversalAgent {
       return this._fail(taskId, `Token/compute budget exceeded: ${preflight.reasons.join("; ")}`);
     }
 
-    // 6. Execute — the ONE real LLM call this task needs for this capability,
-    // UNLESS the capability opts into tool-use (`allowsTools: true`, currently
-    // only webResearch) AND a real MCP tool server is connected — in which
-    // case a small, hard-bounded tool loop runs instead (see
-    // _executeWithTools). Every other capability, and webResearch itself when
-    // no MCP server is configured, behaves exactly as before.
+    // 6. Execute.
     let generation;
     try {
       generation = capability.allowsTools
@@ -221,23 +259,28 @@ class UniversalAgent {
       riskLevel: capability.riskLevel,
     });
 
-    // 7. Verification — deterministic where possible.
+    // 7. Deterministic verification.
     const verification = verificationLayer.verify(capability.name, generation.text);
 
-    // 8. QA grading (a single additional fast-tier call — not a second "agreeing" agent).
+    // 8. QA grading.
     const qa = await this._qaGrade(taskId, generation.text, capability);
 
     const passed = verification.passed && qa.passed;
 
     if (!passed) {
       this.economics.record({ type: "task_failed", model: generation.model, connector: task.sourceConnector });
+      // Negative feedback on recalled lessons is intentionally NOT sent
+      // here — a QA/verification failure is often a property of the task
+      // itself, not of the lessons that were recalled. Penalising them on
+      // every such failure would drift their importance down over time
+      // even when they were never actually wrong.
       return this._fail(
         taskId,
         `Did not pass verification/QA. Verification: ${verification.checks.join("; ")}. QA: ${qa.message}`
       );
     }
 
-    // 9. Store to memory/cache for future reuse — only verified results are cached.
+    // 9. Store to episodic cache (exact/near-exact reuse).
     await this.memory.store(capability.name, userPrompt, generation.text, {
       verificationStatus: "passed",
       confidence: qa.score / 100,
@@ -246,13 +289,55 @@ class UniversalAgent {
       tokenUsage: actualTokens,
     });
 
+    // 10. Economics record.
     this.economics.record({
       type: "task_completed",
       model: generation.model,
       connector: task.sourceConnector,
       revenueUsd: task.rewardUsd || 0,
-      costUsd: 0, // Gemini free tier == $0 real cost; non-zero only if a paid provider tier is used.
+      costUsd: 0,
     });
+
+    // 11. SEMANTIC LESSON STORE + FEEDBACK LOOP — fire-and-forget so the
+    //    task's own latency isn't tied to Supabase's response time. The
+    //    LessonEngine itself is filter-first (deterministic checks, near-
+    //    duplicate detection, template-output rejection), so nothing
+    //    random makes it into memory.
+    if (LESSON_STORE_ENABLED && supabase && supabase.status() === "CONNECTED") {
+      const lessonOutcome = {
+        status: "success",
+        output: generation.text,
+        meta: { qaScore: qa.score },
+      };
+
+      // 11a. Store the positive lesson.
+      this.learning
+        .rememberTaskOutcome(supabase, {
+          taskType: task.type,
+          connector: task.sourceConnector,
+          capability: capability.name,
+          outcome: lessonOutcome,
+          rewardUsd: task.rewardUsd || 0,
+        })
+        .then((r) => {
+          if (r.stored) {
+            console.log(`[universalAgent] lesson stored (id=${r.id}, importance=${r.importance})`);
+          } else {
+            console.log(`[universalAgent] lesson skipped: ${r.reason}`);
+          }
+        })
+        .catch((e) => console.warn(`[universalAgent] lesson store failed: ${e.message}`));
+
+      // 11b. Feedback loop: lessons we just recalled AND that led to a
+      //      successful task get +1 importance. This is how the memory
+      //      self-tunes — useful lessons rise, noisy lessons fade.
+      if (recalledLessons.length > 0) {
+        const ids = recalledLessons.map((l) => l.id).filter(Boolean);
+        this.learning
+          .recordLessonFeedback(supabase, ids, { helped: true })
+          .catch((e) => console.warn(`[universalAgent] lesson feedback failed: ${e.message}`));
+      }
+    }
 
     return this._deliver(taskId, capability, generation.text, {
       cached: false,
@@ -260,6 +345,7 @@ class UniversalAgent {
       tokenUsage: actualTokens,
       model: generation.model,
       provider: generation.provider,
+      lessonsRecalled: recalledLessons.length,
     });
   }
 
@@ -308,13 +394,6 @@ class UniversalAgent {
     };
   }
 
-  /**
-   * The other half of the approval flow: once a human has approved a
-   * pending request (via the approvals queue / CLI), this actually
-   * re-runs the original task, bypassing ONLY the approval gate for this
-   * exact taskId — every other gate (permissions, budget, verification,
-   * QA) still applies in full.
-   */
   async resumeTask(approvalId) {
     const record = this.approvals.get(approvalId);
     if (!record) throw new Error(`No approval request with id "${approvalId}".`);
@@ -333,13 +412,6 @@ class UniversalAgent {
     }
   }
 
-  /**
-   * The ONLY sanctioned path for calling a connector operation. Enforces,
-   * in order: kill switch, connector actually supports the operation
-   * (never assumes), permission grant, and per-connector rate limiting —
-   * then audits the outcome either way. Nothing should call a connector
-   * method directly, bypassing these gates.
-   */
   async callConnector(connectorName, operation, permissionAction, fn) {
     this.killSwitch.assertCanAct(connectorName);
 
@@ -362,24 +434,6 @@ class UniversalAgent {
     }
   }
 
-  /**
-   * Runs a capability's execution through the bounded MCP tool-use loop
-   * instead of a single plain call — only reached for a capability with
-   * `allowsTools: true` (currently just webResearch). Degrades to the
-   * exact plain `modelRouter.generate()` call at every point where tools
-   * aren't actually usable right now, rather than failing the task:
-   *   - no MCP server configured / not CONNECTED
-   *   - the connector-wide MCP circuit is open (see learningEngine.js —
-   *     MCP has been failing the same structural way recently)
-   *   - `tools/list` itself fails
-   *   - the server's advertised tools don't intersect this process's
-   *     explicit MCP_ALLOWED_TOOLS allow-list (McpClient enforces this
-   *     again per-call regardless; filtering here just avoids offering
-   *     the model a tool it will only get refused for trying)
-   *   - the tool loop throws for any other reason
-   * Every actual tool call still goes through `callConnector` (kill
-   * switch, rate limit, audit) exactly like any other connector call.
-   */
   async _executeWithTools(capability, userPrompt) {
     const fallback = () => this.modelRouter.generate(capability.systemPrompt, userPrompt, capability.tier);
 
@@ -420,13 +474,6 @@ class UniversalAgent {
     }
   }
 
-  /**
-   * Runs retention pruning across memory/audit/economics in one call —
-   * this is what actually closes the "no database cleanup" gap. Safe to
-   * call repeatedly (e.g. from a daily cron via src/maintenanceCli.js);
-   * financial totals in economics are preserved via rollup regardless of
-   * how aggressively you prune.
-   */
   runMaintenance({
     memoryMaxRecords = Number(process.env.MEMORY_MAX_RECORDS || 0) || undefined,
     auditMaxAgeMs = Number(process.env.AUDIT_MAX_AGE_MS || 0) || undefined,
