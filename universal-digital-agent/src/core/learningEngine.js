@@ -4,36 +4,9 @@ const path = require("node:path");
 const { JsonFileStore } = require("./persistence/fileStore");
 
 function freshState() {
-  // Always a brand-new set of objects — never share references with
-  // DEFAULT_STATE or between instances, or two in-memory (no persistDir)
-  // LearningEngine instances would silently mutate the same shared
-  // circuits/deadOpportunities/connectorStats objects.
   return { circuits: {}, deadOpportunities: {}, connectorStats: {} };
 }
 
-/**
- * Classifies a thrown/rejected error into a failure kind so the circuit
- * breaker can react appropriately. This is the difference between "the
- * connector is fundamentally unusable right now" (stop hammering it) and
- * "this one listing happens to be broken" (skip just that listing) and
- * "the network hiccuped" (retry soon).
- *
- *   config          - CREDENTIAL_REQUIRED / NOT_SUPPORTED / NOT_CONNECTED:
- *                      will not resolve by retrying, only by an operator
- *                      fixing configuration.
- *   auth            - 401/403/"Unauthorized"/"Forbidden": credentials are
- *                      present but wrong/expired/insufficient. Same
- *                      "stop retrying until a human fixes it" treatment as
- *                      config, tracked separately only for clearer logs.
- *   rate_limit      - 429/"rate limit": will resolve on its own, soon.
- *   transient       - 5xx/timeout/network reset: will usually resolve on
- *                      its own, soon.
- *   listing_defect  - "no usable budget", 404, "insufficient data": a
- *                      property of ONE specific opportunity, not the
- *                      connector. Never opens the connector-wide circuit —
- *                      the caller should mark just that opportunity dead.
- *   unknown         - anything else: treated cautiously (short backoff).
- */
 function classifyError(err) {
   const msg = String((err && err.message) || err || "");
   if (/CREDENTIAL_REQUIRED|NOT_SUPPORTED|NOT_CONNECTED|does not support/i.test(msg)) {
@@ -54,11 +27,6 @@ function classifyError(err) {
   return { kind: "unknown", retryable: true, perListing: false };
 }
 
-// How many consecutive failures of a given kind before the circuit opens,
-// how long the first "open" period lasts, and the ceiling it backs off to
-// (doubling each time it re-opens right after a half-open trial fails).
-// config/auth issues need a human, so they get long, patient backoffs;
-// transient/rate-limit issues resolve themselves, so short ones.
 const POLICY = {
   config: { threshold: 2, baseMs: 2 * 60 * 60 * 1000, capMs: 24 * 60 * 60 * 1000 },
   auth: { threshold: 2, baseMs: 2 * 60 * 60 * 1000, capMs: 24 * 60 * 60 * 1000 },
@@ -74,31 +42,41 @@ function opportunityKey(connector, opportunityId) {
   return `${connector}::${opportunityId}`;
 }
 
+// ---- Semantic-memory tuning ----------------------------------------------
+const MIN_LESSON_CHARS = Number(process.env.LEARNING_MIN_LESSON_CHARS || 200);
+const DEDUP_SIMILARITY_THRESHOLD = Number(process.env.LEARNING_DEDUP_THRESHOLD || 0.92);
+// Recall budget: caps how many tokens of recalled lessons get injected into
+// a single prompt. Each lesson is capped at RECALL_CHARS_PER_LESSON, and
+// the total across all recalled lessons is capped at RECALL_TOTAL_CHARS.
+const RECALL_CHARS_PER_LESSON = Number(process.env.LEARNING_RECALL_CHARS_PER_LESSON || 700);
+const RECALL_TOTAL_CHARS = Number(process.env.LEARNING_RECALL_TOTAL_CHARS || 2200);
+// Importance decays if a lesson hasn't been recalled in this many days.
+// Prevents stale lessons from dominating ranking forever.
+const IMPORTANCE_DECAY_DAYS = Number(process.env.LEARNING_DECAY_DAYS || 30);
+
 /**
- * Persisted failure memory + calibrated economics for MarketplacePipeline.
- * Exists to stop the exact pattern seen in production logs: the same
- * connector failing the exact same way (CREDENTIAL_REQUIRED, 401, "no
- * usable budget") every single cycle, forever, each time paying for a
- * fresh LLM-drafted proposal that was always going to be thrown away.
+ * Persisted failure memory + calibrated economics + SEMANTIC LESSON MEMORY
+ * for MarketplacePipeline.
  *
- * Three independent pieces of memory:
- *   1. Circuit breaker per (connector, operation) — stops attempting an
- *      operation that keeps failing the same structural way, with
- *      exponential backoff, and automatically retries (half-open) once
- *      the backoff elapses rather than staying open forever.
- *   2. Dead-opportunity memory — remembers a specific listing (by id) that
- *      was already found unusable (e.g. no budget field) so it is never
- *      drafted-then-discarded again, even while the connector as a whole
- *      is healthy.
- *   3. Calibrated success probability — Bayesian blend of a strategy's
- *      static guess (e.g. "40% of Molt Market bids win") with this
- *      connector's own observed attempt/win history, so expected-value
- *      ranking gets more accurate the longer the agent runs instead of
- *      trusting a hand-picked constant forever.
+ * Semantic memory layers (all Supabase pgvector-backed):
+ *   1. POSITIVE lessons — what worked, from successful tasks.
+ *   2. NEGATIVE lessons — what to avoid, from repeated failures on the
+ *      same connector+task-type after ≥3 distinct instances.
+ *   3. Feedback-adjusted importance — a lesson's importance is nudged up
+ *      when recall → success, and down when recall → failure.
  *
- * PERSISTENCE follows the same cross-process-safe pattern as KillSwitch:
- * `_sync()` re-reads from disk before every read, `_persist()` writes
- * immediately after every mutation.
+ * Filtering is deterministic (no LLM call to decide "is this worth
+ * remembering"), because the pipeline is already token-constrained:
+ *   - Only substantial, non-template outputs (≥ MIN_LESSON_CHARS) qualify.
+ *   - Near-duplicates (similarity ≥ 0.92) are skipped at write time.
+ *   - Recall returns a token-budgeted, deduplicated set: at most
+ *     RECALL_TOTAL_CHARS total, and no two lessons >0.85 similar to each
+ *     other inside the same prompt.
+ *
+ * EMBEDDING PROVENANCE: every lesson stores `embedding_source` in its
+ * metadata (either "jina-v3" or "pseudo-sha256"). Recall only compares
+ * against lessons from the same source, because comparing a real semantic
+ * vector to a pseudo-hash vector produces noise, not similarity.
  */
 class LearningEngine {
   constructor({ persistDir, encryptionKey, now = () => Date.now() } = {}) {
@@ -123,16 +101,8 @@ class LearningEngine {
     this._store.save({ circuits: this.circuits, deadOpportunities: this.deadOpportunities, connectorStats: this.connectorStats });
   }
 
-  // ---- Circuit breaker -----------------------------------------------
+  // ---- Circuit breaker -------------------------------------------------
 
-  /**
-   * Call BEFORE attempting an operation. Returns `{ open: true, ... }`
-   * when the operation should be skipped entirely this cycle (no
-   * connector call, no LLM draft, nothing spent). When the backoff window
-   * has elapsed, transitions the circuit to "half_open" and allows exactly
-   * one trial through (`open: false, halfOpen: true`) — success closes it,
-   * failure re-opens it with a longer backoff.
-   */
   checkCircuit(connector, operation) {
     this._sync();
     const key = circuitKey(connector, operation);
@@ -143,13 +113,11 @@ class LearningEngine {
     if (c.state === "open" && now < c.openUntil) {
       return { open: true, reason: c.lastError, kind: c.kind, retryAfterMs: c.openUntil - now, failureStreak: c.failureStreak };
     }
-    // Backoff elapsed (or already half-open) — allow one trial through.
     c.state = "half_open";
     this._persist();
     return { open: false, halfOpen: true };
   }
 
-  /** Call after an operation succeeds. Closes/resets its circuit. */
   recordSuccess(connector, operation) {
     this._sync();
     const key = circuitKey(connector, operation);
@@ -159,12 +127,6 @@ class LearningEngine {
     }
   }
 
-  /**
-   * Call after an operation fails. Returns `{ opened, kind, retryable,
-   * perListing }` so the caller can decide whether to also mark a specific
-   * opportunity dead (perListing) rather than blame the whole connector.
-   * A `listing_defect` never touches the circuit at all — see classifyError.
-   */
   recordFailure(connector, operation, err) {
     this._sync();
     const classification = classifyError(err);
@@ -184,8 +146,6 @@ class LearningEngine {
       return { opened: false, ...classification, failureStreak };
     }
 
-    // Exponential backoff from the base, doubling for every re-open beyond
-    // the first, capped so it never blocks forever past a sane ceiling.
     const reopenCount = wasHalfOpen ? (prev.reopenCount || 0) + 1 : 0;
     const backoffMs = Math.min(policy.baseMs * Math.pow(2, reopenCount), policy.capMs);
     const now = this._now();
@@ -202,7 +162,6 @@ class LearningEngine {
     return { opened: true, retryAfterMs: backoffMs, ...classification, failureStreak };
   }
 
-  /** Manual override — e.g. an operator ran a CLI command after fixing credentials. */
   resetCircuit(connector, operation) {
     this._sync();
     delete this.circuits[circuitKey(connector, operation)];
@@ -222,7 +181,6 @@ class LearningEngine {
     this._persist();
   }
 
-  /** Splits a list of normalized opportunities into ones worth processing vs. already known-dead. */
   partitionKnownDead(connector, opportunities) {
     this._sync();
     const toProcess = [];
@@ -236,7 +194,6 @@ class LearningEngine {
 
   // ---- Calibrated success probability ----------------------------------
 
-  /** Call whenever a bid/submission attempt is made, and whether it ultimately won/completed. */
   recordAttempt(connector, { won }) {
     this._sync();
     const stats = this.connectorStats[connector] || { attempts: 0, wins: 0 };
@@ -246,15 +203,6 @@ class LearningEngine {
     this._persist();
   }
 
-  /**
-   * Bayesian blend of a strategy's static guess (`fallback`, e.g. an env
-   * var like MOLTMARKET_DEFAULT_BID_WIN_RATE) with this connector's own
-   * observed win rate. With zero real attempts this returns exactly
-   * `fallback` (no behavior change for a fresh agent); as attempts
-   * accumulate, it converges toward the real observed rate. `priorWeight`
-   * controls how many "virtual" attempts the fallback guess is worth —
-   * higher means the static guess takes longer to be overridden by data.
-   */
   calibratedSuccessProbability(connector, fallback, { priorWeight = 6 } = {}) {
     this._sync();
     const stats = this.connectorStats[connector] || { attempts: 0, wins: 0 };
@@ -262,9 +210,286 @@ class LearningEngine {
     return Math.min(0.99, Math.max(0.01, rate));
   }
 
+  // ---- SEMANTIC MEMORY: filter-first, LLM-free filtering ---------------
+
+  /**
+   * Deterministic filter for POSITIVE lessons. Returns { keep, reason }
+   * and (when keep) the exact content that will be embedded.
+   */
+  _buildPositiveLesson({ taskType, connector, capability, output, rewardUsd, qaScore }) {
+    const text = String(output || "").trim();
+
+    if (text.length < MIN_LESSON_CHARS) {
+      return { keep: false, reason: `output too short (${text.length} < ${MIN_LESSON_CHARS})` };
+    }
+
+    // Filter out template-y outputs that carry no reusable signal.
+    // (Exact-duplicate detection happens in `_dedupCheck` below.)
+    const looksTemplate = /^\s*(done|completed|ok|success)[.!]?\s*$/i.test(text);
+    if (looksTemplate) return { keep: false, reason: "template output" };
+
+    const content = [
+      `Task type: ${taskType || "unknown"}.`,
+      `Connector: ${connector || "unknown"}.`,
+      `Capability: ${capability || "unknown"}.`,
+      qaScore != null ? `QA score: ${qaScore}/100.` : null,
+      rewardUsd ? `Reward: $${rewardUsd}.` : null,
+      "Approach that worked:",
+      text.slice(0, 1500),
+    ].filter(Boolean).join("\n");
+
+    // Importance heuristic, no LLM needed.
+    const qaNorm = qaScore != null ? qaScore / 100 : 0.7;
+    const rewardNorm = rewardUsd ? Math.min(1, rewardUsd / 5) : 0;
+    const importance = Math.max(1, Math.min(10, Math.round(3 + qaNorm * 4 + rewardNorm * 3)));
+
+    return { keep: true, content, importance };
+  }
+
+  /**
+   * Deterministic filter for NEGATIVE lessons. Same shape as positive, but
+   * only fires when the same connector+task-type has failed ≥3 times with
+   * the same error kind — one-off failures don't deserve a permanent
+   * "avoid this" entry.
+   */
+  _buildNegativeLesson({ taskType, connector, capability, errorMessage, errorKind }) {
+    const text = String(errorMessage || "").trim();
+    if (text.length < 40) return { keep: false, reason: "error too short" };
+
+    const content = [
+      `AVOID PATTERN (learned from repeated failure):`,
+      `Task type: ${taskType || "unknown"}.`,
+      `Connector: ${connector || "unknown"}.`,
+      `Capability: ${capability || "unknown"}.`,
+      `Failure kind: ${errorKind || "unknown"}.`,
+      `Why it failed:`,
+      text.slice(0, 800),
+    ].join("\n");
+
+    // Negative lessons default to modest importance (4); they only get
+    // promoted if feedback shows they actually prevent failures.
+    return { keep: true, content, importance: 4 };
+  }
+
+  async _dedupCheck(supabase, content, { connector, taskType, embeddingSource }) {
+    try {
+      const existing = await supabase.searchLessons(content, {
+        threshold: DEDUP_SIMILARITY_THRESHOLD,
+        count: 1,
+        connector,
+        taskType,
+        embeddingSource,
+      });
+      if (Array.isArray(existing) && existing.length > 0) {
+        return { duplicate: true, similarity: existing[0].similarity };
+      }
+    } catch (err) {
+      console.warn(`[learning] dedup search failed: ${err.message} — storing anyway.`);
+    }
+    return { duplicate: false };
+  }
+
+  /**
+   * Store a POSITIVE lesson learned from a successful task.
+   * Fire-and-forget from the pipeline.
+   */
+  async rememberTaskOutcome(supabase, { taskType, connector, capability, outcome, rewardUsd } = {}) {
+    if (!supabase || supabase.status() !== "CONNECTED") {
+      return { stored: false, reason: "supabase not connected" };
+    }
+    if (!outcome || outcome.status !== "success") {
+      return { stored: false, reason: "task not successful" };
+    }
+
+    const built = this._buildPositiveLesson({
+      taskType, connector, capability,
+      output: outcome.output,
+      rewardUsd,
+      qaScore: outcome.meta?.qaScore,
+    });
+    if (!built.keep) return { stored: false, reason: built.reason };
+
+    // Embedding provenance — the connector returns the source it used.
+    // If Jina succeeded, source = "jina-v3"; else "pseudo-sha256".
+    // We need to know it BEFORE the dedup search, because we only want to
+    // compare against same-source lessons.
+    const probe = await supabase.embedWithSource(built.content);
+    const embeddingSource = probe.source;
+
+    const dedup = await this._dedupCheck(supabase, built.content, {
+      connector, taskType, embeddingSource,
+    });
+    if (dedup.duplicate) {
+      return { stored: false, reason: `near-duplicate (sim=${dedup.similarity?.toFixed(3)})` };
+    }
+
+    try {
+      const stored = await supabase.storeLesson({
+        content: built.content,
+        taskType: taskType || null,
+        connector: connector || null,
+        outcome: "success",
+        importance: built.importance,
+        metadata: {
+          capability,
+          rewardUsd: rewardUsd || 0,
+          qaScore: outcome.meta?.qaScore ?? null,
+          embedding_source: embeddingSource,
+          kind: "positive",
+        },
+      });
+      return { stored: true, id: stored?.id, importance: built.importance };
+    } catch (err) {
+      return { stored: false, reason: `store failed: ${err.message}` };
+    }
+  }
+
+  /**
+   * Store a NEGATIVE lesson from a repeated failure. Called by the
+   * pipeline after recordFailure() opens a circuit — this is when we
+   * actually know "this pattern keeps failing" rather than "this one
+   * attempt happened to fail".
+   */
+  async rememberTaskFailure(supabase, { taskType, connector, capability, errorMessage, errorKind } = {}) {
+    if (!supabase || supabase.status() !== "CONNECTED") {
+      return { stored: false, reason: "supabase not connected" };
+    }
+
+    const built = this._buildNegativeLesson({
+      taskType, connector, capability, errorMessage, errorKind,
+    });
+    if (!built.keep) return { stored: false, reason: built.reason };
+
+    const probe = await supabase.embedWithSource(built.content);
+    const embeddingSource = probe.source;
+
+    const dedup = await this._dedupCheck(supabase, built.content, {
+      connector, taskType, embeddingSource,
+    });
+    if (dedup.duplicate) {
+      return { stored: false, reason: `near-duplicate (sim=${dedup.similarity?.toFixed(3)})` };
+    }
+
+    try {
+      const stored = await supabase.storeLesson({
+        content: built.content,
+        taskType: taskType || null,
+        connector: connector || null,
+        outcome: "failure",
+        importance: built.importance,
+        metadata: {
+          capability,
+          embedding_source: embeddingSource,
+          kind: "negative",
+          errorKind,
+        },
+      });
+      return { stored: true, id: stored?.id, importance: built.importance };
+    } catch (err) {
+      return { stored: false, reason: `store failed: ${err.message}` };
+    }
+  }
+
+  /**
+   * Recall relevant lessons for a new task. Returns a token-budgeted,
+   * diversity-filtered list. Each returned item is:
+   *   { id, content, kind, importance, similarity, embedding_source }
+   *
+   * Diversity filter: we never return two lessons whose pairwise
+   * similarity exceeds 0.85, so the prompt doesn't repeat itself.
+   * (Pairwise check here is O(n²) but n is tiny — at most 5-6 items.)
+   */
+  async recallRelevantLessons(supabase, query, { connector, taskType, count = 4, threshold = 0.55, preferKinds = null } = {}) {
+    if (!supabase || supabase.status() !== "CONNECTED") return [];
+    if (!query || !String(query).trim()) return [];
+
+    try {
+      // Fetch a wider set than needed so we can dedupe/diversify.
+      const rows = await supabase.searchLessons(String(query).slice(0, 4000), {
+        threshold,
+        count: Math.max(count * 3, 12),
+        connector,
+        taskType,
+        minImportance: 3,
+      });
+      if (!Array.isArray(rows) || rows.length === 0) return [];
+
+      // Filter by kind if requested.
+      let candidates = rows;
+      if (Array.isArray(preferKinds) && preferKinds.length > 0) {
+        candidates = rows.filter((r) => {
+          const kind = r?.metadata?.kind || "positive";
+          return preferKinds.includes(kind);
+        });
+      }
+
+      // Apply time-based importance decay. A lesson last used 90 days ago
+      // is worth less than one used yesterday, even if its base importance
+      // is higher.
+      const now = this._now();
+      const decayMs = IMPORTANCE_DECAY_DAYS * 24 * 60 * 60 * 1000;
+      const scored = candidates.map((r) => {
+        const lastUsed = r.last_used_at ? new Date(r.last_used_at).getTime() : 0;
+        const ageMs = lastUsed > 0 ? now - lastUsed : decayMs;
+        const decayFactor = Math.max(0.4, 1 - Math.min(1, ageMs / decayMs));
+        return { ...r, _decayed: (r.score ?? r.similarity ?? 0) * decayFactor };
+      }).sort((a, b) => b._decayed - a._decayed);
+
+      // Greedy diversity: pick items whose similarity to already-picked
+      // items is ≤ 0.85 (approximate by checking content Jaccard here,
+      // since computing embeddings pairwise is expensive).
+      const picked = [];
+      const totalCharBudget = RECALL_TOTAL_CHARS;
+      let used = 0;
+
+      for (const row of scored) {
+        if (picked.length >= count) break;
+        const content = String(row.content || "").slice(0, RECALL_CHARS_PER_LESSON);
+        if (used + content.length > totalCharBudget) continue;
+
+        const tooSimilar = picked.some((p) => jaccard(p.content, content) > 0.85);
+        if (tooSimilar) continue;
+
+        picked.push({
+          id: row.id,
+          content,
+          kind: row?.metadata?.kind || "positive",
+          importance: row.importance,
+          similarity: row.similarity,
+          embedding_source: row?.metadata?.embedding_source || null,
+        });
+        used += content.length;
+      }
+      return picked;
+    } catch (err) {
+      console.warn(`[learning] recall failed: ${err.message}`);
+      return [];
+    }
+  }
+
+  /**
+   * Feedback loop: called after a task completes (or fails) whose prompt
+   * included recalled lesson ids. Nudges the importance of each lesson
+   * up (helped) or down (didn't help) so the memory self-tunes over time.
+   */
+  async recordLessonFeedback(supabase, lessonIds, { helped } = {}) {
+    if (!Array.isArray(lessonIds) || lessonIds.length === 0) return { updated: 0 };
+    if (!supabase || supabase.status() !== "CONNECTED") return { updated: 0 };
+    const delta = helped ? +1 : -1;
+    let updated = 0;
+    for (const id of lessonIds) {
+      try {
+        await supabase.adjustImportance(id, delta);
+        updated += 1;
+      } catch (err) {
+        console.warn(`[learning] feedback for ${id} failed: ${err.message}`);
+      }
+    }
+    return { updated };
+  }
+
   // ---- Housekeeping / visibility ----------------------------------------
 
-  /** Drops resolved (closed) circuits and old dead-opportunity entries past maxAgeMs — keeps the state file bounded. */
   prune({ maxAgeMs } = {}) {
     this._sync();
     let removed = 0;
@@ -291,6 +516,17 @@ class LearningEngine {
     this._sync();
     return { circuits: this.circuits, deadOpportunityCount: Object.keys(this.deadOpportunities).length, connectorStats: this.connectorStats };
   }
+}
+
+// ---- Small helper: cheap content-similarity proxy ------------------------
+
+function jaccard(a, b) {
+  const setA = new Set(String(a).toLowerCase().split(/\s+/).filter(Boolean));
+  const setB = new Set(String(b).toLowerCase().split(/\s+/).filter(Boolean));
+  if (setA.size === 0 && setB.size === 0) return 1;
+  let inter = 0;
+  for (const w of setA) if (setB.has(w)) inter += 1;
+  return inter / (setA.size + setB.size - inter);
 }
 
 module.exports = LearningEngine;
