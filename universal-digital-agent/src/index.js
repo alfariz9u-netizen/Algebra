@@ -15,7 +15,7 @@ const TokuAgencyConnector = require("./connectors/tokuAgency");
 const McpClient = require("./connectors/mcpClient");
 const A2aClient = require("./connectors/a2aClient");
 const MoltbookConnector = require("./connectors/moltbook");
-const SupabaseConnector = require("./connectors/supabase"); // ← جديد: الذاكرة الدلالية
+const SupabaseConnector = require("./connectors/supabase");
 
 function buildAgent() {
   // تمرير persistDir و encryptionKey من متغيرات البيئة (ضروري لحفظ
@@ -102,7 +102,7 @@ function buildAgent() {
     statusFn: () => tokuAgency.status(),
   });
 
-  // Moltbook (بناء السمعة: تصويت + تعليق)
+  // Moltbook (بناء السمعة: تصويت + تعليق + نشر)
   const moltbook = new MoltbookConnector();
   agent.connectors.register("moltbook", {
     instance: moltbook,
@@ -114,11 +114,12 @@ function buildAgent() {
       "upvotePost",
       "downvotePost",
       "commentOnPost",
+      "createPost",
     ],
     statusFn: () => moltbook.status(),
   });
 
-  // ← جديد: Supabase (الذاكرة الدلالية طويلة المدى)
+  // Supabase (الذاكرة الدلالية طويلة المدى)
   const supabase = new SupabaseConnector();
   agent.connectors.register("supabase", {
     instance: supabase,
