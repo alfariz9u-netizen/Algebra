@@ -58,9 +58,16 @@ class SupabaseConnector {
   async _embed(text) { const { embedding } = await this.embedWithSource(text); return embedding; }
   async embed(text) { return this._embed(text); }
 
-  async storeLesson({ content, taskType, connector, outcome, importance, metadata } = {}) {
+  // FIX: accepts an optional pre-computed { embedding, source } (as
+  // returned by embedWithSource()) so a caller that already needs the
+  // embedding for another reason (learningEngine.rememberTaskOutcome used
+  // to call embedWithSource() itself just to read `.source` for metadata,
+  // then storeLesson() computed it AGAIN for the same content) doesn't
+  // pay for the same Jina API call — or the same SHA-256 pseudo-embedding
+  // — twice per stored lesson. When omitted, behavior is unchanged.
+  async storeLesson({ content, taskType, connector, outcome, importance, metadata, precomputedEmbedding } = {}) {
     if (!content || !content.trim()) throw new Error("Supabase storeLesson: content is required.");
-    const { embedding, source } = await this.embedWithSource(content);
+    const { embedding, source } = precomputedEmbedding || (await this.embedWithSource(content));
     const res = await fetch(`${SUPABASE_URL}/rest/v1/learnings`, {
       method: "POST",
       headers: this._headers({ Prefer: "return=representation" }),
