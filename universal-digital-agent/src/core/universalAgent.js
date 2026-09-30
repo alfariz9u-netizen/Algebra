@@ -455,6 +455,18 @@ class UniversalAgent {
         riskLevel: "LOW",
       });
     } catch (err) {
+      // FIX (real production evidence, 2026-09-30): lastPostAt was ONLY
+      // being updated on success. Once Moltbook's server-side rate limit
+      // was already tripped, every task-completion for the rest of that
+      // window immediately re-attempted and re-failed with the same 429,
+      // with zero backoff — logs showed exactly this
+      // (MOLTBOOK_POST_FAILED, 429, "remaining":0). The server's own
+      // retry_after_seconds in that case was only 42s — far shorter than
+      // our normal cooldown — so simply engaging the existing cooldown on
+      // ANY failure (not just success) is already more than sufficient;
+      // no need to parse the exact retry-after value.
+      this._moltbookPostState.lastPostAt = Date.now();
+      saveMoltbookPostState(this._moltbookPostState);
       console.warn(`[universalAgent] moltbook createPost failed: ${err.message}`);
       this.audit.record({
         agentId: this.agentId,
