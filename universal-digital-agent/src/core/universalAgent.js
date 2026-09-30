@@ -13,6 +13,7 @@ const { labelUntrustedContent } = require("./promptInjectionGuard");
 const verificationLayer = require("./verificationLayer");
 const { ConnectorRegistry } = require("./connectorRegistry");
 const EconomicIntelligence = require("./economicIntelligence");
+const { estimateCostUsd, DailyQuotaTracker } = require("./llmPricing");
 const LearningEngine = require("./learningEngine");
 const { classify } = require("./intentClassifier");
 const { CAPABILITIES } = require("../capabilities/definitions");
@@ -29,15 +30,33 @@ const LESSON_RECALL_ENABLED = String(process.env.LESSON_RECALL_ENABLED || "true"
 const LESSON_STORE_ENABLED = String(process.env.LESSON_STORE_ENABLED || "true").toLowerCase() !== "false";
 
 const MOLTBOOK_POST_ENABLED = String(process.env.MOLTBOOK_POST_ENABLED || "true").toLowerCase() !== "false";
-const MOLTBOOK_POST_COOLDOWN_MS = Number(process.env.MOLTBOOK_POST_COOLDOWN_MS || 45 * 60 * 1000);
+// FIX: was a hardcoded 45-minute default, while core/strategies/moltbook.js
+// reads the SAME env var (MOLTBOOK_POST_COOLDOWN_MS) with a 30-minute
+// default. Two independent callers hitting Moltbook's real "1 post per 30
+// min" limit with two different cooldown lengths — and, worse, two
+// separate state files (see below) — meant neither actually knew about the
+// other's last post. Aligned to 30 minutes here so an unset env var can't
+// silently desynchronize the two.
+const MOLTBOOK_POST_COOLDOWN_MS = Number(process.env.MOLTBOOK_POST_COOLDOWN_MS || 30 * 60 * 1000);
 const MOLTBOOK_POST_MIN_OUTPUT_CHARS = Number(process.env.MOLTBOOK_POST_MIN_OUTPUT_CHARS || 350);
-const MOLTBOOK_POST_STATE_FILE = path.join(process.env.PERSIST_DIR || "./data", "moltbook-post-state.json");
+// FIX: this used to be its own file (moltbook-post-state.json), completely
+// separate from core/strategies/moltbook.js's moltbook-state.json. Both
+// files tracked "last time we posted" independently, so this auto-post
+// hook and the scheduled reputation strategy could each think Moltbook's
+// real rate limit had reset when it hadn't — risking a real 429 from
+// Moltbook (and, repeated enough, account suspension per moltbook.js's own
+// "10-strike" note). Now both read/write the SAME file and the SAME
+// lastPostAt/publishedTitleHashes fields, so whichever of the two posts
+// last is the one the other respects. Merge-safe: only the post-related
+// fields are touched here; the strategy's own comment/upvote bookkeeping
+// in the same file is read back and preserved untouched.
+const MOLTBOOK_STATE_FILE = path.join(process.env.PERSIST_DIR || "./data", "moltbook-state.json");
 
 function loadMoltbookPostState() {
   try {
-    if (fs.existsSync(MOLTBOOK_POST_STATE_FILE)) {
-      const raw = JSON.parse(fs.readFileSync(MOLTBOOK_POST_STATE_FILE, "utf8"));
-      return { lastPostAt: raw.lastPostAt || 0, titleHashes: new Set(raw.titleHashes || []) };
+    if (fs.existsSync(MOLTBOOK_STATE_FILE)) {
+      const raw = JSON.parse(fs.readFileSync(MOLTBOOK_STATE_FILE, "utf8"));
+      return { lastPostAt: raw.lastPostAt || 0, titleHashes: new Set(raw.publishedTitleHashes || []) };
     }
   } catch (err) {
     console.warn(`[universalAgent] moltbook post state read failed: ${err.message}`);
@@ -47,10 +66,25 @@ function loadMoltbookPostState() {
 
 function saveMoltbookPostState(state) {
   try {
-    fs.mkdirSync(path.dirname(MOLTBOOK_POST_STATE_FILE), { recursive: true });
+    fs.mkdirSync(path.dirname(MOLTBOOK_STATE_FILE), { recursive: true });
+    // Read-merge-write: preserve whatever core/strategies/moltbook.js has
+    // already written for comments/upvotes (and vice versa) rather than
+    // clobbering the shared file with only this hook's two fields.
+    let existing = {};
+    try {
+      if (fs.existsSync(MOLTBOOK_STATE_FILE)) {
+        existing = JSON.parse(fs.readFileSync(MOLTBOOK_STATE_FILE, "utf8"));
+      }
+    } catch {
+      /* corrupt or missing — fall back to writing just our own fields */
+    }
     fs.writeFileSync(
-      MOLTBOOK_POST_STATE_FILE,
-      JSON.stringify({ lastPostAt: state.lastPostAt, titleHashes: [...state.titleHashes] }),
+      MOLTBOOK_STATE_FILE,
+      JSON.stringify({
+        ...existing,
+        lastPostAt: state.lastPostAt,
+        publishedTitleHashes: [...state.titleHashes],
+      }),
       "utf8"
     );
   } catch (err) {
@@ -78,6 +112,10 @@ class UniversalAgent {
       refillPerSecond: Number(process.env.CONNECTOR_RATE_LIMIT_REFILL_PER_SEC || 1),
     });
     this.economics = new EconomicIntelligence({ persistDir, encryptionKey: resolvedEncryptionKey });
+    // Real per-request free-tier quota counter (Groq/Gemini), shared by
+    // every task this agent instance processes — see llmPricing.js for
+    // why this exists and where its numbers come from.
+    this.llmQuota = new DailyQuotaTracker({ persistDir });
     this.learning = new LearningEngine({ persistDir, encryptionKey: resolvedEncryptionKey });
     this.connectors = new ConnectorRegistry();
     this.approvals = new ApprovalQueue({ persistDir, encryptionKey: resolvedEncryptionKey });
@@ -176,7 +214,14 @@ class UniversalAgent {
       return this._deliver(taskId, capability, cacheResult.entry.result, { cached: true, via: cacheResult.via });
     }
 
-    const supabase = this.connectors.get("supabase");
+    // FIX: was `this.connectors.get("supabase")`, which throws for any
+    // agent that doesn't register a "supabase" connector — every unit
+    // test that builds a minimal agent, and both approvalCli.js and
+    // maintenanceCli.js in production (they construct `new
+    // UniversalAgent()` directly, not via buildAgent()). This is an
+    // optional memory feature; a missing connector must degrade to "off",
+    // not crash the entire task. See connectorRegistry.js getOptional().
+    const supabase = this.connectors.getOptional("supabase");
     let recalledLessons = [];
     if (LESSON_RECALL_ENABLED && supabase && supabase.status() === "CONNECTED") {
       try {
@@ -276,12 +321,22 @@ class UniversalAgent {
       tokenUsage: actualTokens,
     });
 
+    // FIX: was hardcoded `costUsd: 0` for every completed task regardless
+    // of which provider actually served it — meaning economicIntelligence's
+    // totalCostUsd/totalProfitUsd/bestPlatform()/bestModel() were always
+    // computing 100% margin, even on calls that hit Grok (this project's
+    // one genuinely paid, non-free-tier provider). Real cost now: $0 if
+    // this request landed inside today's real Groq/Gemini free quota
+    // (and that quota unit is consumed here, so the next call correctly
+    // sees less headroom left today), the real priced $ amount otherwise
+    // — see llmPricing.js for the sourced per-token rates and the daily
+    // quota tracker.
     this.economics.record({
       type: "task_completed",
       model: generation.model,
       connector: task.sourceConnector,
       revenueUsd: task.rewardUsd || 0,
-      costUsd: 0,
+      costUsd: estimateCostUsd(generation.provider, generation.model, generation.usage, this.llmQuota),
     });
 
     if (LESSON_STORE_ENABLED && supabase && supabase.status() === "CONNECTED") {
@@ -329,7 +384,11 @@ class UniversalAgent {
   async _maybePublishMoltbookPost(task, capability, outputText, qaScore) {
     if (!MOLTBOOK_POST_ENABLED) return;
 
-    const moltbook = this.connectors.get("moltbook");
+    // FIX: same unguarded-get() crash risk as the Supabase hook above —
+    // an agent that doesn't register "moltbook" (any minimal/test agent,
+    // approvalCli.js, maintenanceCli.js) must not have this optional,
+    // fire-and-forgotten side effect crash the caller.
+    const moltbook = this.connectors.getOptional("moltbook");
     if (!moltbook || moltbook.status() !== "CONNECTED") return;
     if (task.sourceConnector === "moltbook") return;
 
@@ -566,6 +625,15 @@ class UniversalAgent {
       killSwitch: this.killSwitch.status(),
       dailyTokenUsage: this.tokens.getDailyUsage(),
       economics: this.economics.summary(),
+      // Real remaining free-tier headroom for today (UTC), so an operator
+      // can see "we're about to fall through to paid Grok" before it
+      // happens, not just after the bill shows it. Infinity means this
+      // provider has no tracked free quota (e.g. it's never been called
+      // yet, or it's not one of the two free-tier providers).
+      llmQuotaRemainingToday: {
+        groq: this.llmQuota.remainingToday("GroqClient"),
+        gemini: this.llmQuota.remainingToday("GeminiClient"),
+      },
       learning: this.learning.status(),
       connectors: this.connectors.list(),
       pendingApprovals: this.approvals.list({ status: "pending" }).length,
