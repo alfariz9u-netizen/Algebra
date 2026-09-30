@@ -16,6 +16,7 @@ const McpClient = require("./connectors/mcpClient");
 const A2aClient = require("./connectors/a2aClient");
 const MoltbookConnector = require("./connectors/moltbook");
 const SupabaseConnector = require("./connectors/supabase");
+const AgentverseConnector = require("./connectors/agentverse");
 
 function buildAgent() {
   // تمرير persistDir و encryptionKey من متغيرات البيئة (ضروري لحفظ
@@ -125,6 +126,19 @@ function buildAgent() {
     instance: supabase,
     capabilities: ["storeLesson", "searchLessons", "countLessons"],
     statusFn: () => supabase.status(),
+  });
+
+  // Agentverse (Fetch.ai): a directory/identity registry, not a task
+  // marketplace — see the long comment at the top of connectors/agentverse.js
+  // for why it has no discover/bid/submit strategy and isn't in
+  // combinedServer.js's STRATEGIES list. "register" needs a real signed
+  // identity (AGENTVERSE_AGENT_SEED); "listAgents" (the Search API) only
+  // needs the API key — hence the per-operation statusFn.
+  const agentverse = new AgentverseConnector();
+  agent.connectors.register("agentverse", {
+    instance: agentverse,
+    capabilities: ["register", "listAgents"],
+    statusFn: (operation) => agentverse.status(operation),
   });
 
   const mcp = new McpClient({ serverUrl: process.env.MCP_SERVER_URL, allowedTools: (process.env.MCP_ALLOWED_TOOLS || "").split(",").filter(Boolean) });
