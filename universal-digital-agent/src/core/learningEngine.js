@@ -113,9 +113,26 @@ class LearningEngine {
     if (text.length < 200) return { stored: false, reason: `too short (${text.length})` };
     const content = `Task type: ${taskType || "?"}.\nConnector: ${connector || "?"}.\nCapability: ${capability || "?"}.\nApproach that worked:\n${text.slice(0, 1500)}`;
     const importance = Math.max(1, Math.min(10, Math.round(3 + (outcome.meta?.qaScore || 70) / 25)));
+    // FIX: was computing the embedding here (just to read `.source` for
+    // metadata) AND letting storeLesson() compute it again internally for
+    // the exact same `content` — a real, avoidable double Jina-API-call
+    // (or double SHA-256 pseudo-embedding) on every single lesson stored.
+    // Computed once now and passed through via precomputedEmbedding.
     const probe = await supabase.embedWithSource(content);
-    try { await supabase.storeLesson({ content, taskType: taskType || null, connector: connector || null, outcome: "success", importance, metadata: { capability, embedding_source: probe.source, kind: "positive" } }); return { stored: true, importance }; }
-    catch (e) { return { stored: false, reason: e.message }; }
+    try {
+      await supabase.storeLesson({
+        content,
+        taskType: taskType || null,
+        connector: connector || null,
+        outcome: "success",
+        importance,
+        metadata: { capability, embedding_source: probe.source, kind: "positive" },
+        precomputedEmbedding: probe,
+      });
+      return { stored: true, importance };
+    } catch (e) {
+      return { stored: false, reason: e.message };
+    }
   }
 
   async recallRelevantLessons(supabase, query, { connector, taskType, count = 4, threshold = 0.55 } = {}) {
