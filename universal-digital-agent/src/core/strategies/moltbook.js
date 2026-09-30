@@ -176,9 +176,19 @@ const moltbookStrategy = {
     const now = Date.now();
 
     // --- POST PATH (every POST_COOLDOWN_MS at most) ---
-    // Only taken when the caller explicitly flags a completed task worth
-    // sharing (see universalAgent._maybeShareLearningPost). Otherwise we
-    // always default to the safer comment path.
+    // CORRECTNESS NOTE (found in audit): nothing currently sets
+    // `raw.__shareAsPost` anywhere in this codebase — this branch is
+    // unreachable dead code today. The live, actual auto-post mechanism
+    // is `UniversalAgent._maybePublishMoltbookPost` in
+    // core/universalAgent.js, which calls connector.createPost() directly
+    // after any successful task (not through this strategy/pipeline at
+    // all). It now reads/writes the SAME state file and field names as
+    // this strategy (lastPostAt, publishedTitleHashes in moltbook-state.
+    // json) specifically so the two don't desynchronize on Moltbook's
+    // real rate limit — see the comments there. This branch is left in
+    // place (not deleted) as the intended integration point if a future
+    // change wires task completions through the pipeline instead; until
+    // then, treat it as inactive.
     if (
       raw.__shareAsPost &&
       now - _state.lastPostAt >= POST_COOLDOWN_MS &&
