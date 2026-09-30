@@ -145,10 +145,25 @@ const openTaskStrategy = {
 
   submitOperation: "submitBid",
   submitPermission: "SUBMIT_TASK",
+  // FIX (same class of bug found and fixed earlier in strategies/agentMarket.js,
+  // now found here too on a second look): every failure branch below used to
+  // call `_attemptedTaskIds.add(raw.id)` before rethrowing — including plain
+  // transient failures (a network blip on submitBid, on the reload-after-
+  // scope-change call, or on the withdraw+resubmit call). That permanently
+  // excludes a task from this process's discovery for the rest of its
+  // lifetime, even when the task is still open and perfectly biddable —
+  // silently overriding learningEngine's own, more nuanced retryable-vs-
+  // permanent classification (in marketplacePipeline.js) with a blunt,
+  // un-logged, permanent skip. Now `_attemptedTaskIds` is only ever added
+  // to on a genuine SUCCESS (the task now has our bid on it, correctly
+  // skip it going forward) or the one truly permanent, non-network
+  // condition (no usable reward — that won't change by retrying). Every
+  // error path below rethrows WITHOUT blacklisting, so the task is simply
+  // reconsidered next cycle.
   submit: async (connector, raw, proposalText) => {
     const reward = extractReward(raw);
     if (!(typeof reward === "number" && reward >= MIN_REWARD_USD)) {
-      _attemptedTaskIds.add(raw.id);
+      _attemptedTaskIds.add(raw.id); // permanent: no reward will appear on retry
       throw new Error(
         `Skipping bid on task ${raw.id}: no usable reward found (checked budgetAmount/budgetText/reward_usd, all missing or below the $${MIN_REWARD_USD} floor).`
       );
@@ -163,7 +178,7 @@ const openTaskStrategy = {
 
     try {
       const result = await connector.submitBid(raw.id, buildPayload(raw));
-      _attemptedTaskIds.add(raw.id);
+      _attemptedTaskIds.add(raw.id); // success: we now have a bid in
       return result;
     } catch (err) {
       const kind = classify409(err);
@@ -173,10 +188,9 @@ const openTaskStrategy = {
         console.warn(`[openTask] active bid conflict on ${raw.id} — withdrawing old bid and resubmitting.`);
         try {
           const result = await replaceActiveBid(connector, raw.id, buildPayload(raw));
-          _attemptedTaskIds.add(raw.id);
+          _attemptedTaskIds.add(raw.id); // success
           return result;
         } catch (replaceErr) {
-          _attemptedTaskIds.add(raw.id);
           throw new Error(`Task ${raw.id}: could not replace active bid: ${replaceErr.message}`);
         }
       }
@@ -189,7 +203,6 @@ const openTaskStrategy = {
         try {
           fresh = await connector.getTask(raw.id);
         } catch (reloadErr) {
-          _attemptedTaskIds.add(raw.id);
           throw new Error(`Task ${raw.id} scope changed; reload failed: ${reloadErr.message}`);
         }
 
@@ -197,7 +210,7 @@ const openTaskStrategy = {
 
         try {
           const result = await connector.submitBid(freshTask.id, buildPayload(freshTask));
-          _attemptedTaskIds.add(raw.id);
+          _attemptedTaskIds.add(raw.id); // success
           return result;
         } catch (retryErr) {
           // If the retry failed because we now have an active bid (the task
@@ -206,20 +219,21 @@ const openTaskStrategy = {
           if (classify409(retryErr) === "active_offer") {
             try {
               const result = await replaceActiveBid(connector, freshTask.id, buildPayload(freshTask));
-              _attemptedTaskIds.add(raw.id);
+              _attemptedTaskIds.add(raw.id); // success
               return result;
             } catch (replaceErr2) {
-              _attemptedTaskIds.add(raw.id);
               throw new Error(`Task ${raw.id}: scope changed, then active-bid replace failed: ${replaceErr2.message}`);
             }
           }
-          _attemptedTaskIds.add(raw.id);
           throw new Error(`Task ${raw.id} scope changed twice (retry also failed): ${retryErr.message}`);
         }
       }
 
-      // ---- Any other error: permanent for this task ----
-      _attemptedTaskIds.add(raw.id);
+      // ---- Any other error (network blip, 5xx, timeout): NOT permanent.
+      // Rethrown as-is and left to marketplacePipeline.js's learningEngine
+      // circuit breaker, which classifies retryable vs. non-retryable
+      // failures properly — this strategy no longer overrides that with a
+      // blunt, permanent, un-logged skip.
       throw err;
     }
   },
