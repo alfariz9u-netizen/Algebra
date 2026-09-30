@@ -132,6 +132,30 @@ function startTelegramBot() {
   }
 }
 
+/**
+ * Registers this agent on Agentverse once at boot. Fire-and-forget: per
+ * uagents-core's own docs, v2 registrations are permanent ("no need for
+ * periodic refresh") — calling it again on every restart just updates
+ * the same listing (harmless), and if AGENTVERSE_API_KEY/AGENTVERSE_
+ * AGENT_SEED aren't set, status() reports CREDENTIAL_REQUIRED and this
+ * is skipped with a log line, not a crash. Never blocks server startup.
+ */
+async function maybeRegisterOnAgentverse(agent) {
+  const agentverse = agent.connectors.getOptional
+    ? agent.connectors.getOptional("agentverse")
+    : null;
+  if (!agentverse || agentverse.status("register") !== "CONNECTED") {
+    console.log("[agentverse] skipped registration (CREDENTIAL_REQUIRED — set AGENTVERSE_API_KEY + AGENTVERSE_AGENT_SEED to enable).");
+    return;
+  }
+  try {
+    const result = await agentverse.register({});
+    console.log(`[agentverse] registered/updated listing: address=${result.address} url=${result.url}`);
+  } catch (err) {
+    console.warn(`[agentverse] registration failed (non-fatal): ${err.message}`);
+  }
+}
+
 function main() {
   const agent = buildAgent();
 
@@ -140,6 +164,7 @@ function main() {
     console.log(`Combined server listening on port ${PORT} (A2A: POST /a2a, card: GET /.well-known/agent-card.json, health: GET /healthz).`);
     console.log(`Auto-run scheduler enabled: every ${Math.round(CYCLE_MS / 60000)}m, strategies: ${STRATEGIES.map((s) => s.connectorName).join(", ")}`);
   });
+  maybeRegisterOnAgentverse(agent);
 
   const bot = startTelegramBot();
   const stopScheduler = startMarketplaceScheduler(agent);
