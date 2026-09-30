@@ -16,6 +16,19 @@ const riskEngine = require("./riskEngine");
  */
 let _lastColonyPostAt = 0;
 const COLONY_POST_COOLDOWN_MS = Number(process.env.COLONY_POST_COOLDOWN_MS || 6 * 60 * 1000);
+// FIX (real production evidence, 2026-09-30): a 429 was being IGNORED for
+// cooldown purposes — see the old comment below ("only update on success")
+// — so once Colony's server-side limit was already tripped, every single
+// subsequent attempt re-failed with 429 immediately, with zero backoff,
+// forever, until the account's own window happened to roll over on its
+// own. Real logs showed TWO 429s three seconds apart because of exactly
+// this. Worse: the actual failure seen was `ADMIN_CAP_REACHED` — "limited
+// to 1 post per hour" — a stricter, account-specific cap than the general
+// ~10/60min this file assumed, so even the normal 6-minute cooldown is not
+// long enough to safely resume after one of these. `_colonyBlockedUntil`
+// tracks that separately from the normal cooldown.
+let _colonyBlockedUntil = 0;
+const COLONY_429_COOLDOWN_MS = Number(process.env.COLONY_429_COOLDOWN_MS || 65 * 60 * 1000); // 65 min: covers a strict 1/hour cap plus margin
 
 class MarketplacePipeline {
   constructor(agent) {
@@ -37,6 +50,10 @@ class MarketplacePipeline {
     // fires 2+ posts within seconds and trips the server's 10/60min cap
     // (429 RATE_LIMIT_CREATE_POST). Cooldown below keeps us under it.
     const now = Date.now();
+    if (now < _colonyBlockedUntil) {
+      const remaining = Math.round((_colonyBlockedUntil - now) / 1000);
+      return { shared: false, reason: `colony post blocked after a rate-limit response (${remaining}s remaining)` };
+    }
     if (now - _lastColonyPostAt < COLONY_POST_COOLDOWN_MS) {
       const remaining = Math.round((COLONY_POST_COOLDOWN_MS - (now - _lastColonyPostAt)) / 1000);
       return { shared: false, reason: `colony post cooldown (${remaining}s remaining)` };
@@ -69,6 +86,13 @@ class MarketplacePipeline {
       _lastColonyPostAt = Date.now();
       return { shared: true };
     } catch (err) {
+      // FIX: a 429 must engage a backoff — see the comment at the top of
+      // this file. Any other error (network blip, auth issue) keeps the
+      // original "don't block the next attempt" behavior, since those
+      // aren't evidence the account is actually rate-limited.
+      if (/\b429\b|ADMIN_CAP_REACHED|RATE_LIMIT/i.test(err.message)) {
+        _colonyBlockedUntil = Date.now() + COLONY_429_COOLDOWN_MS;
+      }
       return { shared: false, reason: err.message };
     }
   }
