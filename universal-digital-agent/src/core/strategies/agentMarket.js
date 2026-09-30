@@ -183,9 +183,19 @@ const agentMarketStrategy = {
           message: "Existing active bid confirmed (409 already-bid treated as success).",
         };
       }
-      // Any other error is a real failure — mark the task attempted so we
-      // don't keep re-drafting for it, then rethrow.
-      _attemptedTaskIds.add(raw.id);
+      // FIX: this used to add raw.id to _attemptedTaskIds here too, which
+      // permanently excludes the task from discovery for the rest of the
+      // process's lifetime — even for a purely transient failure (a
+      // network blip, a 500). That's strictly worse than doing nothing:
+      // learningEngine's circuit breaker (in marketplacePipeline.js)
+      // already classifies retryable vs. non-retryable failures properly
+      // and backs off accordingly; this blunt, permanent, un-logged
+      // exclusion silently overrode that for every non-409 error and
+      // could mean a still-open, still-biddable task is never looked at
+      // again this session. Only the two cases above (no usable budget;
+      // confirmed already-bid) are genuinely permanent for this task, so
+      // only those two add to _attemptedTaskIds. Anything else is
+      // rethrown and left to the pipeline's own retry/backoff logic.
       throw err;
     }
   },
