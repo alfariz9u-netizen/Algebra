@@ -118,3 +118,30 @@ test("REAL BUG (production evidence 2026-09-30): a 429 from Moltbook's auto-post
   else process.env.PERSIST_DIR = prevPersist;
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
+
+test("SAME BUG, found on a second pass: strategies/openTask.js also permanently blacklisted a task on a transient submitBid failure", async () => {
+  delete require.cache[require.resolve("../src/core/strategies/openTask")];
+  const openTaskStrategy = require("../src/core/strategies/openTask");
+
+  const raw = { id: `audit-opentask-${Date.now()}`, budgetAmount: 50, updatedAt: new Date().toISOString() };
+  let submitCalls = 0;
+  const flakyConnector = {
+    discoverTasks: async () => [raw],
+    submitBid: async () => {
+      submitCalls += 1;
+      if (submitCalls === 1) throw new Error("502 Bad Gateway");
+      return { success: true, bidId: "bid-1" };
+    },
+  };
+
+  await assert.rejects(() => openTaskStrategy.submit(flakyConnector, raw, "proposal text"));
+
+  const discovered = await openTaskStrategy.discover(flakyConnector);
+  assert.ok(
+    discovered.some((t) => t.id === raw.id),
+    "task must still be discoverable after a transient (non-permanent) submitBid failure"
+  );
+
+  const result = await openTaskStrategy.submit(flakyConnector, raw, "proposal text");
+  assert.strictEqual(result.success, true);
+});
