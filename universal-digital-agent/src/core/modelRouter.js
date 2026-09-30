@@ -10,9 +10,21 @@ const GroqClient = require("../llm/groqClient");
  * across providers if the preferred one isn't configured or fails.
  *
  * Provider order per tier (falls back to the next on failure):
- *   1. Groq       — free tier, 14,400 req/day (fast, no abuse flagging)
+ *   1. Groq       — free tier, **1,000 req/day** per model (gpt-oss-120b
+ *                    and gpt-oss-20b), 30 req/min, 200,000 tokens/day.
+ *                    CORRECTED 2026-09-29: this used to say 14,400 req/day,
+ *                    which was Groq's OLD free tier; multiple independent
+ *                    sources measured the cut to 1,000/day directly against
+ *                    console.groq.com's own rate-limit docs sometime
+ *                    between June and September 2026. See core/llmPricing.js
+ *                    for the sourced per-token paid rate past that quota.
  *   2. Gemini     — free tier, 500 req/day (gemini-3.5-flash-lite)
- *   3. Grok       — paid, last resort
+ *   3. Grok       — paid, last resort. Model ID staleness risk: xAI has
+ *                    retired/redirected Grok model IDs multiple times in
+ *                    2026 (current flagship as of Sep 2026 is Grok 4.7);
+ *                    verify "grok-4-fast"/"grok-4" below still resolve to
+ *                    what you expect in your own xAI Console before
+ *                    relying on them for real spend — see llmPricing.js.
  *
  * NOTE: "Groq" (with a q) is a different company from "Grok" (with a k,
  * xAI). Groq = fast free inference on LPU. Grok = paid xAI model.
