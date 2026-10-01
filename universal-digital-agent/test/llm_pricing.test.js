@@ -81,6 +81,35 @@ test("DailyQuotaTracker: quota state survives a process restart (persisted to di
   }
 });
 
+test("REAL BUG (production evidence, 2026-09-30): rememberTaskOutcome() must return the real Supabase row id, not undefined", async () => {
+  delete require.cache[require.resolve("../src/core/learningEngine")];
+  const LearningEngine = require("../src/core/learningEngine");
+  const learning = new LearningEngine({});
+
+  const fakeSupabase = {
+    status: () => "CONNECTED",
+    embedWithSource: async () => ({ embedding: [0.1, 0.2], source: "fixture" }),
+    // Mirrors the real connector: storeLesson returns the inserted row
+    // (Prefer: return=representation), which includes a real `id`.
+    storeLesson: async () => ({ id: "real-lesson-id-123", content: "..." }),
+  };
+
+  const result = await learning.rememberTaskOutcome(fakeSupabase, {
+    taskType: "summarize",
+    connector: "github",
+    capability: "summarization",
+    outcome: { status: "success", output: "x".repeat(250), meta: { qaScore: 90 } },
+    rewardUsd: 0,
+  });
+
+  assert.strictEqual(result.stored, true);
+  assert.strictEqual(
+    result.id,
+    "real-lesson-id-123",
+    "live logs showed '[universalAgent] lesson stored (id=undefined, ...)' for every single stored lesson — this was the cause"
+  );
+});
+
 test("DailyQuotaTracker: Grok has no tracked free quota (Infinity) since it's never free in this project", () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "llm-quota-"));
   try {
