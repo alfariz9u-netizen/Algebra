@@ -119,6 +119,43 @@ test("REAL BUG (production evidence 2026-09-30): a 429 from Moltbook's auto-post
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
+test("REAL EVIDENCE FOLLOW-UP (2026-09-30): Colony's real admin cap changed message between deployments ('1 post per hour' then '5 posts per 24 hours') — the backoff must scale with whatever the server actually says, not a single hardcoded guess", async () => {
+  // Case A: "5 posts per 24 hours" — average safe spacing is (24h/5)*1.1
+  // ≈ 316.8 minutes, well above the 65-minute floor, so the parsed value
+  // must be used, not the floor.
+  delete require.cache[require.resolve("../src/core/marketplacePipeline")];
+  const PipelineA = require("../src/core/marketplacePipeline");
+  const agentA = buildAgentWithFakeColony(async () => {
+    throw new Error(
+      'Colony post failed: 429 {"detail":{"message":"An administrator has limited this account to 5 posts per 24 hours.","code":"ADMIN_CAP_REACHED"}}'
+    );
+  });
+  const pipelineA = new PipelineA(agentA);
+  const before = Date.now();
+  await pipelineA._shareLearning("github", { id: "t5", type: "summarize" }, { capability: "summarization", output: "ok" });
+  const second = await pipelineA._shareLearning("openTask", { id: "t6", type: "summarize" }, { capability: "summarization", output: "ok" });
+  const remainingSecMatch = /\((\d+)s remaining\)/.exec(second.reason);
+  assert.ok(remainingSecMatch, `expected a parsed remaining-time reason, got: ${second.reason}`);
+  const remainingSec = Number(remainingSecMatch[1]);
+  // Expect roughly 316.8 min (19008s), not the 65-minute floor (3900s).
+  assert.ok(remainingSec > 3900, `expected the 5-per-24h cap to produce a LONGER backoff than the 65-min floor, got ${remainingSec}s`);
+
+  // Case B: "1 posts per hour" — average safe spacing is (60min/1)*1.1 =
+  // 66 minutes, just above the 65-minute floor.
+  delete require.cache[require.resolve("../src/core/marketplacePipeline")];
+  const PipelineB = require("../src/core/marketplacePipeline");
+  const agentB = buildAgentWithFakeColony(async () => {
+    throw new Error(
+      'Colony post failed: 429 {"detail":{"message":"An administrator has limited this account to 1 posts per hour.","code":"ADMIN_CAP_REACHED"}}'
+    );
+  });
+  const pipelineB = new PipelineB(agentB);
+  await pipelineB._shareLearning("github", { id: "t7", type: "summarize" }, { capability: "summarization", output: "ok" });
+  const secondB = await pipelineB._shareLearning("openTask", { id: "t8", type: "summarize" }, { capability: "summarization", output: "ok" });
+  const remainingSecB = Number(/\((\d+)s remaining\)/.exec(secondB.reason)[1]);
+  assert.ok(remainingSecB >= 3900 && remainingSecB <= 4000, `expected ~66 minutes, got ${remainingSecB}s`);
+});
+
 test("SAME BUG, found on a second pass: strategies/openTask.js also permanently blacklisted a task on a transient submitBid failure", async () => {
   delete require.cache[require.resolve("../src/core/strategies/openTask")];
   const openTaskStrategy = require("../src/core/strategies/openTask");
