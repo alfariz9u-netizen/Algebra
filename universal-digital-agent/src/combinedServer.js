@@ -56,6 +56,12 @@ const agentMarketStrategy = require("./core/strategies/agentMarket");
 const githubBountiesStrategy = require("./core/strategies/githubBounties");
 const tokuAgencyStrategy = require("./core/strategies/tokuAgency");
 const moltbookStrategy = require("./core/strategies/moltbook"); // ← جديد: بناء السمعة
+// This strategy file existed already (a full, working discovery/pricing
+// engine) but was never added to STRATEGIES below, so it never ran —
+// confirmed via live logs showing no "[cycle:agentBazaar]" entries ever,
+// and agentBazaar.js's status() previously requiring a wallet for its
+// free discovery operation too (now fixed — see connectors/agentBazaar.js).
+const agentBazaarStrategy = require("./core/strategies/agentBazaar");
 
 // Render sets PORT itself; A2A_SERVER_PORT is honored too for parity with a2aServer.js run standalone.
 const PORT = Number(process.env.PORT || process.env.A2A_SERVER_PORT || 8787);
@@ -74,6 +80,7 @@ const STRATEGIES = [
   agentMarketStrategy,
   githubBountiesStrategy,
   tokuAgencyStrategy,
+  agentBazaarStrategy, // ← جديد: كان جاهزًا بالكامل، لم يُفعَّل قط
   moltbookStrategy, // ← جديد
 ];
 
