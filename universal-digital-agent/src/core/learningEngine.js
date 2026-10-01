@@ -120,7 +120,15 @@ class LearningEngine {
     // Computed once now and passed through via precomputedEmbedding.
     const probe = await supabase.embedWithSource(content);
     try {
-      await supabase.storeLesson({
+      // FIX (live log evidence, 2026-09-30): this row IS the actual
+      // inserted Supabase record (storeLesson returns it via
+      // `Prefer: return=representation`), but its `id` was being
+      // discarded here — every single "[universalAgent] lesson stored"
+      // log line printed `id=undefined`, always, for every lesson ever
+      // stored. Threaded through now so the log (and any future caller
+      // that wants to act on a specific lesson id, e.g. feedback) gets
+      // the real value.
+      const row = await supabase.storeLesson({
         content,
         taskType: taskType || null,
         connector: connector || null,
@@ -129,7 +137,7 @@ class LearningEngine {
         metadata: { capability, embedding_source: probe.source, kind: "positive" },
         precomputedEmbedding: probe,
       });
-      return { stored: true, importance };
+      return { stored: true, importance, id: row?.id };
     } catch (e) {
       return { stored: false, reason: e.message };
     }
