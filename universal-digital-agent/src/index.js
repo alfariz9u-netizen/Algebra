@@ -44,14 +44,14 @@ function buildAgent() {
   agent.connectors.register("agenc", {
     instance: agenc,
     capabilities: ["fetchIncomingTasks", "submitDeliverable"],
-    statusFn: () => agenc.status(),
+    statusFn: (operation) => agenc.status(operation),
   });
 
   const agentBazaar = new AgentBazaarConnector();
   agent.connectors.register("agentBazaar", {
     instance: agentBazaar,
     capabilities: ["fetchIncomingTasks", "submitDeliverable"],
-    statusFn: () => agentBazaar.status(),
+    statusFn: (operation) => agentBazaar.status(operation),
   });
 
   const azureMarketplace = new AzureMarketplaceConnector();
