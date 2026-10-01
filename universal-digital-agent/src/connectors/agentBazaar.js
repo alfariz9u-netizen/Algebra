@@ -52,8 +52,19 @@ class AgentBazaarAdapter {
     this.name = "AgentBazaar";
   }
 
-  status() {
-    // list_agents/stats work with no wallet; hiring needs a funded Solana keypair.
+  /**
+   * FIX (same class of bug as agenc.js, found via live production logs
+   * 2026-09-30): `fetchIncomingTasks` (list_agents via the Python bridge)
+   * needs only python3 + the `agentsbazaar` package — no wallet — so it
+   * must be CONNECTED unconditionally. Only `submitDeliverable` (hiring
+   * an agent, a real on-chain paid call) needs a funded Solana keypair.
+   * Ignoring the operation argument here meant this connector was
+   * permanently CREDENTIAL_REQUIRED for everything, which is also why
+   * its strategy was never actually wired into combinedServer.js's
+   * STRATEGIES — see the fix there for the other half of this.
+   */
+  status(operation) {
+    if (operation === "fetchIncomingTasks") return "CONNECTED";
     return "CREDENTIAL_REQUIRED";
   }
 
