@@ -28,7 +28,32 @@ const COLONY_POST_COOLDOWN_MS = Number(process.env.COLONY_POST_COOLDOWN_MS || 6 
 // long enough to safely resume after one of these. `_colonyBlockedUntil`
 // tracks that separately from the normal cooldown.
 let _colonyBlockedUntil = 0;
-const COLONY_429_COOLDOWN_MS = Number(process.env.COLONY_429_COOLDOWN_MS || 65 * 60 * 1000); // 65 min: covers a strict 1/hour cap plus margin
+const COLONY_429_COOLDOWN_MS = Number(process.env.COLONY_429_COOLDOWN_MS || 65 * 60 * 1000); // 65 min: safe floor, used when the message can't be parsed
+
+/**
+ * FIX (live evidence, 2026-09-30): the account's real admin-imposed cap
+ * changed messages between two observed deployments — "limited to 1
+ * posts per hour" at one point, "limited to 5 posts per 24 hours" at
+ * another (same wording family, different numbers: this appears to be a
+ * live, operator-adjustable cap on Colony's side, not a fixed platform
+ * constant). A single hardcoded cooldown can't stay correct against a
+ * cap that changes. This parses "N posts per M hour(s)" directly out of
+ * the real 429 message and backs off for a full period / N (average
+ * safe spacing) + 10% margin, falling back to COLONY_429_COOLDOWN_MS
+ * only when the message doesn't match this shape (e.g. a different
+ * error entirely).
+ */
+function parseColonyCapCooldownMs(message) {
+  const m = /limited this account to (\d+)\s+posts? per (\d+)\s*(hour|hours|day|days)/i.exec(message || "");
+  if (!m) return COLONY_429_COOLDOWN_MS;
+  const count = Number(m[1]);
+  const periodUnits = Number(m[2]);
+  const unitMs = /day/i.test(m[3]) ? 24 * 60 * 60 * 1000 : 60 * 60 * 1000;
+  if (!count || !periodUnits) return COLONY_429_COOLDOWN_MS;
+  const periodMs = periodUnits * unitMs;
+  const safeSpacing = Math.ceil((periodMs / count) * 1.1); // average spacing + 10% margin
+  return Math.max(safeSpacing, COLONY_429_COOLDOWN_MS); // never back off for LESS than the safe floor
+}
 
 class MarketplacePipeline {
   constructor(agent) {
@@ -91,7 +116,7 @@ class MarketplacePipeline {
       // original "don't block the next attempt" behavior, since those
       // aren't evidence the account is actually rate-limited.
       if (/\b429\b|ADMIN_CAP_REACHED|RATE_LIMIT/i.test(err.message)) {
-        _colonyBlockedUntil = Date.now() + COLONY_429_COOLDOWN_MS;
+        _colonyBlockedUntil = Date.now() + parseColonyCapCooldownMs(err.message);
       }
       return { shared: false, reason: err.message };
     }
