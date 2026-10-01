@@ -28,8 +28,26 @@ class AgencAdapter {
     this._client = null; // lazily created, only if a wallet is configured
   }
 
-  status() {
-    // Read-only discovery works with no wallet; submission needs a funded one.
+  /**
+   * FIX (live production evidence, 2026-09-30 — the deployed logs showed
+   * exactly this): `fetchIncomingTasks` hits AgenC's public, keyless REST
+   * API and must be CONNECTED unconditionally — it never needs a wallet.
+   * Only `submitDeliverable` (a real Solana transaction) needs
+   * AGENC_WALLET_PATH/AGENC_RPC_URL. Before this fix, status() ignored
+   * its operation argument entirely and required the wallet for BOTH
+   * operations, so every single 30-minute cycle logged
+   * `[cycle:agenc] cycle failed: Connector "agenc" does not support
+   * "fetchIncomingTasks" right now (status: CREDENTIAL_REQUIRED)` and
+   * `learningEngine` kept opening a circuit on it — permanently losing a
+   * free, keyless discovery source for a connector that was never
+   * actually broken. (This exact fix was already applied once, in an
+   * earlier zip upload's connectorRegistry.js/agenc.js pair; it just
+   * never made it into this codebase's agenc.js — connectorRegistry.js
+   * has passed `operation` through since the Agentverse round, but
+   * nothing here was reading it until now.)
+   */
+  status(operation) {
+    if (operation === "fetchIncomingTasks") return "CONNECTED";
     return process.env.AGENC_WALLET_PATH && process.env.AGENC_RPC_URL ? "CONNECTED" : "CREDENTIAL_REQUIRED";
   }
 
