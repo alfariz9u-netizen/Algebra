@@ -118,8 +118,21 @@ class LearningEngine {
     // the exact same `content` — a real, avoidable double Jina-API-call
     // (or double SHA-256 pseudo-embedding) on every single lesson stored.
     // Computed once now and passed through via precomputedEmbedding.
-    const probe = await supabase.embedWithSource(content);
     try {
+      // FIX (found while adding the Jina-401-must-not-be-silent fix in
+      // supabase.js): embedWithSource() used to be called OUTSIDE this
+      // try/catch, which was invisible as long as it never threw — and it
+      // never used to throw, since every failure path inside it quietly
+      // returned a pseudo-embedding instead. Now that a 401/403 correctly
+      // throws instead of masking itself, that exception propagated
+      // straight out of rememberTaskOutcome(), breaking its contract
+      // (every other caller, and this method's own other return paths,
+      // expect it to always resolve to {stored, reason|importance}, never
+      // reject). Moved inside the try so a real auth failure is reported
+      // honestly via `reason`, exactly like any other failure here,
+      // instead of either being silently masked (the old bug) or crashing
+      // the caller (this one, caught only because of the fix below).
+      const probe = await supabase.embedWithSource(content);
       // FIX (live log evidence, 2026-09-30): this row IS the actual
       // inserted Supabase record (storeLesson returns it via
       // `Prefer: return=representation`), but its `id` was being
