@@ -41,6 +41,20 @@ class EconomicIntelligence {
     // sync by record()/prune() so summary() never has to rescan events.
     this._live = { countsByType: {}, totalRevenueUsd: 0, totalCostUsd: 0 };
     for (const e of this.events) this._addToLive(e);
+
+    // IDEMPOTENCY (requested explicitly: "تأكد من تسجيل task_completed...
+    // مرة واحدة فقط"): a financial event (task_completed/task_failed) for
+    // the same taskId must only ever be counted once, no matter how many
+    // times record() is called for it — a retried delivery after a crash,
+    // a duplicate webhook, or a double call from a bug should never double
+    // revenue/cost. Rebuilt from history on construction so this holds
+    // across restarts, not just within one process's memory.
+    this._recordedFinancialTaskIds = new Set();
+    for (const e of this.events) {
+      if ((e.type === "task_completed" || e.type === "task_failed") && e.taskId) {
+        this._recordedFinancialTaskIds.add(`${e.type}:${e.taskId}`);
+      }
+    }
   }
 
   _addToLive(e) {
@@ -59,11 +73,29 @@ class EconomicIntelligence {
     }
   }
 
+  /**
+   * Returns the recorded entry, or `{ duplicate: true, ... }` without
+   * writing anything if this exact financial outcome (type + taskId) was
+   * already recorded — the caller should treat both the same way (the
+   * work is "recorded"); only the caller needs to know whether a NEW
+   * write happened if it cares about side effects like logging.
+   * `taskId` is required for "task_completed"/"task_failed" specifically
+   * — other event types (task_discovered, bid_won, moltbook posts, etc.)
+   * aren't double-counting-sensitive in the same way and aren't deduped.
+   */
   record(event) {
+    if ((event.type === "task_completed" || event.type === "task_failed") && event.taskId) {
+      const dedupeKey = `${event.type}:${event.taskId}`;
+      if (this._recordedFinancialTaskIds.has(dedupeKey)) {
+        return { duplicate: true, type: event.type, taskId: event.taskId };
+      }
+      this._recordedFinancialTaskIds.add(dedupeKey);
+    }
     const entry = { timestamp: Date.now(), ...event };
     this.events.push(entry);
     this._addToLive(entry);
     if (this._log) this._log.append(entry);
+    return entry;
   }
 
   /** e.g. { type: "task_discovered" | "task_accepted" | "task_rejected" | "bid_won" | "bid_lost" | "task_completed" | "task_failed", ... } */
