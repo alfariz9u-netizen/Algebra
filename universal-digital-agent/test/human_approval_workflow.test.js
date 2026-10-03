@@ -76,6 +76,23 @@ async function main() {
     const stillPendingResume = await resumingAgent.resumeTask(thirdPending.approvalId);
     assert.strictEqual(stillPendingResume.status, "pending");
     console.log("PASS: attempting to resume a still-pending (unresolved) approval does not execute it either");
+
+    // --- REQUIREMENT: resuming the SAME already-consumed approval again must not re-execute it ---
+    const replayResume = await resumingAgent.resumeTask(approvalId);
+    assert.strictEqual(replayResume.status, "conflict", "a second resume of an already-consumed approval must be refused, not silently re-run");
+    console.log("PASS: resuming an already-consumed approval a second time is refused (replay prevention)");
+
+    // --- REQUIREMENT: two CONCURRENT resume attempts for the same approval — only one may execute ---
+    const fourthTask = { id: "concurrent-task", type: "communication", input: { context: "x", goal: "y" } };
+    const fourthPending = await resumingAgent.processTask(fourthTask);
+    resumingAgent.approvals.resolve(fourthPending.approvalId, "approved", "human-reviewer");
+    const [first, second] = await Promise.all([
+      resumingAgent.resumeTask(fourthPending.approvalId),
+      resumingAgent.resumeTask(fourthPending.approvalId),
+    ]);
+    const outcomes = [first.status, second.status].sort();
+    assert.deepStrictEqual(outcomes, ["conflict", "success"], "of two concurrent resumes, exactly one must execute and the other must be refused");
+    console.log("PASS: of two truly concurrent resume calls for the same approval, exactly one executes");
   } finally {
     server.close();
     fs.rmSync(dataDir, { recursive: true, force: true });
