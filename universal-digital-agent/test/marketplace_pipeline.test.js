@@ -25,9 +25,35 @@ function createCombinedFixtureServer(port) {
         return;
       }
       // --- Molt Market: submit a bid ---
-      if (req.url === "/jobs/job-42/bid" && req.method === "POST") {
+      // FIX: this fixture used to say "/bid" (singular), but
+      // connectors/moltMarket.js's real bidOnJob() posts to "/bids"
+      // (plural) — a stale fixture path, now corrected to match the real
+      // connector. This was previously masked by an unrelated crash (the
+      // connectors.get("supabase") bug fixed earlier this session), which
+      // made resumeTask fail before ever reaching this HTTP call; once
+      // that was fixed, execution actually reached here and exposed the
+      // mismatch for the first time.
+      if (req.url === "/jobs/job-42/bids" && req.method === "POST") {
         res.writeHead(201);
         res.end(JSON.stringify({ id: "bid-99", job_id: "job-42", status: "pending" }));
+        return;
+      }
+      // --- The Colony: JWT token exchange (colony.js's real postFinding()
+      // flow does this first — see the AUTH FIX note at the top of that
+      // file). Missing from this fixture before, which — once the
+      // supabase-crash and /bids-path bugs above stopped masking it —
+      // caused every _shareLearning() attempt to fail with "Colony token
+      // exchange failed: 404 {}" before ever reaching /posts. ---
+      if (req.url === "/auth/token" && req.method === "POST") {
+        res.writeHead(200);
+        res.end(JSON.stringify({ access_token: "fixture-jwt-token" }));
+        return;
+      }
+      // --- The Colony: resolve "general" → a UUID (postFinding's default
+      // colony target — see colony.js's _resolveColonyId). ---
+      if (req.url === "/colonies" && req.method === "GET") {
+        res.writeHead(200);
+        res.end(JSON.stringify([{ id: "11111111-1111-1111-1111-111111111111", name: "general", slug: "general" }]));
         return;
       }
       // --- The Colony: share a learning finding ---
