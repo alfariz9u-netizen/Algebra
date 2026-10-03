@@ -45,14 +45,38 @@ class SupabaseConnector {
         const data = await res.json();
         const vec = data?.data?.[0]?.embedding;
         if (Array.isArray(vec) && vec.length === EMBEDDING_DIM) return { embedding: vec, source: "jina-v3" };
+        console.warn(`[supabase] Jina returned 200 but a malformed embedding shape — using pseudo.`);
+        return { embedding: this._pseudoEmbedding(truncated), source: "pseudo-sha256" };
+      } else if (res.status === 401 || res.status === 403) {
+        // FIX (explicit rule: don't silently fall back on an auth
+        // failure): a 401/403 means JINA_API_KEY is missing, wrong, or
+        // revoked — a real, fixable configuration problem, not a
+        // transient service hiccup. Silently degrading to a low-quality
+        // SHA-256 pseudo-embedding here made this invisible forever: live
+        // logs showed this exact message on literally every single cycle,
+        // because nothing ever surfaced it as something to go fix. Now it
+        // throws a clear, actionable error instead. This is safe — every
+        // caller (learningEngine.rememberTaskOutcome/recallRelevantLessons)
+        // already wraps this in try/catch and degrades gracefully (skips
+        // the lesson, logs why) — so the system doesn't break, but the
+        // real cause is no longer hidden behind a fake-looking success.
+        throw new Error(
+          `Jina embeddings API rejected the request (${res.status}): JINA_API_KEY is missing, invalid, or revoked. Fix the key — this is not a transient failure and will not resolve itself.`
+        );
       } else {
         const txt = await res.text().catch(() => "");
-        console.warn(`[supabase] Jina failed (${res.status}) — using pseudo.`);
+        // Non-auth failures (5xx, timeout, network) are treated as
+        // transient — degrading to pseudo-embedding here keeps lesson
+        // storage/recall working at reduced quality rather than failing
+        // every task outright, which is reasonable for a real outage.
+        console.warn(`[supabase] Jina failed (${res.status}) — using pseudo. Response: ${txt.slice(0, 200)}`);
+        return { embedding: this._pseudoEmbedding(truncated), source: "pseudo-sha256" };
       }
     } catch (err) {
+      if (err.message.includes("JINA_API_KEY")) throw err; // the 401/403 case above — must propagate, not be masked here
       console.warn(`[supabase] Jina threw: ${err.message} — using pseudo.`);
+      return { embedding: this._pseudoEmbedding(truncated), source: "pseudo-sha256" };
     }
-    return { embedding: this._pseudoEmbedding(truncated), source: "pseudo-sha256" };
   }
 
   async _embed(text) { const { embedding } = await this.embedWithSource(text); return embedding; }
