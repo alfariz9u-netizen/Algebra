@@ -81,6 +81,77 @@ test("DailyQuotaTracker: quota state survives a process restart (persisted to di
   }
 });
 
+test("REQUIREMENT: Jina 401/403 must NOT silently degrade to a pseudo-embedding — it's a config problem, not a transient failure", async () => {
+  process.env.SUPABASE_URL = "https://fixture.supabase.co";
+  process.env.SUPABASE_SERVICE_KEY = "fixture-service-key";
+  process.env.JINA_API_KEY = "bad-or-revoked-key";
+  delete require.cache[require.resolve("../src/connectors/supabase")];
+  const SupabaseConnector = require("../src/connectors/supabase");
+  const supabase = new SupabaseConnector();
+
+  const originalFetch = global.fetch;
+  global.fetch = async (url) => {
+    if (String(url).includes("jina.ai")) {
+      return { ok: false, status: 401, text: async () => '{"error":"invalid API key"}' };
+    }
+    return { ok: true, json: async () => [{ id: "x" }] };
+  };
+
+  try {
+    await assert.rejects(
+      () => supabase.embedWithSource("some lesson content"),
+      /JINA_API_KEY is missing, invalid, or revoked/,
+      "a 401 must throw a clear, actionable error — not silently return a pseudo-embedding"
+    );
+
+    // And the caller (learningEngine) must still degrade gracefully —
+    // the system shouldn't crash, it should just correctly skip the
+    // lesson and say why, instead of silently storing a low-quality
+    // embedding that looks like a success.
+    delete require.cache[require.resolve("../src/core/learningEngine")];
+    const LearningEngine = require("../src/core/learningEngine");
+    const learning = new LearningEngine({});
+    const result = await learning.rememberTaskOutcome(supabase, {
+      taskType: "summarize",
+      connector: "github",
+      capability: "summarization",
+      outcome: { status: "success", output: "x".repeat(250), meta: { qaScore: 90 } },
+      rewardUsd: 0,
+    });
+    assert.strictEqual(result.stored, false);
+    assert.match(result.reason, /JINA_API_KEY/);
+  } finally {
+    global.fetch = originalFetch;
+    delete process.env.SUPABASE_URL;
+    delete process.env.SUPABASE_SERVICE_KEY;
+    delete process.env.JINA_API_KEY;
+  }
+});
+
+test("Jina a non-auth failure (500, network error) still degrades gracefully to a pseudo-embedding (transient, not a config problem)", async () => {
+  process.env.SUPABASE_URL = "https://fixture.supabase.co";
+  process.env.SUPABASE_SERVICE_KEY = "fixture-service-key";
+  delete require.cache[require.resolve("../src/connectors/supabase")];
+  const SupabaseConnector = require("../src/connectors/supabase");
+  const supabase = new SupabaseConnector();
+
+  const originalFetch = global.fetch;
+  global.fetch = async (url) => {
+    if (String(url).includes("jina.ai")) return { ok: false, status: 503, text: async () => "service unavailable" };
+    return { ok: true, json: async () => [{ id: "x" }] };
+  };
+
+  try {
+    const result = await supabase.embedWithSource("some content");
+    assert.strictEqual(result.source, "pseudo-sha256");
+    assert.strictEqual(result.embedding.length, 768);
+  } finally {
+    global.fetch = originalFetch;
+    delete process.env.SUPABASE_URL;
+    delete process.env.SUPABASE_SERVICE_KEY;
+  }
+});
+
 test("REAL BUG (production evidence, 2026-09-30): rememberTaskOutcome() must return the real Supabase row id, not undefined", async () => {
   delete require.cache[require.resolve("../src/core/learningEngine")];
   const LearningEngine = require("../src/core/learningEngine");
