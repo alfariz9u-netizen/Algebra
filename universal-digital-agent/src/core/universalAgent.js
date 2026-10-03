@@ -306,7 +306,7 @@ class UniversalAgent {
     const passed = verification.passed && qa.passed;
 
     if (!passed) {
-      this.economics.record({ type: "task_failed", model: generation.model, connector: task.sourceConnector });
+      this.economics.record({ type: "task_failed", taskId, model: generation.model, connector: task.sourceConnector });
       return this._fail(
         taskId,
         `Did not pass verification/QA. Verification: ${verification.checks.join("; ")}. QA: ${qa.message}`
@@ -333,6 +333,7 @@ class UniversalAgent {
     // quota tracker.
     this.economics.record({
       type: "task_completed",
+      taskId,
       model: generation.model,
       connector: task.sourceConnector,
       revenueUsd: task.rewardUsd || 0,
@@ -429,13 +430,24 @@ class UniversalAgent {
       .join("\n");
 
     try {
-      const response = await moltbook.createPost({ title, body, submolt: "general" });
+      // FIX (unified security gate): this used to call moltbook.createPost()
+      // directly — bypassing killSwitch.assertCanAct(), the connectors.
+      // supports() check, and rateLimiter.assertConsume() entirely. A
+      // kill-switch trip or a connector-level rate limit on "moltbook"
+      // had NO effect on this specific code path, even though every
+      // other external call in this project (including colony's own
+      // auto-post in marketplacePipeline.js) goes through callConnector().
+      // Routed through it now, consistent with that existing pattern —
+      // same "PUBLISH" (MEDIUM risk) action colony already uses.
+      const response = await this.callConnector("moltbook", "createPost", "PUBLISH", () =>
+        moltbook.createPost({ title, body, submolt: "general" })
+      );
 
       const challenge = moltbook.extractChallenge(response);
       if (challenge) {
         try {
           const answer = moltbook.solveChallenge(challenge.challenge);
-          await moltbook.verifyChallenge(challenge.code, answer);
+          await this.callConnector("moltbook", "createPost", "PUBLISH", () => moltbook.verifyChallenge(challenge.code, answer));
           console.log(`[universalAgent] moltbook post verified (hash=${titleShort})`);
         } catch (err) {
           console.warn(`[universalAgent] moltbook post verification failed: ${err.message}`);
@@ -537,16 +549,64 @@ class UniversalAgent {
   async resumeTask(approvalId) {
     const record = this.approvals.get(approvalId);
     if (!record) throw new Error(`No approval request with id "${approvalId}".`);
-    if (record.status !== "approved") {
-      return { status: record.status, approvalId, message: `Approval "${approvalId}" is "${record.status}", not "approved" — nothing to resume.` };
+
+    // FIX (approval replay / race condition — exactly what was asked to be
+    // prevented): this used to just check `record.status === "approved"`
+    // and proceed straight to processTask(). Two near-simultaneous calls
+    // to resumeTask() for the SAME approvalId — a double-tap on a
+    // Telegram button, a retried webhook, a human running
+    // `approvalCli.js resume` while the Telegram bot is also handling it
+    // — would BOTH pass that check and BOTH execute the task (and, before
+    // the economicIntelligence idempotency fix, both record revenue for
+    // it too). `claim()` is an atomic compare-and-swap: only the first
+    // caller succeeds; every other concurrent caller gets a ConflictError
+    // here and returns a clear "already being handled" result instead of
+    // re-running anything.
+    const { ConflictError } = require("./approvalQueue");
+    let claimed;
+    try {
+      claimed = this.approvals.claim(approvalId, this.agentId);
+    } catch (err) {
+      if (err instanceof ConflictError) {
+        // Two genuinely different situations produce the same ConflictError
+        // from claim(), and callers deserve different answers for each:
+        //   - record.status is "denied" or "pending": this was never a
+        //     race, there's just nothing approved to run — preserve the
+        //     original, more specific status so callers checking for
+        //     exactly "denied"/"pending" keep working.
+        //   - record.status is "claimed"/"executing"/"consumed"/"failed":
+        //     this IS the real race/replay case — someone else (possibly
+        //     this very approvalId being resumed twice concurrently) got
+        //     there first. "conflict" is the honest answer here.
+        const fresh = this.approvals.get(approvalId);
+        if (fresh && (fresh.status === "denied" || fresh.status === "pending")) {
+          return { status: fresh.status, approvalId, message: `Approval "${approvalId}" is "${fresh.status}", not "approved" — nothing to resume.` };
+        }
+        return { status: "conflict", approvalId, message: err.message };
+      }
+      throw err;
     }
-    if (!record.resumable || !record.task) {
+
+    if (!claimed.resumable || !claimed.task) {
+      // Nothing to actually execute — but it's claimed now, so mark it
+      // failed rather than leaving it stuck in "claimed" forever.
+      this.approvals.fail(approvalId, claimed.version, "not resumable: no stored task");
       return { status: "not_resumable", approvalId, message: "This approval has no stored task to resume automatically." };
     }
 
+    const executing = this.approvals.markExecuting(approvalId, claimed.version);
     this._approvedOverrides.add(record.taskId);
     try {
-      return await this.processTask(record.task);
+      const result = await this.processTask(claimed.task);
+      this.approvals.consume(approvalId, executing.version, { taskStatus: result.status });
+      return result;
+    } catch (err) {
+      try {
+        this.approvals.fail(approvalId, executing.version, err.message);
+      } catch {
+        /* best-effort — the original error below is what matters */
+      }
+      throw err;
     } finally {
       this._approvedOverrides.delete(record.taskId);
     }
