@@ -6,14 +6,31 @@ const os = require("node:os");
 const path = require("node:path");
 const EconomicIntelligence = require("../src/core/economicIntelligence");
 
-/** Independent, deliberately-naive reimplementation of the old O(n) rescan, used only to check the incremental version agrees with it. */
+/**
+ * Independent, deliberately-naive reimplementation of the old O(n) rescan, used only to check the incremental version agrees with it.
+ * Updated when summary() gained totalExpectedRevenueUsd / totalActualRevenueUsd / pendingPaymentsUsd (a deepStrictEqual against the
+ * full summary() object needs the reference to know every key); the new fields are computed here independently, by rescanning.
+ */
 function naiveSummary(events, rollup) {
+  const round = (n) => Math.round(n * 1e6) / 1e6;
   const byType = { ...rollup.countsByType };
   for (const e of events) byType[e.type] = (byType[e.type] || 0) + 1;
   const completed = events.filter((e) => e.type === "task_completed");
-  const revenue = rollup.totalRevenueUsd + completed.reduce((s, e) => s + (e.revenueUsd || 0), 0);
+  const payments = events.filter((e) => e.type === "payment_received");
+  const paid = payments.reduce((s, e) => s + (e.amountUsd || 0), 0);
+  const revenue = rollup.totalRevenueUsd + completed.reduce((s, e) => s + (e.revenueUsd || 0), 0) + paid;
   const cost = rollup.totalCostUsd + completed.reduce((s, e) => s + (e.costUsd || 0), 0);
-  return { countsByType: byType, totalRevenueUsd: revenue, totalCostUsd: cost, totalProfitUsd: revenue - cost };
+  const expected = (rollup.totalExpectedRevenueUsd || 0) + completed.reduce((s, e) => s + (e.expectedRevenueUsd || 0), 0);
+  const actual = (rollup.totalPaymentsUsd || 0) + paid;
+  return {
+    countsByType: byType,
+    totalRevenueUsd: revenue,
+    totalCostUsd: cost,
+    totalProfitUsd: revenue - cost,
+    totalExpectedRevenueUsd: round(expected),
+    totalActualRevenueUsd: round(actual),
+    pendingPaymentsUsd: round(Math.max(0, expected - actual)),
+  };
 }
 
 test("EconomicIntelligence.summary() incremental aggregation matches a full rescan", async (t) => {
