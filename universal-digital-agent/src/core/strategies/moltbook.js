@@ -305,7 +305,7 @@ const moltbookStrategy = {
 
       const response = await connector.createPost({
         title: parsed.title,
-        body: parsed.body,
+        content: parsed.body,
         submolt: raw.__postSubmolt || "general",
       });
 
