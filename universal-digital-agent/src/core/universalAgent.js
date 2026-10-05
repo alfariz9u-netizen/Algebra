@@ -336,7 +336,15 @@ class UniversalAgent {
       taskId,
       model: generation.model,
       connector: task.sourceConnector,
-      revenueUsd: task.rewardUsd || 0,
+      // FIX (phantom profit): this used to record `revenueUsd: task.rewardUsd`,
+      // i.e. the reward the platform ADVERTISED, as if it were money in hand.
+      // The dashboard then showed $10.10 of "revenue" while the Solana wallet
+      // was empty (Account does not exist onchain). Completing a task is not
+      // being paid: the advertised reward is tracked separately as
+      // `expectedRevenueUsd`, and real revenue only appears when
+      // economics.recordPayment() logs a payment actually received.
+      revenueUsd: 0,
+      expectedRevenueUsd: task.rewardUsd || 0,
       costUsd: estimateCostUsd(generation.provider, generation.model, generation.usage, this.llmQuota),
     });
 
@@ -440,7 +448,7 @@ class UniversalAgent {
       // Routed through it now, consistent with that existing pattern —
       // same "PUBLISH" (MEDIUM risk) action colony already uses.
       const response = await this.callConnector("moltbook", "createPost", "PUBLISH", () =>
-        moltbook.createPost({ title, body, submolt: "general" })
+        moltbook.createPost({ title, content: body, submolt: "general" })
       );
 
       const challenge = moltbook.extractChallenge(response);
@@ -690,13 +698,22 @@ class UniversalAgent {
   }
 
   dashboard() {
+    // One summary() call, so economics and the three headline fields below
+    // are always consistent with each other.
+    const economics = this.economics.summary();
     return {
       agentId: this.agentId,
       persistDir: this.persistDir || null,
       autonomyLevel: this.autonomyLevel,
       killSwitch: this.killSwitch.status(),
       dailyTokenUsage: this.tokens.getDailyUsage(),
-      economics: this.economics.summary(),
+      economics,
+      // Expected (advertised by platforms) vs. actual (payments really
+      // received) revenue — kept apart so completed-but-unpaid work can't be
+      // mistaken for income. `pendingPaymentsUsd` = expected - actual.
+      totalExpectedRevenueUsd: economics.totalExpectedRevenueUsd,
+      totalActualRevenueUsd: economics.totalActualRevenueUsd,
+      pendingPaymentsUsd: economics.pendingPaymentsUsd,
       // Real remaining free-tier headroom for today (UTC), so an operator
       // can see "we're about to fall through to paid Grok" before it
       // happens, not just after the bill shows it. Infinity means this
