@@ -1,4 +1,5 @@
 "use strict";
+const fs = require("node:fs");
 const path = require("node:path");
 const { JsonFileStore } = require("./persistence/fileStore");
 
@@ -39,7 +40,34 @@ class LearningEngine {
     this.deadOpportunities = { ...(s.deadOpportunities || {}) };
     this.connectorStats = { ...(s.connectorStats || {}) };
   }
-  _sync() { if (!this._store) return; const s = this._store.load(freshState()); this.circuits = { ...(s.circuits || {}) }; this.deadOpportunities = { ...(s.deadOpportunities || {}) }; this.connectorStats = { ...(s.connectorStats || {}) }; }
+  // FIX (performance, optional): _sync() used to do a full file read +
+  // JSON.parse (+ decrypt, when PERSIST_ENCRYPTION_KEY is set) on EVERY
+  // call — and it's called from nearly every public method here
+  // (recordFailure, recordAttempt, isOpportunityDead,
+  // calibratedSuccessProbability, resetCircuit, ...), potentially many
+  // times per 30-minute marketplace cycle across 9+ strategies. A
+  // fs.statSync() first is dramatically cheaper than a full read+parse,
+  // and lets every call skip the real work entirely when nothing has
+  // changed on disk since the last sync — the common case within one
+  // cycle, where most of these calls happen back-to-back with no write
+  // in between. Falls back to the original always-reload behavior if
+  // stat() fails for any reason other than the file not existing yet.
+  _sync() {
+    if (!this._store) return;
+    try {
+      const mtimeMs = fs.statSync(this._store.filePath).mtimeMs;
+      if (this._lastSyncedMtimeMs === mtimeMs) return; // unchanged — skip the real read
+      this._lastSyncedMtimeMs = mtimeMs;
+    } catch (err) {
+      if (err.code !== "ENOENT") throw err;
+      // File doesn't exist yet — fall through to load(), which already
+      // handles ENOENT by returning the default state.
+    }
+    const s = this._store.load(freshState());
+    this.circuits = { ...(s.circuits || {}) };
+    this.deadOpportunities = { ...(s.deadOpportunities || {}) };
+    this.connectorStats = { ...(s.connectorStats || {}) };
+  }
   _persist() { if (!this._store) return; this._store.save({ circuits: this.circuits, deadOpportunities: this.deadOpportunities, connectorStats: this.connectorStats }); }
 
   checkCircuit(connector, operation) {
