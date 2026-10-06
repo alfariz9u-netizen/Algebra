@@ -90,6 +90,26 @@ function freshBuildAgent() {
   return require("../src/index").buildAgent;
 }
 
+// FIX (test isolation, exposed by index.js's PERSIST_DIR-default fix):
+// buildAgent() used to get `persistDir: undefined` whenever PERSIST_DIR
+// wasn't set, which made every agent instance here silently in-memory-only
+// — each of the 4 phases below got an accidentally-clean audit log only
+// because persistence was effectively off, not because this test asked
+// for isolation. Now that buildAgent() correctly defaults PERSIST_DIR to
+// a real "./data" directory (so production actually persists), relying on
+// "unset = isolated" is no longer true: all 4 phases would share one real
+// directory and see each other's audit entries. Each phase now gets its
+// own fresh temp directory, which is what this test actually needs
+// (independent scenarios), without depending on an implicit side effect.
+function freshPersistDir() {
+  const fs = require("node:fs");
+  const os = require("node:os");
+  const path = require("node:path");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mcp-tool-loop-test-"));
+  process.env.PERSIST_DIR = dir;
+  return dir;
+}
+
 async function main() {
   const geminiPort = 8961;
   const mcpPort = 8962;
@@ -106,6 +126,7 @@ async function main() {
     {
       process.env.MCP_SERVER_URL = `http://localhost:${mcpPort}`;
       process.env.MCP_ALLOWED_TOOLS = "search_web";
+      freshPersistDir();
       const buildAgent = freshBuildAgent();
       const agent = buildAgent();
 
@@ -123,6 +144,7 @@ async function main() {
     {
       process.env.MCP_SERVER_URL = `http://localhost:${mcpPort}`;
       process.env.MCP_ALLOWED_TOOLS = "some_other_tool"; // search_web NOT included -> no usable tools -> falls back
+      freshPersistDir();
       const buildAgent = freshBuildAgent();
       const agent = buildAgent();
       const result = await agent.processTask({ id: "t-tools-2", type: "webResearch", input: { query: "x" } });
@@ -137,6 +159,7 @@ async function main() {
     {
       delete process.env.MCP_SERVER_URL;
       delete process.env.MCP_ALLOWED_TOOLS;
+      freshPersistDir();
       const buildAgent = freshBuildAgent();
       const agent = buildAgent();
       const result = await agent.processTask({ id: "t-tools-3", type: "webResearch", input: { query: "renewable energy adoption" } });
@@ -155,6 +178,7 @@ async function main() {
     {
       process.env.MCP_SERVER_URL = "http://localhost:1"; // nothing listens here
       process.env.MCP_ALLOWED_TOOLS = "search_web";
+      freshPersistDir();
       const buildAgent = freshBuildAgent();
       const agent = buildAgent();
       const result = await agent.processTask({ id: "t-tools-4", type: "webResearch", input: { query: "x" } });
@@ -167,6 +191,10 @@ async function main() {
   } finally {
     delete process.env.MCP_SERVER_URL;
     delete process.env.MCP_ALLOWED_TOOLS;
+    if (process.env.PERSIST_DIR) {
+      require("node:fs").rmSync(process.env.PERSIST_DIR, { recursive: true, force: true });
+    }
+    delete process.env.PERSIST_DIR;
     await new Promise((resolve) => geminiServer.close(resolve));
     await new Promise((resolve) => mcpServer.close(resolve));
   }
