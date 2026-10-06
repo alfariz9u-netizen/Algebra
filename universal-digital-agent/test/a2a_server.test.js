@@ -7,6 +7,14 @@ function freshA2aModules() {
   for (const mod of ["../src/a2aServer", "../src/core/universalAgent", "../src/index"]) {
     delete require.cache[require.resolve(mod)];
   }
+  // FIX (test isolation, same class as mcp_tool_loop.test.js): now that
+  // buildAgent() defaults PERSIST_DIR to a real "./data" instead of
+  // leaving persistence off, each call here needs its own fresh
+  // directory to stay independent — see the longer comment in
+  // mcp_tool_loop.test.js for the full explanation.
+  process.env.PERSIST_DIR = require("node:fs").mkdtempSync(
+    require("node:path").join(require("node:os").tmpdir(), "a2a-server-test-")
+  );
   return { a2a: require("../src/a2aServer"), buildAgent: require("../src/index").buildAgent };
 }
 
