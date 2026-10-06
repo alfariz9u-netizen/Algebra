@@ -107,6 +107,44 @@ test("REQUIREMENT: an execution failure is terminal (failed), distinct from succ
   assert.throws(() => queue.claim(record.id, "worker-B"), /already "failed"/);
 });
 
+test("REQUIREMENT: an approval stuck in 'executing' past the timeout is auto-failed (simulates a process crashing right after markExecuting)", () => {
+  const queue = new ApprovalQueue();
+  const record = queue.enqueue({ taskId: "t9", task: { id: "t9" }, action: "SUBMIT_TASK", riskLevel: "MEDIUM" });
+  queue.resolve(record.id, "approved", "alice");
+  const claimed = queue.claim(record.id, "worker-A");
+  const executing = queue.markExecuting(record.id, claimed.version);
+
+  // Simulate "the process crashed right after markExecuting()" by
+  // directly backdating executingAt on the in-memory record, as if a lot
+  // of real wall-clock time had passed with nobody ever calling
+  // consume()/fail(). (There is deliberately no public API to do this —
+  // reaching into the record this way IS the simulation.)
+  const stale = queue.records.find((r) => r.id === record.id);
+  stale.executingAt = new Date(Date.now() - 11 * 60 * 1000).toISOString(); // 11 minutes ago
+
+  const listed = queue.list({ status: "failed" });
+  assert.strictEqual(listed.length, 1, "list() must surface the stuck approval as failed, not leave it invisible as 'executing' forever");
+  assert.strictEqual(listed[0].id, record.id);
+  assert.match(listed[0].result.error, /timed out/);
+
+  // And it's genuinely terminal now — nobody (not even the "crashed"
+  // worker eventually calling consume()) can act on it again.
+  assert.throws(() => queue.consume(record.id, executing.version, { ok: true }), /already "failed"/);
+  assert.throws(() => queue.claim(record.id, "worker-B"), /already "failed"/);
+});
+
+test("An approval still within the executing timeout is left alone", () => {
+  const queue = new ApprovalQueue();
+  const record = queue.enqueue({ taskId: "t10", task: { id: "t10" }, action: "SUBMIT_TASK", riskLevel: "MEDIUM" });
+  queue.resolve(record.id, "approved", "alice");
+  const claimed = queue.claim(record.id, "worker-A");
+  queue.markExecuting(record.id, claimed.version);
+
+  // Fresh — well within the 10-minute timeout.
+  assert.strictEqual(queue.get(record.id).status, "executing");
+  assert.strictEqual(queue.list({ status: "failed" }).length, 0);
+});
+
 test("REQUIREMENT: state survives across independent ApprovalQueue instances pointed at the same persistDir — i.e. real cross-process safety, not just in-memory", () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "approval-queue-cross-process-"));
   try {
