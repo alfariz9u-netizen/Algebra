@@ -88,6 +88,48 @@ async function main() {
   assert.strictEqual(econReloaded.summary().totalRevenueUsd, 6.0, "the rollup must persist across a restart, not just within one process");
   console.log("PASS: the rollup itself survives a restart — pruned financial history is never lost, even across process restarts");
 
+  // ============ _recordedFinancialTaskIds unbounded growth (FIX) ============
+  // Small cap via env override so the test doesn't need 10,000+ real
+  // records to exercise the eviction path.
+  process.env.ECONOMICS_MAX_FINANCIAL_DEDUPE_KEYS = "5";
+  delete require.cache[require.resolve("../src/core/economicIntelligence")];
+  const EconomicIntelligenceCapped = require("../src/core/economicIntelligence");
+  const dedupeDir = fs.mkdtempSync(path.join(os.tmpdir(), "uda-dedupe-cap-test-"));
+  const econCapped = new EconomicIntelligenceCapped({ persistDir: dedupeDir });
+
+  for (let i = 0; i < 8; i++) {
+    econCapped.record({ type: "task_completed", taskId: `task-${i}`, revenueUsd: 1, costUsd: 0 });
+  }
+  assert.strictEqual(
+    econCapped._recordedFinancialTaskIds.size,
+    8,
+    "the Set itself isn't capped on every record() — only prune() evicts, per the requirement"
+  );
+
+  const cappedPruneResult = econCapped.prune({ maxEntries: 1000 }); // no events are old/excess enough to remove by count/age
+  assert.strictEqual(cappedPruneResult.dedupeKeysRemoved, 3, "prune() must evict exactly (size - cap) = 8 - 5 = 3 oldest keys");
+  assert.strictEqual(econCapped._recordedFinancialTaskIds.size, 5, "the Set must be capped at the configured size after prune()");
+
+  // The newest keys (task-3..task-7) must survive; the oldest (task-0..task-2) are evicted.
+  for (let i = 3; i < 8; i++) {
+    assert.ok(
+      econCapped._recordedFinancialTaskIds.has(`task_completed:task-${i}`),
+      `recent task-${i} must still be protected against duplicate recording after the cap is enforced`
+    );
+  }
+  for (let i = 0; i < 3; i++) {
+    assert.ok(!econCapped._recordedFinancialTaskIds.has(`task_completed:task-${i}`), `oldest task-${i} should have been evicted`);
+  }
+
+  // And recent dedupe protection genuinely still works post-eviction: a
+  // duplicate recording of a SURVIVING taskId is still rejected.
+  const dupeResult = econCapped.record({ type: "task_completed", taskId: "task-7", revenueUsd: 999, costUsd: 0 });
+  assert.strictEqual(dupeResult.duplicate, true, "deduping of recent, still-tracked taskIds must not be lost after eviction");
+  console.log("PASS: _recordedFinancialTaskIds is capped during prune(), evicting oldest-first, without losing dedup coverage for recent tasks");
+
+  fs.rmSync(dedupeDir, { recursive: true, force: true });
+  delete process.env.ECONOMICS_MAX_FINANCIAL_DEDUPE_KEYS;
+
   fs.rmSync(dir, { recursive: true, force: true });
 }
 
