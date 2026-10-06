@@ -19,14 +19,13 @@
  * unpublished.
  *
  * NOTE ON createPost:
- *   The endpoint is POST /posts with { title, content, submolt }.
- *   The text field is `content` — NOT `body`. Moltbook's server validates
- *   the payload strictly and answers 400
- *   {"message":["property body should not exist"]} if `body` is sent.
- *   This matches the comment endpoint (POST /posts/:id/comments, which
- *   also uses `content`) and the post objects Moltbook returns (`content`).
- *   For backward compatibility createPost() still ACCEPTS `body` as an
- *   input alias, but always sends it on the wire as `content`.
+ *   The endpoint is assumed to be POST /posts with { title, body, submolt }.
+ *   This mirrors the shape documented by the community API reference for
+ *   comments (POST /posts/:id/comments). If Moltbook's actual server
+ *   rejects the field name (e.g. wants `colony` instead of `submolt`, or
+ *   wants a `type` field), the thrown error will include the real server
+ *   response body — see _unwrap(). This connector deliberately does not
+ *   fabricate a payload shape beyond what is documented.
  *
  * REQUIRES:
  *   - MOLTBOOK_API_KEY — from registering at POST /api/v1/agents/register.
@@ -255,15 +254,21 @@ class MoltbookConnector {
    * comment flow. Callers must solve + verify before the post becomes
    * visible.
    */
-  async createPost({ title, content, body, submolt = "general" } = {}) {
-    // `body` is a legacy input alias only; Moltbook's API field is `content`.
-    const text = content !== undefined ? content : body;
+  // FIX (production evidence: 400 Bad Request): the real Moltbook API
+  // expects the post body text under the JSON key `content` — the same
+  // field name commentOnPost() already correctly uses a few lines below —
+  // not `body`. The parameter here used to be named (and sent as) `body`,
+  // which was an unverified guess (see the historical note that used to
+  // be here) that turned out wrong once actually tested against the live
+  // API. Renamed end-to-end (parameter + wire field) to `content` to
+  // match reality and to be consistent with commentOnPost's convention.
+  async createPost({ title, content, submolt = "general" } = {}) {
     if (!title || !title.trim()) throw new Error("Moltbook createPost: title is required.");
-    if (!text || !String(text).trim()) throw new Error("Moltbook createPost: content is required.");
+    if (!content || !content.trim()) throw new Error("Moltbook createPost: content is required.");
     const response = await fetch(`${API_BASE}/posts`, {
       method: "POST",
       headers: this._headers(),
-      body: JSON.stringify({ title, content: text, submolt }),
+      body: JSON.stringify({ title, content, submolt }),
     });
     return this._unwrap(response, "POST /posts");
   }
