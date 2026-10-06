@@ -46,6 +46,18 @@ const { JsonFileStore } = require("./persistence/fileStore");
 
 const TERMINAL_STATUSES = new Set(["denied", "consumed", "failed"]);
 
+// FIX (stuck approvals): if the process executing a claimed approval
+// crashes (or is killed, or hangs) between markExecuting() and
+// consume()/fail(), the record is stuck in "executing" forever — nothing
+// else can ever claim it again (claim() only accepts "approved"), so it
+// silently blocks that task's approvalId permanently with no error
+// anywhere. 10 minutes is far longer than any real task in this project
+// takes (LLM calls + one HTTP submission), so anything still "executing"
+// past that is a crashed/hung process, not a slow one. Overridable via
+// APPROVAL_EXECUTING_TIMEOUT_MS for environments with genuinely
+// longer-running tasks.
+const EXECUTING_TIMEOUT_MS = Number(process.env.APPROVAL_EXECUTING_TIMEOUT_MS || 10 * 60 * 1000);
+
 class ConflictError extends Error {
   constructor(message) {
     super(message);
@@ -61,9 +73,33 @@ class ApprovalQueue {
 
   // Always the current on-disk truth (a no-op, returning the in-memory
   // array, when there's no persistDir — single-process-only mode).
+  // Also reaps any approval stuck in "executing" past the timeout (see
+  // EXECUTING_TIMEOUT_MS above) — called from every read/write path
+  // (list(), get(), and every _transition()), so a stuck record is
+  // caught and failed wherever it's next touched, not just on a
+  // dedicated sweep.
   _reload() {
     if (this._store) this.records = this._store.load([]);
+    this._reapStuckExecuting();
     return this.records;
+  }
+
+  _reapStuckExecuting() {
+    const now = Date.now();
+    let changed = false;
+    for (const record of this.records) {
+      if (record.status !== "executing" || !record.executingAt) continue;
+      const elapsed = now - new Date(record.executingAt).getTime();
+      if (elapsed > EXECUTING_TIMEOUT_MS) {
+        record.status = "failed";
+        record.version += 1;
+        record.result = {
+          error: `Execution timed out after ${Math.round(elapsed / 1000)}s (stuck in "executing" since ${record.executingAt} — the process handling it likely crashed or hung before calling consume()/fail()).`,
+        };
+        changed = true;
+      }
+    }
+    if (changed) this._persist();
   }
 
   _persist() {
