@@ -120,4 +120,44 @@ test("state survives a restart when persistDir is set", () => {
   }
 });
 
+test("FIX (performance): _sync() skips the real file read when the file hasn't changed since the last sync", () => {
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const dir = fs.mkdtempSync(path.join(require("node:os").tmpdir(), "learning-engine-sync-perf-"));
+  try {
+    const engine = new LearningEngine({ persistDir: dir });
+    engine.markOpportunityDead("agentMarket", "job-1", "seed state"); // ensure the file exists on disk
+    // markOpportunityDead's own _sync() ran BEFORE its _persist() changed
+    // the file's mtime, so _lastSyncedMtimeMs is now one write behind —
+    // exactly one more real read is legitimately needed to catch up. That
+    // read is expected and not what this test is about; prime it here so
+    // the counter below measures only the genuinely-redundant case.
+    engine.isOpportunityDead("agentMarket", "__priming_call__");
+
+    let realReadCount = 0;
+    const originalLoad = engine._store.load.bind(engine._store);
+    engine._store.load = (...args) => {
+      realReadCount += 1;
+      return originalLoad(...args);
+    };
+
+    // Several read-only calls back-to-back, nothing written in between —
+    // the common case within one marketplace cycle.
+    engine.isOpportunityDead("agentMarket", "job-1");
+    engine.isOpportunityDead("agentMarket", "job-2");
+    engine.checkCircuit("openTask", "submitBid");
+    assert.strictEqual(realReadCount, 0, "no real file read should happen when the on-disk file hasn't changed since the last sync");
+
+    // A real external write (simulating a different process) MUST still
+    // be picked up — correctness must never be sacrificed for the cache.
+    const externalWriter = new LearningEngine({ persistDir: dir });
+    externalWriter.markOpportunityDead("agentMarket", "job-3", "written by a different process");
+
+    assert.strictEqual(engine.isOpportunityDead("agentMarket", "job-3"), true, "a genuine external change must still be picked up correctly");
+    assert.strictEqual(realReadCount, 1, "exactly one real read should have happened, to pick up the real external change");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 console.log("All learning engine tests defined — run via `node --test`.");
