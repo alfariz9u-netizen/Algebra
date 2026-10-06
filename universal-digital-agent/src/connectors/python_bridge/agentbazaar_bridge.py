@@ -16,6 +16,8 @@ Requires:
     A Solana keypair for any action beyond list_agents/stats — either at
     ~/.config/solana/id.json or via the SOLANA_PRIVATE_KEY env var, per the
     package's own load_keypair() convention.
+    Optional: AGENTBAZAAR_API_URL to override the default base URL
+    (https://agentbazaar.dev) the SDK client connects to.
 
 Every response is printed to stdout as a single JSON line so the Node side
 can parse it without scraping human-readable text.
@@ -41,14 +43,24 @@ def main():
         }))
         sys.exit(1)
 
+    # FIX (production error, AgentBazaar #308): every SyncAgentBazaarClient()
+    # call here used to take no base_url at all, letting the SDK fall back
+    # to whatever it defaults to internally — which redirected (HTTP 308,
+    # Permanent Redirect) rather than connecting directly. Pinning the real
+    # base URL explicitly avoids that extra hop entirely. Overridable via
+    # AGENTBAZAAR_API_URL for whichever environment needs a different host
+    # (e.g. a staging API) without editing this file.
+    import os
+    base_url = os.environ.get("AGENTBAZAAR_API_URL", "https://agentbazaar.dev")
+
     try:
         if command == "list_agents":
-            with SyncAgentBazaarClient() as client:
+            with SyncAgentBazaarClient(base_url=base_url) as client:
                 result = client.list_agents()
                 print(json.dumps({"ok": True, "result": result}))
 
         elif command == "stats":
-            with SyncAgentBazaarClient() as client:
+            with SyncAgentBazaarClient(base_url=base_url) as client:
                 result = client.stats()
                 # pydantic model -> dict if needed
                 payload = result.dict() if hasattr(result, "dict") else result
@@ -56,7 +68,7 @@ def main():
 
         elif command == "call":
             keypair = load_keypair()
-            with SyncAgentBazaarClient(keypair=keypair) as client:
+            with SyncAgentBazaarClient(base_url=base_url, keypair=keypair) as client:
                 result = client.call(task=args.get("task"), skills=args.get("skills"))
                 payload = result.dict() if hasattr(result, "dict") else {"result": str(result)}
                 print(json.dumps({"ok": True, "result": payload}))
