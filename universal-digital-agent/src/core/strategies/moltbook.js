@@ -303,6 +303,11 @@ const moltbookStrategy = {
         return { skipped: true, reason: "duplicate post title hash" };
       }
 
+      // FIX: connector.createPost() now expects `content`, not `body` —
+      // see connectors/moltbook.js. `parsed.body` is still the field name
+      // we ask the LLM to produce in its own JSON output above (our
+      // internal schema, unrelated to Moltbook's wire format); only the
+      // key handed to the connector needed to change.
       const response = await connector.createPost({
         title: parsed.title,
         content: parsed.body,
