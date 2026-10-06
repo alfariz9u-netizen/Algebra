@@ -18,11 +18,40 @@ const MoltbookConnector = require("./connectors/moltbook");
 const SupabaseConnector = require("./connectors/supabase");
 const AgentverseConnector = require("./connectors/agentverse");
 
+// FIX (PERSIST_DIR consistency on Render/production): this used to pass
+// `process.env.PERSIST_DIR` straight through with NO fallback. Several
+// OTHER modules (llmPricing.js's quota tracker, strategies/moltbook.js's
+// and strategies/agentBazaar.js's own state files) already independently
+// default to "./data" when PERSIST_DIR is unset — but UniversalAgent (and
+// everything fed by `this.persistDir` inside it: approvals, economics,
+// learning, audit, kill switch, memory) got `undefined` instead, which
+// means NO persistence at all, not even same-directory-as-everything-else
+// local persistence — a silent, much worse failure mode than "resets on
+// restart": approvalCli.js and the Telegram bot literally cannot see
+// anything combinedServer.js's own long-running process creates, even
+// within the same deployment between restarts, because there was no file
+// for them to share in the first place. Resolved ONCE here, with the SAME
+// "./data" default every other module already uses (so everything is
+// finally guaranteed to share one real directory), and a loud, explicit
+// warning when the env var itself was never set — this is exactly the
+// kind of silent misconfiguration that should be impossible to miss in
+// logs, not something you discover by noticing approvals never resume.
+const resolvedPersistDir = process.env.PERSIST_DIR || "./data";
+if (!process.env.PERSIST_DIR) {
+  console.warn(
+    `[index] WARNING: PERSIST_DIR is not set. Falling back to "${resolvedPersistDir}" (relative to the process's working directory). ` +
+      "On Render specifically, the local disk is ephemeral by default: anything written to a path that isn't on an attached " +
+      "Persistent Disk is LOST on every restart/redeploy — including approvals, economics history, learned circuit-breaker " +
+      "state, and moltbook/colony post cooldowns. Set PERSIST_DIR to a path on a real attached disk (e.g. /data) for this to " +
+      "actually persist in production."
+  );
+}
+
 function buildAgent() {
   // تمرير persistDir و encryptionKey من متغيرات البيئة (ضروري لحفظ
   // audit log / approvals / economics / memory على القرص بدلاً من الذاكرة فقط)
   const agent = new UniversalAgent({
-    persistDir: process.env.PERSIST_DIR,
+    persistDir: resolvedPersistDir,
     encryptionKey: process.env.PERSIST_ENCRYPTION_KEY,
   });
 
