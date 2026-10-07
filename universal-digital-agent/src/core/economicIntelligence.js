@@ -48,12 +48,15 @@ class EconomicIntelligence {
     this._rollupStore = persistDir ? new JsonFileStore(path.join(persistDir, "economic-rollup.json"), { encryptionKey }) : null;
     this.events = this._log ? this._log.loadAll() : [];
     this.rollup = this._rollupStore
-      ? this._rollupStore.load({ countsByType: {}, totalRevenueUsd: 0, totalCostUsd: 0 })
-      : { countsByType: {}, totalRevenueUsd: 0, totalCostUsd: 0 };
+      ? this._rollupStore.load({ countsByType: {}, totalRevenueUsd: 0, totalCostUsd: 0, totalExpectedRevenueUsd: 0, totalConfirmedPaymentsUsd: 0 })
+      : { countsByType: {}, totalRevenueUsd: 0, totalCostUsd: 0, totalExpectedRevenueUsd: 0, totalConfirmedPaymentsUsd: 0 };
+    // Older persisted rollups won't have these two fields — default them.
+    this.rollup.totalExpectedRevenueUsd = this.rollup.totalExpectedRevenueUsd || 0;
+    this.rollup.totalConfirmedPaymentsUsd = this.rollup.totalConfirmedPaymentsUsd || 0;
 
     // Incremental mirror of whatever is currently in `this.events`, kept in
     // sync by record()/prune() so summary() never has to rescan events.
-    this._live = { countsByType: {}, totalRevenueUsd: 0, totalCostUsd: 0 };
+    this._live = { countsByType: {}, totalRevenueUsd: 0, totalCostUsd: 0, totalExpectedRevenueUsd: 0, totalConfirmedPaymentsUsd: 0 };
     for (const e of this.events) this._addToLive(e);
 
     // IDEMPOTENCY (requested explicitly: "تأكد من تسجيل task_completed...
@@ -69,6 +72,18 @@ class EconomicIntelligence {
         this._recordedFinancialTaskIds.add(`${e.type}:${e.taskId}`);
       }
     }
+
+    // recordPayment()'s own idempotency key is the real on-chain
+    // transaction signature/hash — NOT taskId. A payment can exist with
+    // no taskId at all (no memo on-chain to match it to anything yet),
+    // and the payment watcher re-scans a rolling 24h window every 5
+    // minutes, so it WILL see the same real transaction many times;
+    // txSignature is the only thing guaranteed to be unique per real
+    // payment. Rebuilt from history on construction, same as above.
+    this._recordedTxSignatures = new Set();
+    for (const e of this.events) {
+      if (e.type === "payment_received" && e.txSignature) this._recordedTxSignatures.add(e.txSignature);
+    }
   }
 
   _addToLive(e) {
@@ -76,6 +91,10 @@ class EconomicIntelligence {
     if (e.type === "task_completed") {
       this._live.totalRevenueUsd += e.revenueUsd || 0;
       this._live.totalCostUsd += e.costUsd || 0;
+      this._live.totalExpectedRevenueUsd = (this._live.totalExpectedRevenueUsd || 0) + (e.expectedRevenueUsd || 0);
+    }
+    if (e.type === "payment_received") {
+      this._live.totalConfirmedPaymentsUsd = (this._live.totalConfirmedPaymentsUsd || 0) + (e.amountUsd || 0);
     }
   }
 
@@ -84,6 +103,10 @@ class EconomicIntelligence {
     if (e.type === "task_completed") {
       this._live.totalRevenueUsd -= e.revenueUsd || 0;
       this._live.totalCostUsd -= e.costUsd || 0;
+      this._live.totalExpectedRevenueUsd = (this._live.totalExpectedRevenueUsd || 0) - (e.expectedRevenueUsd || 0);
+    }
+    if (e.type === "payment_received") {
+      this._live.totalConfirmedPaymentsUsd = (this._live.totalConfirmedPaymentsUsd || 0) - (e.amountUsd || 0);
     }
   }
 
@@ -112,7 +135,37 @@ class EconomicIntelligence {
     return entry;
   }
 
-  /** e.g. { type: "task_discovered" | "task_accepted" | "task_rejected" | "bid_won" | "bid_lost" | "task_completed" | "task_failed", ... } */
+  /** e.g. { type: "task_discovered" | "task_accepted" | "task_rejected" | "bid_won" | "bid_lost" | "task_completed" | "task_failed" | "payment_received", ... } */
+
+  /**
+   * THE REAL revenue source (see paymentWatcher.js). A "task_completed"
+   * event means the work was delivered — it is NOT proof anyone paid for
+   * it. This is: real money actually arrived on-chain, confirmed by a
+   * real transaction. `taskId` links it back to a specific task when a
+   * memo was found on-chain (Solana supports this natively; Base/EVM
+   * Transfer events don't carry a memo, so taskId may legitimately be
+   * null there — see paymentWatcher.js's own notes). Idempotent by
+   * `txSignature`, NOT by taskId: a real transaction signature/hash is
+   * the only thing that uniquely identifies one real payment, and the
+   * watcher re-scans a rolling window repeatedly, so it WILL see the
+   * same real payment many times across cycles.
+   * @param {{ taskId?: string|null, amountUsd: number, txSignature: string, network?: string, token?: string, from?: string }} payment
+   */
+  recordPayment({ taskId = null, amountUsd, txSignature, network = null, token = null, from = null }) {
+    if (!txSignature) throw new Error("economics.recordPayment: txSignature is required — it is the idempotency key.");
+    if (typeof amountUsd !== "number" || !(amountUsd > 0)) {
+      throw new Error(`economics.recordPayment: amountUsd must be a positive number, got ${amountUsd}.`);
+    }
+    if (this._recordedTxSignatures.has(txSignature)) {
+      return { duplicate: true, type: "payment_received", txSignature };
+    }
+    this._recordedTxSignatures.add(txSignature);
+    const entry = { timestamp: Date.now(), type: "payment_received", taskId, amountUsd, txSignature, network, token, from };
+    this.events.push(entry);
+    this._addToLive(entry);
+    if (this._log) this._log.append(entry);
+    return entry;
+  }
 
   summary() {
     const byType = { ...this.rollup.countsByType };
@@ -122,12 +175,20 @@ class EconomicIntelligence {
 
     const revenue = this.rollup.totalRevenueUsd + this._live.totalRevenueUsd;
     const cost = this.rollup.totalCostUsd + this._live.totalCostUsd;
+    const expectedRevenue = this.rollup.totalExpectedRevenueUsd + this._live.totalExpectedRevenueUsd;
+    const confirmedPayments = this.rollup.totalConfirmedPaymentsUsd + this._live.totalConfirmedPaymentsUsd;
 
     return {
       countsByType: byType,
       totalRevenueUsd: revenue,
       totalCostUsd: cost,
       totalProfitUsd: revenue - cost,
+      // Pipeline value (bids submitted, not yet confirmed paid) kept
+      // explicitly separate from real revenue — never summed into it.
+      totalExpectedRevenueUsd: expectedRevenue,
+      // The only number in this object backed by a real blockchain
+      // transaction, not an estimate or a platform's own unconfirmed claim.
+      totalConfirmedPaymentsUsd: confirmedPayments,
     };
   }
 
@@ -195,6 +256,10 @@ class EconomicIntelligence {
       if (e.type === "task_completed") {
         this.rollup.totalRevenueUsd += e.revenueUsd || 0;
         this.rollup.totalCostUsd += e.costUsd || 0;
+        this.rollup.totalExpectedRevenueUsd += e.expectedRevenueUsd || 0;
+      }
+      if (e.type === "payment_received") {
+        this.rollup.totalConfirmedPaymentsUsd += e.amountUsd || 0;
       }
       this._removeFromLive(e);
     }
@@ -204,8 +269,9 @@ class EconomicIntelligence {
     if (this._rollupStore) this._rollupStore.save(this.rollup);
 
     const dedupeKeysRemoved = this._capFinancialDedupeSet();
+    const txSignaturesRemoved = this._capTxSignatureSet();
 
-    return { before, after: this.events.length, removed: before - this.events.length, dedupeKeysRemoved };
+    return { before, after: this.events.length, removed: before - this.events.length, dedupeKeysRemoved, txSignaturesRemoved };
   }
 
   /**
@@ -220,6 +286,17 @@ class EconomicIntelligence {
     const it = this._recordedFinancialTaskIds.values();
     for (let i = 0; i < excess; i++) {
       this._recordedFinancialTaskIds.delete(it.next().value);
+    }
+    return excess;
+  }
+
+  /** Same bounded-growth fix, same oldest-first eviction, for recordPayment()'s txSignature dedupe set. */
+  _capTxSignatureSet() {
+    const excess = this._recordedTxSignatures.size - MAX_RECORDED_FINANCIAL_TASK_IDS;
+    if (excess <= 0) return 0;
+    const it = this._recordedTxSignatures.values();
+    for (let i = 0; i < excess; i++) {
+      this._recordedTxSignatures.delete(it.next().value);
     }
     return excess;
   }
