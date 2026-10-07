@@ -130,6 +130,59 @@ async function main() {
   fs.rmSync(dedupeDir, { recursive: true, force: true });
   delete process.env.ECONOMICS_MAX_FINANCIAL_DEDUPE_KEYS;
 
+  // ============ recordPayment() idempotency (FIX: real revenue source) ============
+  delete require.cache[require.resolve("../src/core/economicIntelligence")];
+  const EconomicIntelligenceForPayments = require("../src/core/economicIntelligence");
+  const paymentDir = fs.mkdtempSync(path.join(os.tmpdir(), "uda-payment-idempotency-"));
+  const econPayments = new EconomicIntelligenceForPayments({ persistDir: paymentDir });
+
+  const first = econPayments.recordPayment({
+    taskId: "task-A",
+    amountUsd: 5.5,
+    txSignature: "5sig...real-signature-1",
+    network: "solana",
+    token: "USDC",
+  });
+  assert.strictEqual(first.duplicate, undefined, "the first recording of a real payment must not be reported as a duplicate");
+  assert.strictEqual(econPayments.summary().totalConfirmedPaymentsUsd, 5.5);
+  assert.strictEqual(econPayments.summary().totalRevenueUsd, 0, "recordPayment must never touch totalRevenueUsd — that stays task_completed's field, kept separate on purpose");
+
+  // The watcher re-scans a rolling window every cycle — it WILL see this
+  // exact transaction again. Re-recording it must not double the total.
+  const duplicate = econPayments.recordPayment({
+    taskId: "task-A",
+    amountUsd: 5.5,
+    txSignature: "5sig...real-signature-1", // same signature — the real payment is the same one
+    network: "solana",
+    token: "USDC",
+  });
+  assert.strictEqual(duplicate.duplicate, true, "re-recording the same real transaction must be reported as a duplicate");
+  assert.strictEqual(
+    econPayments.summary().totalConfirmedPaymentsUsd,
+    5.5,
+    "a duplicate recording of the same real transaction must NOT be double-counted"
+  );
+
+  // A genuinely different payment (different signature) must still count.
+  econPayments.recordPayment({ taskId: "task-B", amountUsd: 2.25, txSignature: "5sig...real-signature-2", network: "base", token: "USDC" });
+  assert.strictEqual(econPayments.summary().totalConfirmedPaymentsUsd, 7.75, "a genuinely different payment must be counted normally");
+
+  // Idempotency must survive a restart too — not just hold in one process's memory.
+  const econPaymentsReloaded = new EconomicIntelligenceForPayments({ persistDir: paymentDir });
+  const dupeAfterRestart = econPaymentsReloaded.recordPayment({
+    taskId: "task-A",
+    amountUsd: 5.5,
+    txSignature: "5sig...real-signature-1",
+  });
+  assert.strictEqual(dupeAfterRestart.duplicate, true, "idempotency must hold across a restart, not just in-memory");
+  assert.strictEqual(econPaymentsReloaded.summary().totalConfirmedPaymentsUsd, 7.75);
+
+  assert.throws(() => econPaymentsReloaded.recordPayment({ amountUsd: 1, txSignature: "" }), /txSignature is required/);
+  assert.throws(() => econPaymentsReloaded.recordPayment({ amountUsd: -1, txSignature: "x" }), /must be a positive number/);
+  console.log("PASS: recordPayment() is idempotent by real transaction signature, survives restarts, and never inflates totalRevenueUsd directly");
+
+  fs.rmSync(paymentDir, { recursive: true, force: true });
+
   fs.rmSync(dir, { recursive: true, force: true });
 }
 
