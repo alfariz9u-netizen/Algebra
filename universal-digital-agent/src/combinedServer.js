@@ -66,6 +66,14 @@ const agentBazaarStrategy = require("./core/strategies/agentBazaar");
 // Render sets PORT itself; A2A_SERVER_PORT is honored too for parity with a2aServer.js run standalone.
 const PORT = Number(process.env.PORT || process.env.A2A_SERVER_PORT || 8787);
 const CYCLE_MS = Number(process.env.MARKETPLACE_CYCLE_MS || 30 * 60 * 1000);
+// Real revenue confirmation (see paymentWatcher.js and
+// economicIntelligence.recordPayment()). Every 5 minutes by default — far
+// more frequent than the 24h lookback window that gets re-scanned each
+// time, so a payment is confirmed in the dashboard well before the day's
+// window would otherwise roll past it. recordPayment()'s own
+// txSignature-based idempotency is what makes the repeated re-scanning
+// safe (see the tests in payment_watcher.test.js).
+const PAYMENT_WATCH_CYCLE_MS = Number(process.env.PAYMENT_WATCH_CYCLE_MS || 5 * 60 * 1000);
 
 // moltbookStrategy is appended last: it is pure reputation-building
 // (rewardUsd=0, reputationValue>0), so it should not displace or delay
@@ -118,6 +126,37 @@ function startMarketplaceScheduler(agent) {
   const timer = setInterval(() => {
     runOneRound().catch((err) => console.error("marketplace scheduler round failed:", err.message));
   }, CYCLE_MS);
+  return () => clearInterval(timer);
+}
+
+/**
+ * Starts the real-payment confirmation loop. Only actually scans a
+ * network once a wallet address is configured for it
+ * (PAYMENT_WALLET_SOLANA / PAYMENT_WALLET_BASE) — with neither set, this
+ * runs every cycle, finds nothing to scan, and is a no-op, so it's always
+ * safe to start. Never throws into the caller — a real RPC outage or
+ * misconfiguration is logged and retried next cycle, not fatal to the
+ * rest of the server.
+ */
+function startPaymentWatcher(agent) {
+  const { runPaymentWatchCycle } = require("./core/paymentWatcher");
+
+  async function runOneCycle() {
+    const result = await runPaymentWatchCycle(agent.economics);
+    if (result.scanned.length === 0) return; // no wallet configured — nothing to do, no need to log every 5 minutes
+    for (const s of result.scanned) {
+      console.log(`[paymentWatcher] ${s.network} (${s.walletAddress}): found ${s.found} transfer(s) in the lookback window.`);
+    }
+    if (result.recorded > 0) console.log(`[paymentWatcher] recorded ${result.recorded} new confirmed payment(s).`);
+    for (const e of result.errors) {
+      console.error(`[paymentWatcher] ${e.network} scan failed (will retry next cycle): ${e.error}`);
+    }
+  }
+
+  runOneCycle().catch((err) => console.error("[paymentWatcher] initial cycle failed:", err.message));
+  const timer = setInterval(() => {
+    runOneCycle().catch((err) => console.error("[paymentWatcher] cycle failed:", err.message));
+  }, PAYMENT_WATCH_CYCLE_MS);
   return () => clearInterval(timer);
 }
 
@@ -175,10 +214,12 @@ function main() {
 
   const bot = startTelegramBot();
   const stopScheduler = startMarketplaceScheduler(agent);
+  const stopPaymentWatcher = startPaymentWatcher(agent);
 
   const shutdown = (signal) => {
     console.log(`${signal} received, shutting down.`);
     stopScheduler();
+    stopPaymentWatcher();
     if (bot) bot.stop();
     server.close(() => process.exit(0));
     // Force-exit if something (e.g. the Telegram long-poll's in-flight request) keeps the event loop alive.
@@ -190,4 +231,4 @@ function main() {
 
 if (require.main === module) main();
 
-module.exports = { main, startMarketplaceScheduler, startTelegramBot };
+module.exports = { main, startMarketplaceScheduler, startTelegramBot, startPaymentWatcher };
