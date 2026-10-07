@@ -521,15 +521,30 @@ class TelegramApprovalBot {
             strategy.submitPermission,
             () => strategy.submit(connector, raw, result.output)
           );
+          // FIX (fake profit): this used to record `revenueUsd:
+          // raw.reward_usd ?? raw.budget_usdc ?? 0` the INSTANT a bid was
+          // submitted — before the platform ever accepted it, before the
+          // work was verified, before any money actually moved. That's
+          // not revenue, it's a hope. totalRevenueUsd/totalProfitUsd in
+          // economicIntelligence.summary() were counting unearned,
+          // unconfirmed amounts as if they were real income. Real revenue
+          // now comes ONLY from confirmed on-chain payments via
+          // economics.recordPayment() (see paymentWatcher.js) — this just
+          // records the expected amount for later comparison/reporting,
+          // with revenueUsd explicitly 0 so it can never inflate the real
+          // totals. taskId enables the idempotent-recording guarantee
+          // already built into record().
           agent.economics.record({
             type: "task_completed",
+            taskId: raw.id,
             connector: strategy.connectorName,
-            revenueUsd: raw.reward_usd ?? raw.budget_usdc ?? 0,
+            revenueUsd: 0,
+            expectedRevenueUsd: raw.reward_usd ?? raw.budget_usdc ?? 0,
             costUsd: 0,
           });
           await this._send(chatId, `📤 Submitted to ${strategy.connectorName} for opportunity <code>${escapeHtml(String(raw.id))}</code>.`);
         } catch (submitErr) {
-          agent.economics.record({ type: "task_failed", connector: strategy.connectorName });
+          agent.economics.record({ type: "task_failed", taskId: raw.id, connector: strategy.connectorName });
           await this._send(chatId, `⚠️ Drafted OK but submitting to ${strategy.connectorName} failed: ${escapeHtml(submitErr.message)}`);
         }
       }
