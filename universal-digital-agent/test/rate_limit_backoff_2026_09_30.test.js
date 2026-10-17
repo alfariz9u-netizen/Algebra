@@ -82,6 +82,14 @@ test("REAL BUG (production evidence 2026-09-30): a 429 from Moltbook's auto-post
   const UA = require("../src/core/universalAgent");
   const agent = new UA({ persistDir: tmpDir });
 
+  // Post text is LLM-written now; stub the router so the test stays offline.
+  agent.modelRouter.generate = async () => ({
+    text: JSON.stringify({
+      title: "Why I stopped trusting github estimates when scoping work",
+      body: Array.from({ length: 100 }, (_, i) => `word${i}`).join(" "),
+    }),
+  });
+
   let createPostCalls = 0;
   const fakeMoltbook = {
     status: () => "CONNECTED",
