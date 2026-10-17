@@ -62,10 +62,20 @@ class AgencAdapter {
       throw new Error(`AgenC read API request failed: ${response.status} ${response.statusText}`);
     }
     const data = await response.json();
-    const tasks = data.tasks || data || [];
+    // The API has returned an array, {tasks}, {items} and {data}; an object
+    // without a list (e.g. an error body) used to crash with "tasks.map is not
+    // a function". Anything unrecognized now yields [] plus a warning.
+    const rawTasks = Array.isArray(data) ? data
+      : Array.isArray(data?.tasks) ? data.tasks
+      : Array.isArray(data?.items) ? data.items
+      : Array.isArray(data?.data) ? data.data
+      : [];
+    if (rawTasks.length === 0 && data && typeof data === "object") {
+      console.warn(`[agenc] unexpected response: ${Object.keys(data).join(",")}`);
+    }
 
     // Map AgenC's on-chain task shape onto this platform's internal task shape.
-    return tasks.map((onChainTask) => ({
+    return rawTasks.map((onChainTask) => ({
       id: onChainTask.taskId || onChainTask.id,
       type: onChainTask.taskType || "business_automation",
       clientLocale: "en-US",
