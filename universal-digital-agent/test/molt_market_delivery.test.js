@@ -27,10 +27,22 @@ function createFixtureServer(port) {
         res.end(JSON.stringify({ id: "job-77", title: "Summarize quarterly report", description: "Please summarize the attached quarterly report.", category: "documentProcessing", budget_usdc: 0.2 }));
         return;
       }
-      if (req.url === "/jobs/job-77/deliver" && req.method === "POST") {
+      if (req.url === "/jobs/job-77/deliveries" && req.method === "POST") {
         const parsed = JSON.parse(body);
         res.writeHead(201);
         res.end(JSON.stringify({ id: "delivery-1", job_id: "job-77", content: parsed.content, status: "submitted" }));
+        return;
+      }
+      // The Colony connector now exchanges the API key for a JWT and resolves
+      // colony names to UUIDs before posting.
+      if (req.url === "/auth/token" && req.method === "POST") {
+        res.writeHead(200);
+        res.end(JSON.stringify({ access_token: "fixture-jwt" }));
+        return;
+      }
+      if (req.url === "/colonies" && req.method === "GET") {
+        res.writeHead(200);
+        res.end(JSON.stringify([{ id: "11111111-1111-4111-8111-111111111111", name: "general", slug: "general" }]));
         return;
       }
       if (req.url === "/posts" && req.method === "POST") {
