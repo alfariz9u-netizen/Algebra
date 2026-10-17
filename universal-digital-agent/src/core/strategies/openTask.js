@@ -23,6 +23,41 @@ const DEFAULT_ETA_DAYS = Number(process.env.OPENTASK_DEFAULT_ETA_DAYS || 1);
 // Session-lifetime de-dupe (resets on redeploy).
 const _attemptedTaskIds = new Set();
 
+// 409-loop guard (production evidence: the same task failed with a 409 every
+// 30-minute cycle, forever, doing withdraw + resubmit each time).
+//   _permanentFailedIds: taskId -> timestamp (ms) it was blocked at.
+//   _submitAttempts:     taskId -> consecutive failed submit() count.
+// A task is blocked after MAX_SUBMIT_ATTEMPTS failures and released again
+// after PERMANENT_BLOCK_MS. Both maps are in-memory (reset on redeploy).
+const _permanentFailedIds = new Map();
+const _submitAttempts = new Map();
+const PERMANENT_BLOCK_MS = Number(process.env.OPENTASK_PERMANENT_BLOCK_MS || 24 * 60 * 60 * 1000);
+const MAX_SUBMIT_ATTEMPTS = Number(process.env.OPENTASK_MAX_SUBMIT_ATTEMPTS || 3);
+// OpenTask needs a moment between withdrawing a bid and accepting a new one
+// for the same task; resubmitting instantly can 409 again. Read at call time.
+const replaceDelayMs = () => Number(process.env.OPENTASK_REPLACE_DELAY_MS ?? 2500);
+
+/** True while the task is blocked. An expired block is lifted (and its attempt counter reset). */
+function isPermanentlyBlocked(taskId) {
+  const blockedAt = _permanentFailedIds.get(taskId);
+  if (blockedAt === undefined) return false;
+  if (Date.now() - blockedAt >= PERMANENT_BLOCK_MS) {
+    _permanentFailedIds.delete(taskId);
+    _submitAttempts.delete(taskId);
+    return false;
+  }
+  return true;
+}
+
+function recordSubmitFailure(taskId) {
+  const attempts = (_submitAttempts.get(taskId) || 0) + 1;
+  _submitAttempts.set(taskId, attempts);
+  if (attempts >= MAX_SUBMIT_ATTEMPTS) {
+    _permanentFailedIds.set(taskId, Date.now());
+    console.log(`[openTask] task ${taskId} blocked permanently after ${attempts} attempts`);
+  }
+}
+
 function extractReward(raw) {
   if (typeof raw.budgetAmount === "string" || typeof raw.budgetAmount === "number") {
     const n = parseFloat(raw.budgetAmount);
@@ -102,6 +137,7 @@ async function replaceActiveBid(connector, taskId, newPayload) {
     return connector.submitBid(taskId, newPayload);
   }
   await connector.withdrawBid(existing.id);
+  await new Promise((r) => setTimeout(r, replaceDelayMs()));
   return connector.submitBid(taskId, newPayload);
 }
 
@@ -113,7 +149,16 @@ const openTaskStrategy = {
   discover: async (connector) => {
     const data = await connector.discoverTasks({ status: "open" });
     const tasks = Array.isArray(data) ? data : data.tasks || data.results || [];
-    return tasks.filter((task) => task && task.id && !_attemptedTaskIds.has(task.id));
+    // Lift every expired block first (not only for tasks still listed).
+    for (const id of [..._permanentFailedIds.keys()]) isPermanentlyBlocked(id);
+    return tasks.filter((task) => {
+      if (!task || !task.id || _attemptedTaskIds.has(task.id)) return false;
+      if (isPermanentlyBlocked(task.id)) {
+        console.log(`[openTask] task ${task.id} skipped: permanently blocked`);
+        return false;
+      }
+      return true;
+    });
   },
 
   toOpportunity: (raw) => {
@@ -161,82 +206,102 @@ const openTaskStrategy = {
   // error path below rethrows WITHOUT blacklisting, so the task is simply
   // reconsidered next cycle.
   submit: async (connector, raw, proposalText) => {
-    const reward = extractReward(raw);
-    if (!(typeof reward === "number" && reward >= MIN_REWARD_USD)) {
-      _attemptedTaskIds.add(raw.id); // permanent: no reward will appear on retry
-      throw new Error(
-        `Skipping bid on task ${raw.id}: no usable reward found (checked budgetAmount/budgetText/reward_usd, all missing or below the $${MIN_REWARD_USD} floor).`
-      );
+    // Blocked tasks fail fast, with no network request at all.
+    if (isPermanentlyBlocked(raw.id)) {
+      console.log(`[openTask] task ${raw.id} skipped: permanently blocked`);
+      throw new Error(`Task ${raw.id} skipped: permanently blocked after ${MAX_SUBMIT_ATTEMPTS} failed attempts`);
     }
-
-    const buildPayload = (snapshot) => ({
-      priceText: `${Math.round(reward * BID_RATIO * 100) / 100} ${snapshot.budgetCurrency || "USDC"}`,
-      etaDays: DEFAULT_ETA_DAYS,
-      approach: proposalText,
-      expectedTaskUpdatedAt: snapshot.updatedAt || snapshot.createdAt || new Date().toISOString(),
-    });
-
     try {
-      const result = await connector.submitBid(raw.id, buildPayload(raw));
-      _attemptedTaskIds.add(raw.id); // success: we now have a bid in
+      const result = await submitOnce(connector, raw, proposalText);
+      _submitAttempts.delete(raw.id); // success resets the counter
       return result;
     } catch (err) {
-      const kind = classify409(err);
-
-      // ---- Case 1: an active bid already exists → withdraw + resubmit ----
-      if (kind === "active_offer") {
-        console.warn(`[openTask] active bid conflict on ${raw.id} — withdrawing old bid and resubmitting.`);
-        try {
-          const result = await replaceActiveBid(connector, raw.id, buildPayload(raw));
-          _attemptedTaskIds.add(raw.id); // success
-          return result;
-        } catch (replaceErr) {
-          throw new Error(`Task ${raw.id}: could not replace active bid: ${replaceErr.message}`);
-        }
-      }
-
-      // ---- Case 2: the task itself changed → reload once, retry once ----
-      if (kind === "scope_change") {
-        console.warn(`[openTask] 409 scope change on ${raw.id} — reloading task and retrying once with fresh updatedAt.`);
-
-        let fresh;
-        try {
-          fresh = await connector.getTask(raw.id);
-        } catch (reloadErr) {
-          throw new Error(`Task ${raw.id} scope changed; reload failed: ${reloadErr.message}`);
-        }
-
-        const freshTask = fresh?.task || fresh?.data || fresh;
-
-        try {
-          const result = await connector.submitBid(freshTask.id, buildPayload(freshTask));
-          _attemptedTaskIds.add(raw.id); // success
-          return result;
-        } catch (retryErr) {
-          // If the retry failed because we now have an active bid (the task
-          // changed between discovery and reload in a way that revealed an
-          // existing offer), do the withdraw+resubmit dance once.
-          if (classify409(retryErr) === "active_offer") {
-            try {
-              const result = await replaceActiveBid(connector, freshTask.id, buildPayload(freshTask));
-              _attemptedTaskIds.add(raw.id); // success
-              return result;
-            } catch (replaceErr2) {
-              throw new Error(`Task ${raw.id}: scope changed, then active-bid replace failed: ${replaceErr2.message}`);
-            }
-          }
-          throw new Error(`Task ${raw.id} scope changed twice (retry also failed): ${retryErr.message}`);
-        }
-      }
-
-      // ---- Any other error (network blip, 5xx, timeout): NOT permanent.
-      // Rethrown as-is and left to marketplacePipeline.js's learningEngine
-      // circuit breaker, which classifies retryable vs. non-retryable
-      // failures properly — this strategy no longer overrides that with a
-      // blunt, permanent, un-logged skip.
+      // "No usable reward" is already permanent via _attemptedTaskIds; don't double-count.
+      if (!_attemptedTaskIds.has(raw.id)) recordSubmitFailure(raw.id);
       throw err;
     }
   },
 };
+
+// Original submit logic, unchanged apart from being a standalone function.
+async function submitOnce(connector, raw, proposalText) {
+  const reward = extractReward(raw);
+  if (!(typeof reward === "number" && reward >= MIN_REWARD_USD)) {
+    _attemptedTaskIds.add(raw.id); // permanent: no reward will appear on retry
+    throw new Error(
+      `Skipping bid on task ${raw.id}: no usable reward found (checked budgetAmount/budgetText/reward_usd, all missing or below the $${MIN_REWARD_USD} floor).`
+    );
+  }
+
+  const buildPayload = (snapshot) => ({
+    priceText: `${Math.round(reward * BID_RATIO * 100) / 100} ${snapshot.budgetCurrency || "USDC"}`,
+    etaDays: DEFAULT_ETA_DAYS,
+    approach: proposalText,
+    expectedTaskUpdatedAt: snapshot.updatedAt || snapshot.createdAt || new Date().toISOString(),
+  });
+
+  try {
+    const result = await connector.submitBid(raw.id, buildPayload(raw));
+    _attemptedTaskIds.add(raw.id); // success: we now have a bid in
+    return result;
+  } catch (err) {
+    const kind = classify409(err);
+
+    // ---- Case 1: an active bid already exists → withdraw + resubmit ----
+    if (kind === "active_offer") {
+      console.warn(`[openTask] active bid conflict on ${raw.id} — withdrawing old bid and resubmitting.`);
+      try {
+        const result = await replaceActiveBid(connector, raw.id, buildPayload(raw));
+        _attemptedTaskIds.add(raw.id); // success
+        return result;
+      } catch (replaceErr) {
+        throw new Error(`Task ${raw.id}: could not replace active bid: ${replaceErr.message}`);
+      }
+    }
+
+    // ---- Case 2: the task itself changed → reload once, retry once ----
+    if (kind === "scope_change") {
+      console.warn(`[openTask] 409 scope change on ${raw.id} — reloading task and retrying once with fresh updatedAt.`);
+
+      let fresh;
+      try {
+        fresh = await connector.getTask(raw.id);
+      } catch (reloadErr) {
+        throw new Error(`Task ${raw.id} scope changed; reload failed: ${reloadErr.message}`);
+      }
+
+      const freshTask = fresh?.task || fresh?.data || fresh;
+
+      try {
+        const result = await connector.submitBid(freshTask.id, buildPayload(freshTask));
+        _attemptedTaskIds.add(raw.id); // success
+        return result;
+      } catch (retryErr) {
+        // If the retry failed because we now have an active bid (the task
+        // changed between discovery and reload in a way that revealed an
+        // existing offer), do the withdraw+resubmit dance once.
+        if (classify409(retryErr) === "active_offer") {
+          try {
+            const result = await replaceActiveBid(connector, freshTask.id, buildPayload(freshTask));
+            _attemptedTaskIds.add(raw.id); // success
+            return result;
+          } catch (replaceErr2) {
+            throw new Error(`Task ${raw.id}: scope changed, then active-bid replace failed: ${replaceErr2.message}`);
+          }
+        }
+        throw new Error(`Task ${raw.id} scope changed twice (retry also failed): ${retryErr.message}`);
+      }
+    }
+
+    // ---- Any other error (network blip, 5xx, timeout): NOT permanent.
+    // Rethrown as-is and left to marketplacePipeline.js's learningEngine
+    // circuit breaker, which classifies retryable vs. non-retryable
+    // failures properly — this strategy no longer overrides that with a
+    // blunt, permanent, un-logged skip.
+    throw err;
+  }
+}
+
+Object.assign(openTaskStrategy, { _permanentFailedIds, _submitAttempts, _attemptedTaskIds });
 
 module.exports = openTaskStrategy;
