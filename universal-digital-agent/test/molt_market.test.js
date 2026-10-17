@@ -29,8 +29,8 @@ function createMoltFixtureServer(port) {
         res.end(JSON.stringify({ id: "offer-2", title: parsed.title, version: 1 }));
         return;
       }
-      if (req.url.includes("/purchase") && req.method === "POST") {
-        // Simulating the platform's real fail-closed behavior: settlement disabled.
+      if (req.url === "/jobs/job-poor/bids" && req.method === "POST") {
+        // Simulating the platform's fail-closed behavior: settlement disabled.
         res.writeHead(402);
         res.end(JSON.stringify({ error: "insufficient internal cash" }));
         return;
@@ -41,7 +41,7 @@ function createMoltFixtureServer(port) {
         res.end(JSON.stringify({ id: "job-1", title: parsed.title, status: "open", funded: false }));
         return;
       }
-      if (req.url.match(/\/jobs\/job-1\/bid$/) && req.method === "POST") {
+      if (req.url.match(/\/jobs\/job-1\/bids$/) && req.method === "POST") {
         res.writeHead(201);
         res.end(JSON.stringify({ id: "bid-1", job_id: "job-1", status: "pending" }));
         return;
@@ -62,27 +62,23 @@ async function main() {
   const MoltMarketConnector = require("../src/connectors/moltMarket");
 
   try {
-    // Before registering, status must be honest: CREDENTIAL_REQUIRED.
+    // Without an API key, status must be honest: CREDENTIAL_REQUIRED.
+    delete process.env.MOLTMARKET_API_KEY;
     const connector = new MoltMarketConnector();
     assert.strictEqual(connector.status(), "CREDENTIAL_REQUIRED");
     console.log("PASS: status is CREDENTIAL_REQUIRED with no API key");
+    await assert.rejects(() => connector.checkHealth(), /MOLTMARKET_API_KEY is not set/);
+    console.log("PASS: requests without a key fail locally instead of going out unauthenticated");
 
-    const health = await connector.checkHealth();
-    assert.strictEqual(health.financial.ready, false);
-    console.log("PASS: /health correctly reports settlement is not yet enabled (fail-closed, not faked)");
-
-    const registration = await MoltMarketConnector.register({ name: "TestAgent", skills: ["research"] });
-    assert.strictEqual(registration.api_key, "molt_testkey123");
-    process.env.MOLTMARKET_API_KEY = registration.api_key;
-    console.log("PASS: register() parses the real documented response shape");
-
+    process.env.MOLTMARKET_API_KEY = "molt_testkey123";
     const authedConnector = new MoltMarketConnector();
     assert.strictEqual(authedConnector.status(), "CONNECTED");
     console.log("PASS: status becomes CONNECTED once an API key is present");
 
+    // checkHealth() probes GET /jobs (there is no /health endpoint on the connector).
     const offers = await authedConnector.browseOffers({ category: "research" });
     assert.ok(offers.offers.length > 0);
-    console.log("PASS: browseOffers() works with no auth, matching the real public endpoint");
+    console.log("PASS: browseOffers() returns the offers list");
 
     const published = await authedConnector.publishOffer({
       title: "Write unit tests",
@@ -94,17 +90,12 @@ async function main() {
     assert.strictEqual(published.title, "Write unit tests");
     console.log("PASS: publishOffer() sends the documented POST /offers shape");
 
-    // The platform's own docs say purchases can fail closed (402) while
-    // settlement is disabled — this must surface as a real error, not success.
-    let threw = false;
-    try {
-      await authedConnector.purchaseOffer("offer-1", { expectedVersion: 1, brief: "test", idempotencyKey: "test-key-1" });
-    } catch (err) {
-      threw = true;
-      assert.ok(err.message.includes("insufficient internal cash"));
-    }
-    assert.ok(threw, "purchaseOffer should throw a real error on 402, not fake success");
-    console.log("PASS: a real 402 (settlement disabled) surfaces as an honest failure, never a fake success");
+    // A real 402 must surface as an honest error (with status + body), never a fake success.
+    await assert.rejects(
+      () => authedConnector.bidOnJob("job-poor", { amountUsdc: 1, message: "x" }),
+      (err) => err.status === 402 && JSON.stringify(err.body).includes("insufficient internal cash")
+    );
+    console.log("PASS: a real 402 surfaces as an honest failure, never a fake success");
 
     const job = await authedConnector.createJob({
       title: "Write unit tests",
@@ -118,7 +109,7 @@ async function main() {
 
     const bid = await authedConnector.bidOnJob("job-1", { amountUsdc: 0.05, message: "I can do this" });
     assert.strictEqual(bid.job_id, "job-1");
-    console.log("PASS: bidOnJob() sends the documented POST /jobs/:id/bid shape");
+    console.log("PASS: bidOnJob() sends POST /jobs/:id/bids");
   } finally {
     server.close();
   }
