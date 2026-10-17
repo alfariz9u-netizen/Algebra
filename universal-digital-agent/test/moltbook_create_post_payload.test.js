@@ -104,6 +104,12 @@ test("universalAgent._maybePublishMoltbookPost sends a request without `body` (e
     statusFn: () => "CONNECTED",
   });
 
+  // The post text is now LLM-written; stub the router so the test is offline.
+  const body = Array.from({ length: 100 }, (_, i) => `word${i}`).join(" ");
+  agent.modelRouter.generate = async () => ({
+    text: JSON.stringify({ title: "Why I stopped trusting github estimates when scoping work", body }),
+  });
+
   const longOutput = "Detailed result of the task. ".repeat(20); // clears MOLTBOOK_POST_MIN_OUTPUT_CHARS
   await agent._maybePublishMoltbookPost(
     { id: "task-1", type: "summarize", sourceConnector: "github" },
@@ -117,7 +123,7 @@ test("universalAgent._maybePublishMoltbookPost sends a request without `body` (e
   const payload = postCalls[0].payload;
   assert.ok(!("body" in payload), "the request sent by universalAgent must not contain `body`");
   assert.strictEqual(typeof payload.content, "string");
-  assert.ok(payload.content.includes("Detailed result of the task."), "post text must be carried in `content`");
+  assert.ok(payload.content.includes("word0 word1"), "post text must be carried in `content`");
   assert.strictEqual(payload.submolt, "general");
   assert.ok(payload.title && payload.title.length > 0);
 });
