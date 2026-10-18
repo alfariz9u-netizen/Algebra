@@ -31,11 +31,21 @@ const _attemptedTaskIds = new Set();
 // after PERMANENT_BLOCK_MS. Both maps are in-memory (reset on redeploy).
 const _permanentFailedIds = new Map();
 const _submitAttempts = new Map();
-const PERMANENT_BLOCK_MS = Number(process.env.OPENTASK_PERMANENT_BLOCK_MS || 24 * 60 * 60 * 1000);
-const MAX_SUBMIT_ATTEMPTS = Number(process.env.OPENTASK_MAX_SUBMIT_ATTEMPTS || 3);
+// A typo'd env value (NaN) would silently disable the guard (attempts >= NaN
+// is never true), so invalid or non-positive values fall back to the default.
+const positiveNumber = (raw, fallback) => (Number.isFinite(Number(raw)) && Number(raw) > 0 ? Number(raw) : fallback);
+const PERMANENT_BLOCK_MS = positiveNumber(process.env.OPENTASK_PERMANENT_BLOCK_MS, 24 * 60 * 60 * 1000);
+const MAX_SUBMIT_ATTEMPTS = positiveNumber(process.env.OPENTASK_MAX_SUBMIT_ATTEMPTS, 3);
+// taskId -> time of the last failed submit. Failures older than
+// PERMANENT_BLOCK_MS stop counting, so "consecutive" really means recent and
+// the counter map can't grow forever with one-off failures.
+const _lastFailureAt = new Map();
 // OpenTask needs a moment between withdrawing a bid and accepting a new one
 // for the same task; resubmitting instantly can 409 again. Read at call time.
-const replaceDelayMs = () => Number(process.env.OPENTASK_REPLACE_DELAY_MS ?? 2500);
+const replaceDelayMs = () => {
+  const n = Number(process.env.OPENTASK_REPLACE_DELAY_MS ?? 2500);
+  return Number.isFinite(n) && n >= 0 ? n : 2500;
+};
 
 /** True while the task is blocked. An expired block is lifted (and its attempt counter reset). */
 function isPermanentlyBlocked(taskId) {
@@ -44,14 +54,28 @@ function isPermanentlyBlocked(taskId) {
   if (Date.now() - blockedAt >= PERMANENT_BLOCK_MS) {
     _permanentFailedIds.delete(taskId);
     _submitAttempts.delete(taskId);
+    _lastFailureAt.delete(taskId);
     return false;
   }
   return true;
 }
 
+/** Drops attempt counters whose last failure is older than the block window. */
+function pruneStaleAttempts() {
+  const now = Date.now();
+  for (const [id, at] of [..._lastFailureAt]) {
+    if (now - at >= PERMANENT_BLOCK_MS && !_permanentFailedIds.has(id)) {
+      _lastFailureAt.delete(id);
+      _submitAttempts.delete(id);
+    }
+  }
+}
+
 function recordSubmitFailure(taskId) {
+  pruneStaleAttempts();
   const attempts = (_submitAttempts.get(taskId) || 0) + 1;
   _submitAttempts.set(taskId, attempts);
+  _lastFailureAt.set(taskId, Date.now());
   if (attempts >= MAX_SUBMIT_ATTEMPTS) {
     _permanentFailedIds.set(taskId, Date.now());
     console.log(`[openTask] task ${taskId} blocked permanently after ${attempts} attempts`);
@@ -138,7 +162,30 @@ async function replaceActiveBid(connector, taskId, newPayload) {
   }
   await connector.withdrawBid(existing.id);
   await new Promise((r) => setTimeout(r, replaceDelayMs()));
-  return connector.submitBid(taskId, newPayload);
+  try {
+    return await connector.submitBid(taskId, newPayload);
+  } catch (err) {
+    // The old bid is already withdrawn. Left as-is, a persistent 409 here
+    // meant every cycle destroyed our live bid and replaced it with nothing.
+    // Best effort: put the previous terms back before reporting the failure.
+    const prev = {
+      priceText: existing.priceText || existing.price_text,
+      etaDays: existing.etaDays || existing.eta_days,
+      approach: existing.approach,
+      expectedTaskUpdatedAt: newPayload.expectedTaskUpdatedAt,
+    };
+    if (prev.priceText && prev.approach) {
+      try {
+        await connector.submitBid(taskId, prev);
+        console.warn(`[openTask] resubmit failed on ${taskId}; previous bid restored.`);
+      } catch (restoreErr) {
+        console.warn(`[openTask] resubmit failed on ${taskId} and the previous bid could NOT be restored: ${restoreErr.message}`);
+      }
+    } else {
+      console.warn(`[openTask] resubmit failed on ${taskId}; previous bid terms unknown, so it was not restored.`);
+    }
+    throw err;
+  }
 }
 
 const openTaskStrategy = {
@@ -151,6 +198,7 @@ const openTaskStrategy = {
     const tasks = Array.isArray(data) ? data : data.tasks || data.results || [];
     // Lift every expired block first (not only for tasks still listed).
     for (const id of [..._permanentFailedIds.keys()]) isPermanentlyBlocked(id);
+    pruneStaleAttempts();
     return tasks.filter((task) => {
       if (!task || !task.id || _attemptedTaskIds.has(task.id)) return false;
       if (isPermanentlyBlocked(task.id)) {
@@ -214,6 +262,7 @@ const openTaskStrategy = {
     try {
       const result = await submitOnce(connector, raw, proposalText);
       _submitAttempts.delete(raw.id); // success resets the counter
+      _lastFailureAt.delete(raw.id);
       return result;
     } catch (err) {
       // "No usable reward" is already permanent via _attemptedTaskIds; don't double-count.
@@ -270,7 +319,9 @@ async function submitOnce(connector, raw, proposalText) {
         throw new Error(`Task ${raw.id} scope changed; reload failed: ${reloadErr.message}`);
       }
 
-      const freshTask = fresh?.task || fresh?.data || fresh;
+      // Always target the task we were asked about: a reload body without an
+      // id used to produce POST /tasks/undefined/bids.
+      const freshTask = { ...(fresh?.task || fresh?.data || fresh), id: raw.id };
 
       try {
         const result = await connector.submitBid(freshTask.id, buildPayload(freshTask));
@@ -302,6 +353,6 @@ async function submitOnce(connector, raw, proposalText) {
   }
 }
 
-Object.assign(openTaskStrategy, { _permanentFailedIds, _submitAttempts, _attemptedTaskIds });
+Object.assign(openTaskStrategy, { _permanentFailedIds, _submitAttempts, _attemptedTaskIds, _lastFailureAt });
 
 module.exports = openTaskStrategy;
