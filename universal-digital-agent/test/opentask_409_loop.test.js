@@ -34,6 +34,7 @@ beforeEach(() => {
   strategy._permanentFailedIds.clear();
   strategy._submitAttempts.clear();
   strategy._attemptedTaskIds.clear();
+  strategy._lastFailureAt.clear();
 });
 
 test("3 failed attempts block the task; the 4th is skipped with NO network request", async () => {
@@ -106,4 +107,50 @@ test("replaceActiveBid waits between withdrawBid and submitBid", async () => {
   }
   assert.deepStrictEqual(order, ["submit", "withdraw", "submit"]);
   assert.ok(times.submit - times.withdraw >= 45, "delay between withdraw and resubmit");
+});
+
+test("a failed resubmit after withdraw restores the previous bid instead of leaving none", async () => {
+  const submits = [];
+  const c = {
+    submitBid: async (id, payload) => {
+      submits.push(payload);
+      if (submits.length <= 2) throw new Error("409 you already have an active bid, update it instead");
+      return { restored: true };
+    },
+    getMyActiveBids: async () => [{ id: "b1", taskId: "t-restore", priceText: "9 USDC", etaDays: 2, approach: "old approach" }],
+    withdrawBid: async () => {},
+  };
+  await assert.rejects(() => strategy.submit(c, raw("t-restore"), "new approach"), /409/);
+  assert.strictEqual(submits.length, 3, "initial, failed resubmit, restore");
+  assert.strictEqual(submits[2].approach, "old approach");
+  assert.strictEqual(submits[2].priceText, "9 USDC");
+});
+
+test("scope-change reload without an id still bids on the original task id", async () => {
+  const urls = [];
+  const c = {
+    submitBid: async (id) => {
+      urls.push(id);
+      if (urls.length === 1) throw new Error("409 bid_task_scope_changed");
+      return { ok: true };
+    },
+    getTask: async () => ({ updatedAt: "2026-10-02T00:00:00Z" }), // no id field
+  };
+  await strategy.submit(c, raw("t-scope"), "p");
+  assert.deepStrictEqual(urls, ["t-scope", "t-scope"]);
+});
+
+test("old failures stop counting after the block window (no slow drip into a block, no map leak)", async (t) => {
+  const c = failingConnector();
+  const start = Date.now();
+  let offset = 0;
+  t.mock.method(Date, "now", () => start + offset);
+
+  await assert.rejects(() => strategy.submit(c, raw("drip"), "p"));
+  await assert.rejects(() => strategy.submit(c, raw("drip"), "p"));
+  offset = DAY + 1000;
+  await strategy.discover(c); // prunes stale counters
+  assert.ok(!strategy._submitAttempts.has("drip"));
+  await assert.rejects(() => strategy.submit(c, raw("drip"), "p"));
+  assert.ok(!strategy._permanentFailedIds.has("drip"), "1 recent failure, not 3");
 });
