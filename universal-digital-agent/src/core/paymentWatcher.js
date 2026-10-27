@@ -265,7 +265,8 @@ async function runPaymentWatchCycle(economics, { fetchImpl = fetch, lookbackHour
       const payments = await scanWalletForPayments({ network, walletAddress, lookbackHours, fetchImpl });
       for (const p of payments) {
         const outcome = economics.recordPayment({
-          taskId: p.taskId,
+          // No memo on-chain (e.g. plain ERC-20 transfers): key the payment by its transaction so it is still counted exactly once.
+          taskId: p.taskId || `tx:${p.txSignature}`,
           amountUsd: p.amountUsd,
           txSignature: p.txSignature,
           network: p.network,
