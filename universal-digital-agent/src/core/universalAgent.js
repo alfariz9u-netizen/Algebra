@@ -19,6 +19,7 @@ const { classify } = require("./intentClassifier");
 const { CAPABILITIES } = require("../capabilities/definitions");
 const ApprovalQueue = require("./approvalQueue");
 const { parseJsonLoose } = require("./jsonExtract");
+const { SupabaseState, WriteBehindQueue } = require("./persistence/supabaseState");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
@@ -198,6 +199,64 @@ class UniversalAgent {
     this._approvedOverrides = new Set();
     this.autonomyLevel = currentLevel();
     this._moltbookPostState = loadMoltbookPostState();
+
+    // Durable state (Render's disk is ephemeral): economics, approvals, learning and the
+    // moltbook post state are mirrored to Supabase when SUPABASE_URL/SUPABASE_SERVICE_KEY
+    // are set, with the persistDir files as the fallback. Long-lived entry points `await
+    // agent.ready` once at startup to load Supabase's copy into memory (it also refreshes the
+    // local files); it never rejects, and without Supabase it is already resolved. It is lazy
+    // on purpose: short-lived helper agents (e.g. one per Telegram action) that never touch
+    // `ready` don't each re-download the whole history — they read the local files instead.
+    this._stateRemote = new SupabaseState();
+    this._moltbookQueue = new WriteBehindQueue({ label: "moltbook", reconcile: () => this._pushMoltbookState() });
+    this._readyPromise = null;
+  }
+
+  get ready() {
+    if (!this._readyPromise) this._readyPromise = this._initDurableState();
+    return this._readyPromise;
+  }
+
+  async _initDurableState() {
+    await Promise.all([this.economics.init(), this.approvals.init(), this.learning.init(), this._initMoltbookState()]);
+  }
+
+  /** Moltbook post state: union of local file + Supabase (latest lastPostAt, all title hashes). */
+  _initMoltbookState() {
+    if (!this._stateRemote.enabled) return Promise.resolve();
+    return this._moltbookQueue
+      .push(async () => {
+        const rows = await this._stateRemote.request("GET", "moltbook_state?key=eq.post_state&select=*");
+        const remote = Array.isArray(rows) && rows[0] ? rows[0].value || {} : null;
+        if (remote) {
+          const state = this._moltbookPostState;
+          state.lastPostAt = Math.max(state.lastPostAt || 0, Number(remote.lastPostAt) || 0);
+          for (const h of remote.publishedTitleHashes || []) state.titleHashes.add(h);
+          saveMoltbookPostState(state); // refresh the local fallback file too
+        }
+        await this._pushMoltbookState();
+      })
+      .then(() => undefined);
+  }
+
+  async _pushMoltbookState() {
+    const state = this._moltbookPostState;
+    await this._stateRemote.upsert(
+      "moltbook_state",
+      [{ key: "post_state", value: { lastPostAt: state.lastPostAt, publishedTitleHashes: [...state.titleHashes] }, updated_at: new Date().toISOString() }],
+      { onConflict: "key", mode: "merge" }
+    );
+  }
+
+  /** Local file (fallback) + Supabase mirror. Replaces the bare saveMoltbookPostState() calls. */
+  _saveMoltbookState() {
+    saveMoltbookPostState(this._moltbookPostState);
+    if (this._stateRemote.enabled) this._moltbookQueue.push(() => this._pushMoltbookState());
+  }
+
+  /** Resolves once queued Supabase writes (all four stores) have been attempted. */
+  async flushState() {
+    await Promise.all([this.economics.flush(), this.approvals.flush(), this.learning.flush(), this._moltbookQueue.flush()]);
   }
 
   authorizeTask(taskId, actions, { durationMs = 30 * 60 * 1000 } = {}) {
@@ -412,7 +471,9 @@ class UniversalAgent {
       taskId,
       model: generation.model,
       connector: task.sourceConnector,
-      revenueUsd: task.rewardUsd || 0,
+      // The reward is an expectation, not money received: only recordPayment() makes revenue.
+      revenueUsd: 0,
+      expectedRevenueUsd: task.rewardUsd || 0,
       costUsd: estimateCostUsd(generation.provider, generation.model, generation.usage, this.llmQuota),
     });
 
@@ -550,7 +611,7 @@ class UniversalAgent {
 
       this._moltbookPostState.lastPostAt = Date.now();
       this._moltbookPostState.titleHashes.add(titleShort);
-      saveMoltbookPostState(this._moltbookPostState);
+      this._saveMoltbookState();
 
       console.log(`[universalAgent] moltbook post published: "${title}"`);
 
@@ -572,7 +633,7 @@ class UniversalAgent {
       // ANY failure (not just success) is already more than sufficient;
       // no need to parse the exact retry-after value.
       this._moltbookPostState.lastPostAt = Date.now();
-      saveMoltbookPostState(this._moltbookPostState);
+      this._saveMoltbookState();
       console.warn(`[universalAgent] moltbook createPost failed: ${err.message}`);
       this.audit.record({
         agentId: this.agentId,
@@ -641,7 +702,11 @@ class UniversalAgent {
   }
 
   async resumeTask(approvalId) {
-    const record = this.approvals.get(approvalId);
+    let record = this.approvals.get(approvalId);
+    if (!record) {
+      await this.approvals.refresh(); // it may have been created by another process (Supabase)
+      record = this.approvals.get(approvalId);
+    }
     if (!record) throw new Error(`No approval request with id "${approvalId}".`);
 
     // FIX (approval replay / race condition — exactly what was asked to be
@@ -659,7 +724,9 @@ class UniversalAgent {
     const { ConflictError } = require("./approvalQueue");
     let claimed;
     try {
-      claimed = this.approvals.claim(approvalId, this.agentId);
+      // claimRemote(): the compare-and-swap runs in Supabase (UPDATE ... WHERE version = X) when
+      // configured, so it also holds across processes; otherwise it is the local claim().
+      claimed = await this.approvals.claimRemote(approvalId, this.agentId);
     } catch (err) {
       if (err instanceof ConflictError) {
         // Two genuinely different situations produce the same ConflictError
@@ -784,13 +851,17 @@ class UniversalAgent {
   }
 
   dashboard() {
+    const economics = this.economics.summary();
     return {
       agentId: this.agentId,
       persistDir: this.persistDir || null,
       autonomyLevel: this.autonomyLevel,
       killSwitch: this.killSwitch.status(),
       dailyTokenUsage: this.tokens.getDailyUsage(),
-      economics: this.economics.summary(),
+      economics,
+      totalExpectedRevenueUsd: economics.totalExpectedRevenueUsd,
+      totalActualRevenueUsd: economics.totalActualRevenueUsd,
+      pendingPaymentsUsd: economics.pendingPaymentsUsd,
       // Real remaining free-tier headroom for today (UTC), so an operator
       // can see "we're about to fall through to paid Grok" before it
       // happens, not just after the bill shows it. Infinity means this
