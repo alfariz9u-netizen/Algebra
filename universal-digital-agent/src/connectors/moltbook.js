@@ -19,7 +19,7 @@
  * unpublished.
  *
  * NOTE ON createPost:
- *   The endpoint is assumed to be POST /posts with { title, body, submolt }.
+ *   The endpoint is assumed to be POST /posts with { title, content, submolt }.
  *   This mirrors the shape documented by the community API reference for
  *   comments (POST /posts/:id/comments). If Moltbook's actual server
  *   rejects the field name (e.g. wants `colony` instead of `submolt`, or
@@ -262,7 +262,8 @@ class MoltbookConnector {
   // be here) that turned out wrong once actually tested against the live
   // API. Renamed end-to-end (parameter + wire field) to `content` to
   // match reality and to be consistent with commentOnPost's convention.
-  async createPost({ title, content, submolt = "general" } = {}) {
+  async createPost({ title, content, body, submolt = "general" } = {}) {
+    if (content === undefined && body !== undefined) content = body; // legacy callers passed `body`; the wire field is `content`
     if (!title || !title.trim()) throw new Error("Moltbook createPost: title is required.");
     if (!content || !content.trim()) throw new Error("Moltbook createPost: content is required.");
     const response = await fetch(`${API_BASE}/posts`, {
