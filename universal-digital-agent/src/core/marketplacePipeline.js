@@ -198,7 +198,7 @@ class MarketplacePipeline {
   async _processOpportunity(strategy, opportunity) {
     this.agent.economics.record({ type: "task_accepted", connector: strategy.connectorName, expectedValueUsd: opportunity.expectedValue });
 
-    const task = strategy.toTask(opportunity.raw);
+    const task = await strategy.toTask(opportunity.raw); // may be async (AgenC fetches the job spec)
     const outcome = await this.agent.processTask(task);
 
     if (outcome.status === "pending_human_approval") {
@@ -233,7 +233,8 @@ class MarketplacePipeline {
         type: "task_completed",
         connector: strategy.connectorName,
         model: outcome.meta?.model,
-        revenueUsd: opportunity.rewardUsd || 0,
+        revenueUsd: 0, // expectation only; real money is recorded by recordPayment()
+        expectedRevenueUsd: opportunity.rewardUsd || 0,
         costUsd: opportunity.estimatedModelCostUsd || 0,
       });
 
@@ -318,7 +319,8 @@ class MarketplacePipeline {
         type: "task_completed",
         connector: connectorName,
         model: outcome.meta?.model,
-        revenueUsd: job.budget_usdc || 0,
+        revenueUsd: 0,
+        expectedRevenueUsd: job.budget_usdc || 0,
         costUsd: 0,
       });
       const learning = await this._shareLearning(connectorName, task, outcome);
