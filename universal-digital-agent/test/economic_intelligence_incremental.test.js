@@ -16,13 +16,17 @@ function naiveSummary(events, rollup) {
   const cost = rollup.totalCostUsd + completed.reduce((s, e) => s + (e.costUsd || 0), 0);
   const expectedRevenue = (rollup.totalExpectedRevenueUsd || 0) + completed.reduce((s, e) => s + (e.expectedRevenueUsd || 0), 0);
   const confirmedPayments = (rollup.totalConfirmedPaymentsUsd || 0) + payments.reduce((s, e) => s + (e.amountUsd || 0), 0);
+  const r6 = (n) => Math.round(n * 1e6) / 1e6;
+  const total = r6(revenue + confirmedPayments); // real payments count as revenue
   return {
     countsByType: byType,
-    totalRevenueUsd: revenue,
+    totalRevenueUsd: total,
     totalCostUsd: cost,
-    totalProfitUsd: revenue - cost,
-    totalExpectedRevenueUsd: expectedRevenue,
-    totalConfirmedPaymentsUsd: confirmedPayments,
+    totalProfitUsd: r6(total - cost),
+    totalExpectedRevenueUsd: r6(expectedRevenue),
+    totalActualRevenueUsd: r6(confirmedPayments),
+    totalConfirmedPaymentsUsd: r6(confirmedPayments),
+    pendingPaymentsUsd: r6(Math.max(0, expectedRevenue - confirmedPayments)),
   };
 }
 
