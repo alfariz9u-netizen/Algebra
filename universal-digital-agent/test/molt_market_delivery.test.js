@@ -109,9 +109,11 @@ async function main() {
     assert.strictEqual(delivered.learning.shared, true);
     console.log("PASS: learning is shared to The Colony after a successful delivery");
 
-    const revenue = agent.economics.summary().totalRevenueUsd;
-    assert.strictEqual(revenue, 0.2);
-    console.log("PASS: economic intelligence records the real revenue from the job's budget");
+    const summary = agent.economics.summary();
+    assert.strictEqual(summary.totalExpectedRevenueUsd, 0.2);
+    assert.strictEqual(summary.totalActualRevenueUsd, 0, "delivery is not payment");
+    assert.strictEqual(summary.pendingPaymentsUsd, 0.2);
+    console.log("PASS: economic intelligence records the job's budget as expected (not received) revenue");
   } finally {
     server.close();
   }
