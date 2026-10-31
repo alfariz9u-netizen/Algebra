@@ -1,6 +1,7 @@
 "use strict";
 
 const { getSolUsdPrice } = require("../priceOracle");
+const AgencAdapter = require("../../connectors/agenc");
 
 /**
  * AgenC strategy for MarketplacePipeline. Unlike Molt Market's bid-first
@@ -17,6 +18,13 @@ const { getSolUsdPrice } = require("../priceOracle");
  */
 const LAMPORTS_PER_SOL = 1_000_000_000;
 
+// A task's reward is in `rewardMint` when that is set (null = SOL). Only mints whose USD value is
+// known without an oracle are priced; any other token is left unpriced rather than mis-read as SOL.
+const USD_STABLECOINS = {
+  EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v: 6, // USDC (mainnet)
+  Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB: 6, // USDT (mainnet)
+};
+
 const agencStrategy = {
   connectorName: "agenc",
 
@@ -25,18 +33,26 @@ const agencStrategy = {
   discover: async (connector) => connector.fetchIncomingTasks(),
 
   toOpportunity: async (raw) => {
-    const rewardSol = raw.input?.rewardLamports ? raw.input.rewardLamports / LAMPORTS_PER_SOL : null;
+    // `rewardLamports` arrives as a decimal STRING (can exceed 2^53 for large token amounts).
+    const amount = Number(raw.input?.rewardLamports);
+    const hasReward = Number.isFinite(amount) && amount > 0;
+    const mint = raw.input?.rewardMint || null;
 
     let rewardUsd = null;
     let priceSource = "unavailable";
-    if (rewardSol) {
+    if (hasReward && !mint) {
       try {
         const { price, source } = await getSolUsdPrice();
-        rewardUsd = rewardSol * price;
+        rewardUsd = (amount / LAMPORTS_PER_SOL) * price;
         priceSource = source;
       } catch (err) {
         priceSource = `error: ${err.message}`;
       }
+    } else if (hasReward && USD_STABLECOINS[mint] !== undefined) {
+      rewardUsd = amount / 10 ** USD_STABLECOINS[mint];
+      priceSource = "stablecoin-1:1";
+    } else if (hasReward) {
+      priceSource = `unpriced token mint ${mint}`; // NOT SOL: never convert at the SOL price
     }
 
     return {
@@ -51,22 +67,31 @@ const agencStrategy = {
     };
   },
 
-  toTask: (raw) => ({
-    id: `agenc-${raw.id}`,
-    type: raw.type || "business_automation",
-    input: {
-      spec: raw.input?.spec,
-      process: raw.input?.spec,
-      topic: raw.input?.spec,
-    },
-    untrustedContent: raw.input?.spec,
-    untrustedSource: "agenc-task-listing",
-    sourceConnector: "agenc",
-  }),
+  // Async: the listing only carries a title and a job-spec URI; the real brief has to be fetched
+  // (https only, SSRF-guarded, hash-checked — see connectors/agenc.js). Without it the model used
+  // to be handed the bare URI as "the spec". Falls back to the title when the spec can't be read.
+  toTask: async (raw) => {
+    const title = raw.input?.title || raw.input?.spec || "";
+    const fetched = await AgencAdapter.fetchJobSpec(raw.input?.jobSpecUri, raw.input?.jobSpecHash);
+    const spec = fetched ? `${title}\n\n${fetched.text}`.trim() : title;
+    return {
+      id: `agenc-${raw.id}`,
+      type: raw.type || "business_automation",
+      input: {
+        spec,
+        process: spec,
+        topic: title || spec,
+      },
+      untrustedContent: spec,
+      untrustedSource: "agenc-task-listing",
+      sourceConnector: "agenc",
+    };
+  },
 
   submitOperation: "submitDeliverable",
   submitPermission: "SUBMIT_TASK",
-  submit: async (connector, raw, outputText) => connector.submitDeliverable(raw.id, { content: outputText, resultUri: null }),
+  submit: async (connector, raw, outputText) =>
+    connector.submitDeliverable(raw.id, { content: outputText, resultUri: null, jobSpecHash: raw.input?.jobSpecHash }),
 };
 
 module.exports = agencStrategy;
