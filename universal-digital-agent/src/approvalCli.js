@@ -46,6 +46,7 @@ async function main() {
   const persistDir = requirePersistDir();
   const encryptionKey = process.env.PERSIST_ENCRYPTION_KEY || undefined;
   const queue = new ApprovalQueue({ persistDir, encryptionKey });
+  await queue.init(); // pull approvals from Supabase (no-op without it) — this process may have an empty disk
 
   switch (command) {
     case "list": {
@@ -88,9 +89,12 @@ async function main() {
         record = queue.resolve(id, "approved", "cli-user");
         console.log("(auto-approved before resuming, since it was still pending)");
       }
+      await queue.flush(); // the approve above must reach Supabase before the agent claims it
       const agent = new UniversalAgent({ persistDir });
+      await agent.ready;
       const result = await agent.resumeTask(id);
       console.log(JSON.stringify(result, null, 2));
+      await agent.flushState();
       break;
     }
 
@@ -98,6 +102,7 @@ async function main() {
       console.error("Unknown command. Usage: list | show <id> | approve <id> | deny <id> | resume <id>");
       process.exit(1);
   }
+  await queue.flush(); // let write-behind Supabase updates (approve/deny) land before the process exits
 }
 
 main().catch((err) => {
