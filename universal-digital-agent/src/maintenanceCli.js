@@ -30,9 +30,10 @@ function requirePersistDir() {
   return dir;
 }
 
-function main() {
+async function main() {
   const persistDir = requirePersistDir();
   const agent = new UniversalAgent({ persistDir });
+  await agent.ready; // pull Supabase state first so pruning acts on the real history
 
   console.log(`=== Running maintenance on ${persistDir} ===`);
   const result = agent.runMaintenance();
@@ -47,6 +48,10 @@ function main() {
 
   console.log(`\nTotal records removed: ${totalRemoved}`);
   console.log("Financial totals (economics.summary()) are unaffected by pruning — preserved via rollup.");
+  await agent.flushState(); // let the Supabase prune/rollup write land before exiting
 }
 
-main();
+main().catch((err) => {
+  console.error("Error:", err.message);
+  process.exit(1);
+});
