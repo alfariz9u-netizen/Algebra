@@ -202,8 +202,11 @@ async function maybeRegisterOnAgentverse(agent) {
   }
 }
 
-function main() {
+async function main() {
   const agent = buildAgent();
+  // Load durable state (economics, approvals, learning, moltbook) from Supabase before serving
+  // or scheduling anything. Never rejects; instant when Supabase isn't configured.
+  await agent.ready;
 
   const server = createServer(agent);
   server.listen(PORT, () => {
@@ -221,7 +224,9 @@ function main() {
     stopScheduler();
     stopPaymentWatcher();
     if (bot) bot.stop();
-    server.close(() => process.exit(0));
+    // Give queued Supabase writes a moment to land before the process exits.
+    const closeServer = () => server.close(() => process.exit(0));
+    Promise.race([agent.flushState(), new Promise((r) => setTimeout(r, 3000))]).then(closeServer, closeServer);
     // Force-exit if something (e.g. the Telegram long-poll's in-flight request) keeps the event loop alive.
     setTimeout(() => process.exit(0), 5000).unref();
   };
@@ -229,6 +234,11 @@ function main() {
   process.on("SIGINT", () => shutdown("SIGINT"));
 }
 
-if (require.main === module) main();
+if (require.main === module) {
+  main().catch((err) => {
+    console.error("[combinedServer] fatal startup error:", err);
+    process.exit(1);
+  });
+}
 
 module.exports = { main, startMarketplaceScheduler, startTelegramBot, startPaymentWatcher };
