@@ -1,6 +1,7 @@
 "use strict";
 
 const dns = require("node:dns").promises;
+const net = require("node:net");
 
 /**
  * SSRF (Server-Side Request Forgery) protection. This matters most for
@@ -53,18 +54,44 @@ function isPrivateOrReservedIPv4(ip) {
   );
 }
 
+/** Expands any textual IPv6 (incl. "::" and an embedded dotted IPv4 tail) into 8 16-bit groups, or null. */
+function parseIPv6(input) {
+  let ip = String(input).toLowerCase().split("%")[0]; // drop a zone id (fe80::1%eth0)
+  if (!net.isIPv6(ip)) return null;
+  const tail = /(\d+\.\d+\.\d+\.\d+)$/.exec(ip);
+  if (tail) {
+    const n = ipv4ToInt(tail[1]);
+    if (n === null) return null;
+    ip = ip.slice(0, -tail[1].length) + ((n >>> 16) & 0xffff).toString(16) + ":" + (n & 0xffff).toString(16);
+  }
+  const halves = ip.split("::");
+  if (halves.length > 2) return null;
+  const head = halves[0] ? halves[0].split(":") : [];
+  const rest = halves.length === 2 && halves[1] ? halves[1].split(":") : [];
+  const missing = 8 - head.length - rest.length;
+  if (halves.length === 1 ? missing !== 0 : missing < 0) return null;
+  const groups = [...head, ...(halves.length === 2 ? Array(missing).fill("0") : []), ...rest].map((g) => parseInt(g || "0", 16));
+  return groups.length === 8 && groups.every((g) => Number.isInteger(g) && g >= 0 && g <= 0xffff) ? groups : null;
+}
+
+const v4FromGroups = (hi, lo) => [(hi >> 8) & 255, hi & 255, (lo >> 8) & 255, lo & 255].join(".");
+
+/** Loopback, unspecified, link-local, unique-local, multicast, documentation — and any IPv4 embedded in mapped/NAT64/6to4/compat forms. */
 function isPrivateOrReservedIPv6(ip) {
-  const lower = ip.toLowerCase();
-  return (
-    lower === "::1" ||
-    lower === "::" ||
-    lower.startsWith("fe80:") || // link-local
-    lower.startsWith("fc") ||
-    lower.startsWith("fd") || // unique local
-    lower.startsWith("::ffff:127.") ||
-    lower.startsWith("::ffff:10.") ||
-    lower.startsWith("::ffff:169.254.")
-  );
+  const g = parseIPv6(ip);
+  if (!g) return true; // unparseable literal: fail closed
+  const allZeroUpTo = (n) => g.slice(0, n).every((x) => x === 0);
+  if (allZeroUpTo(7) && (g[7] === 0 || g[7] === 1)) return true; // :: and ::1
+  if ((g[0] & 0xffc0) === 0xfe80) return true; // fe80::/10 link-local
+  if ((g[0] & 0xfe00) === 0xfc00) return true; // fc00::/7 unique local
+  if ((g[0] & 0xff00) === 0xff00) return true; // ff00::/8 multicast
+  if (g[0] === 0x2001 && g[1] === 0x0db8) return true; // documentation
+  if (g[0] === 0x0100 && g[1] === 0 && g[2] === 0 && g[3] === 0) return true; // 100::/64 discard
+  if (allZeroUpTo(5) && g[5] === 0xffff) return isPrivateOrReservedIPv4(v4FromGroups(g[6], g[7])); // ::ffff:a.b.c.d
+  if (allZeroUpTo(6)) return isPrivateOrReservedIPv4(v4FromGroups(g[6], g[7])); // ::a.b.c.d (deprecated compat)
+  if (g[0] === 0x0064 && g[1] === 0xff9b && g.slice(2, 6).every((x) => x === 0)) return isPrivateOrReservedIPv4(v4FromGroups(g[6], g[7])); // NAT64
+  if (g[0] === 0x2002) return isPrivateOrReservedIPv4(v4FromGroups(g[1], g[2])); // 6to4
+  return false;
 }
 
 /**
@@ -89,11 +116,13 @@ function decodeObfuscatedIPv4(hostname) {
 }
 
 function isBlockedHostnameLiteral(hostname) {
-  const h = hostname.toLowerCase().replace(/\.$/, "");
+  // URL.hostname keeps IPv6 literals in brackets ("[::1]"), which no IP check ever matched.
+  const h = hostname.toLowerCase().replace(/\.$/, "").replace(/^\[|\]$/g, "");
   if (BLOCKED_HOSTNAMES.has(h)) return true;
+  if (/\.(localhost|local|internal|localdomain|home\.arpa)$/.test(h)) return true;
   if (BLOCKED_LITERAL_IPS.has(h)) return true;
   if (isPrivateOrReservedIPv4(h)) return true;
-  if (h.includes(":") && isPrivateOrReservedIPv6(h)) return true;
+  if (h.includes(":")) return isPrivateOrReservedIPv6(h);
   const decoded = decodeObfuscatedIPv4(h);
   if (decoded && isPrivateOrReservedIPv4(decoded)) return true;
   return false;
@@ -146,4 +175,69 @@ async function assertSafeUrl(urlString, { allowPrivate = false, resolver } = {})
   return parsed;
 }
 
-module.exports = { assertSafeUrl, isBlockedHostnameLiteral, isPrivateOrReservedIPv4, decodeObfuscatedIPv4 };
+/**
+ * fetch() with SSRF protection on EVERY hop: redirects are followed manually and each Location is
+ * re-validated (a public URL that 302s to http://169.254.169.254/ is refused), plus a timeout and a
+ * response-size cap. Returns { response, text } — the body is read here so the cap is enforced.
+ *
+ * Note: Node's fetch cannot pin the validated IP, so a DNS-rebinding race between check and connect
+ * remains theoretically possible; each hop is re-resolved, which narrows (not eliminates) it.
+ */
+async function safeFetch(url, init = {}, { maxRedirects = 3, timeoutMs = 15000, maxBytes = 1024 * 1024, resolver, fetchImpl } = {}) {
+  const doFetch = fetchImpl || globalThis.fetch;
+  let current = url;
+  let method = init.method || "GET";
+  let body = init.body;
+  for (let hop = 0; hop <= maxRedirects; hop++) {
+    await assertSafeUrl(current, { resolver });
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await doFetch(current, { ...init, method, body, redirect: "manual", signal: controller.signal });
+      if ([301, 302, 303, 307, 308].includes(response.status)) {
+        const location = response.headers && response.headers.get && response.headers.get("location");
+        if (!location) throw new Error(`Redirect without Location from ${current}`);
+        current = new URL(location, current).toString();
+        if (response.status === 303 || ((response.status === 301 || response.status === 302) && method === "POST")) {
+          method = "GET";
+          body = undefined;
+        }
+        continue;
+      }
+      const declared = Number(response.headers && response.headers.get && response.headers.get("content-length"));
+      if (Number.isFinite(declared) && declared > maxBytes) throw new Error(`Response too large (${declared} > ${maxBytes} bytes).`);
+      const text = await readCapped(response, maxBytes);
+      return { response, text };
+    } catch (err) {
+      if (err.name === "AbortError") throw new Error(`Request to ${current} timed out after ${timeoutMs}ms.`);
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  throw new Error(`Too many redirects (> ${maxRedirects}) starting at ${url}.`);
+}
+
+async function readCapped(response, maxBytes) {
+  if (!response.body || typeof response.body.getReader !== "function") {
+    const t = await response.text();
+    if (t.length > maxBytes) throw new Error(`Response too large (> ${maxBytes} bytes).`);
+    return t;
+  }
+  const reader = response.body.getReader();
+  const chunks = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.length;
+    if (total > maxBytes) {
+      reader.cancel().catch(() => {});
+      throw new Error(`Response too large (> ${maxBytes} bytes).`);
+    }
+    chunks.push(value);
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+module.exports = { assertSafeUrl, safeFetch, isBlockedHostnameLiteral, isPrivateOrReservedIPv4, isPrivateOrReservedIPv6, decodeObfuscatedIPv4 };
