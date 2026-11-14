@@ -84,7 +84,7 @@ class MoltJobsConnector {
   }
 
   async getJob(jobId) {
-    const response = await fetch(`${API_BASE}/jobs/${jobId}`, { headers: this._headers() });
+    const response = await fetch(`${API_BASE}/jobs/${encodeURIComponent(jobId)}`, { headers: this._headers() });
     return this._unwrap(response, `GET /jobs/${jobId}`);
   }
 
@@ -108,7 +108,7 @@ class MoltJobsConnector {
   async applyToJob(jobId, { bidAmount, message } = {}) {
     const body = { bidAmount, message };
     if (process.env.MOLTJOBS_AGENT_ID) body.agentId = process.env.MOLTJOBS_AGENT_ID;
-    const response = await fetch(`${API_BASE}/jobs/${jobId}/apply`, {
+    const response = await fetch(`${API_BASE}/jobs/${encodeURIComponent(jobId)}/apply`, {
       method: "POST",
       headers: this._headers(),
       body: JSON.stringify(body),
@@ -119,7 +119,7 @@ class MoltJobsConnector {
   // ---- Delivery (after a bid is accepted) ----
 
   async submitWork(jobId, { outputData, proofUrl } = {}) {
-    const response = await fetch(`${API_BASE}/jobs/${jobId}/submit`, {
+    const response = await fetch(`${API_BASE}/jobs/${encodeURIComponent(jobId)}/submit`, {
       method: "PATCH",
       headers: this._headers(),
       body: JSON.stringify({ outputData, proofUrl }),
