@@ -63,6 +63,11 @@ const TOKENS = {
 const TRANSFER_EVENT_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 const BASE_AVERAGE_BLOCK_SECONDS = 2; // Base's published target block time
 
+function asNonNegInt(n, fallback) {
+  const v = Number(n);
+  return Number.isFinite(v) && v >= 0 ? Math.floor(v) : fallback;
+}
+
 function asPositiveInt(n, fallback) {
   const v = Number(n);
   return Number.isFinite(v) && v > 0 ? Math.floor(v) : fallback;
@@ -100,7 +105,7 @@ async function scanSolana({ rpcUrl, walletAddress, lookbackHours, tokens, fetchI
     const tokenAccounts = (accountsResult?.value || []).map((v) => v.pubkey);
 
     for (const tokenAccountAddress of tokenAccounts) {
-      const signatures = await solanaRpc(rpcUrl, "getSignaturesForAddress", [tokenAccountAddress, { limit: 1000 }], fetchImpl);
+      const signatures = await solanaRpc(rpcUrl, "getSignaturesForAddress", [tokenAccountAddress, { limit: 1000, commitment: "finalized" }], fetchImpl);
 
       for (const sigInfo of signatures || []) {
         if (sigInfo.err) continue; // failed transaction — nothing real moved
@@ -109,7 +114,7 @@ async function scanSolana({ rpcUrl, walletAddress, lookbackHours, tokens, fetchI
         const tx = await solanaRpc(
           rpcUrl,
           "getTransaction",
-          [sigInfo.signature, { encoding: "jsonParsed", maxSupportedTransactionVersion: 0 }],
+          [sigInfo.signature, { encoding: "jsonParsed", maxSupportedTransactionVersion: 0, commitment: "finalized" }],
           fetchImpl
         );
         if (!tx || !tx.meta) continue;
@@ -132,8 +137,18 @@ async function scanSolana({ rpcUrl, walletAddress, lookbackHours, tokens, fetchI
           }
         }
 
-        const from =
-          (tx.meta.preTokenBalances || []).find((b) => b.mint === tokenInfo.mint && b.owner !== walletAddress)?.owner || null;
+        // The sender is the owner whose balance of this mint actually went DOWN (not just "someone else").
+        const balanceOf = (list, owner) => Number((list || []).find((b) => b.owner === owner && b.mint === tokenInfo.mint)?.uiTokenAmount?.uiAmount || 0);
+        let from = null;
+        let biggestDrop = 0;
+        for (const b of tx.meta.preTokenBalances || []) {
+          if (b.mint !== tokenInfo.mint || b.owner === walletAddress) continue;
+          const drop = Number(b.uiTokenAmount?.uiAmount || 0) - balanceOf(tx.meta.postTokenBalances, b.owner);
+          if (drop > biggestDrop) {
+            biggestDrop = drop;
+            from = b.owner;
+          }
+        }
 
         payments.push({
           txSignature: sigInfo.signature,
@@ -168,9 +183,13 @@ function padAddressToTopic(address) {
   return "0x" + address.toLowerCase().replace(/^0x/, "").padStart(64, "0");
 }
 
-async function scanBase({ rpcUrl, walletAddress, lookbackHours, tokens, fetchImpl }) {
+const BASE_LOG_CHUNK_BLOCKS = 9000; // public RPCs commonly cap eth_getLogs ranges (~10k blocks)
+
+async function scanBase({ rpcUrl, walletAddress, lookbackHours, tokens, fetchImpl, confirmations }) {
   const latestHex = await evmRpc(rpcUrl, "eth_blockNumber", [], fetchImpl);
-  const latestBlock = parseInt(latestHex, 16);
+  // Only count transfers buried under N blocks: a payment in the newest block can still be reorged away,
+  // and revenue must never be booked for money that later disappears.
+  const latestBlock = Math.max(0, parseInt(latestHex, 16) - asNonNegInt(confirmations, 12));
   const blocksBack = Math.ceil((lookbackHours * 3600) / BASE_AVERAGE_BLOCK_SECONDS);
   const fromBlock = Math.max(0, latestBlock - blocksBack);
   const payments = [];
@@ -179,21 +198,28 @@ async function scanBase({ rpcUrl, walletAddress, lookbackHours, tokens, fetchImp
     const tokenInfo = TOKENS.base[tokenName];
     if (!tokenInfo) continue;
 
-    const logs = await evmRpc(
-      rpcUrl,
-      "eth_getLogs",
-      [
-        {
-          fromBlock: "0x" + fromBlock.toString(16),
-          toBlock: "latest",
-          address: tokenInfo.contract,
-          topics: [TRANSFER_EVENT_TOPIC, null, padAddressToTopic(walletAddress)],
-        },
-      ],
-      fetchImpl
-    );
+    const logs = [];
+    for (let start = fromBlock; start <= latestBlock; start += BASE_LOG_CHUNK_BLOCKS) {
+      const end = Math.min(latestBlock, start + BASE_LOG_CHUNK_BLOCKS - 1);
+      const chunk = await evmRpc(
+        rpcUrl,
+        "eth_getLogs",
+        [
+          {
+            fromBlock: "0x" + start.toString(16),
+            toBlock: "0x" + end.toString(16),
+            address: tokenInfo.contract,
+            topics: [TRANSFER_EVENT_TOPIC, null, padAddressToTopic(walletAddress)],
+          },
+        ],
+        fetchImpl
+      );
+      if (Array.isArray(chunk)) logs.push(...chunk);
+    }
 
     for (const log of logs || []) {
+      if (log.removed) continue; // reorged out: nothing real moved
+      if (!log.data || log.data === "0x") continue;
       const rawAmount = BigInt(log.data);
       const amountUsd = Number(rawAmount) / 10 ** tokenInfo.decimals;
       if (!(amountUsd > 0)) continue;
@@ -230,7 +256,7 @@ function extractTaskId(memo) {
  * @param {{ network: "solana"|"base", walletAddress: string, lookbackHours?: number, tokens?: string[], fetchImpl?: Function }} opts
  * @returns {Promise<Array<{txSignature, amountUsd, token, network, from, memo, taskId, blockTime}>>}
  */
-async function scanWalletForPayments({ network, walletAddress, lookbackHours = 24, tokens = ["usdc"], fetchImpl = fetch } = {}) {
+async function scanWalletForPayments({ network, walletAddress, lookbackHours = 24, tokens = ["usdc"], fetchImpl = fetch, confirmations = process.env.PAYMENT_BASE_CONFIRMATIONS } = {}) {
   if (!walletAddress) throw new Error("scanWalletForPayments: walletAddress is required.");
   const hours = asPositiveInt(lookbackHours, 24);
 
@@ -240,9 +266,36 @@ async function scanWalletForPayments({ network, walletAddress, lookbackHours = 2
   }
   if (network === "base") {
     const rpcUrl = process.env.PAYMENT_BASE_RPC_URL || "https://mainnet.base.org";
-    return scanBase({ rpcUrl, walletAddress, lookbackHours: hours, tokens, fetchImpl });
+    return scanBase({ rpcUrl, walletAddress, lookbackHours: hours, tokens, fetchImpl, confirmations });
   }
   throw new Error(`scanWalletForPayments: unsupported network "${network}" (expected "solana" or "base").`);
+}
+
+/**
+ * Decides whether a detected incoming transfer may count as REVENUE. Not every credit to the wallet is a
+ * customer payment: moving your own money between your wallets, refunds, airdrops and dust spam would all
+ * otherwise show up as "profit". Returns { ok, reason }.
+ */
+function classifyIncoming(p, { ownAddresses = new Set(), minUsd = 0.01, requireTaskMatch = false } = {}) {
+  if (!(p.amountUsd >= minUsd)) return { ok: false, reason: "below_minimum" };
+  const from = p.from ? String(p.from).toLowerCase() : null;
+  if (from && ownAddresses.has(from)) return { ok: false, reason: "own_wallet" };
+  if (requireTaskMatch && !p.taskId) return { ok: false, reason: "no_task_memo" };
+  return { ok: true };
+}
+
+function watcherPolicyFromEnv() {
+  const own = new Set(
+    [process.env.PAYMENT_WALLET_SOLANA, process.env.PAYMENT_WALLET_BASE, ...(process.env.PAYMENT_IGNORE_FROM || "").split(",")]
+      .map((a) => (a || "").trim().toLowerCase())
+      .filter(Boolean)
+  );
+  const min = Number(process.env.PAYMENT_MIN_USD);
+  return {
+    ownAddresses: own,
+    minUsd: Number.isFinite(min) && min >= 0 ? min : 0.01,
+    requireTaskMatch: process.env.PAYMENT_REQUIRE_TASK_MATCH === "true",
+  };
 }
 
 /**
@@ -253,8 +306,8 @@ async function scanWalletForPayments({ network, walletAddress, lookbackHours = 2
  * window (as combinedServer.js does, every 5 minutes) never double-counts
  * a real payment it already saw.
  */
-async function runPaymentWatchCycle(economics, { fetchImpl = fetch, lookbackHours } = {}) {
-  const results = { scanned: [], recorded: 0, duplicates: 0, errors: [] };
+async function runPaymentWatchCycle(economics, { fetchImpl = fetch, lookbackHours, policy = watcherPolicyFromEnv() } = {}) {
+  const results = { scanned: [], recorded: 0, duplicates: 0, ignored: [], errors: [] };
   const configs = [
     { network: "solana", walletAddress: process.env.PAYMENT_WALLET_SOLANA },
     { network: "base", walletAddress: process.env.PAYMENT_WALLET_BASE },
@@ -264,6 +317,11 @@ async function runPaymentWatchCycle(economics, { fetchImpl = fetch, lookbackHour
     try {
       const payments = await scanWalletForPayments({ network, walletAddress, lookbackHours, fetchImpl });
       for (const p of payments) {
+        const verdict = classifyIncoming(p, policy);
+        if (!verdict.ok) {
+          results.ignored.push({ txSignature: p.txSignature, amountUsd: p.amountUsd, reason: verdict.reason });
+          continue;
+        }
         const outcome = economics.recordPayment({
           // No memo on-chain (e.g. plain ERC-20 transfers): key the payment by its transaction so it is still counted exactly once.
           taskId: p.taskId || `tx:${p.txSignature}`,
@@ -284,4 +342,4 @@ async function runPaymentWatchCycle(economics, { fetchImpl = fetch, lookbackHour
   return results;
 }
 
-module.exports = { scanWalletForPayments, runPaymentWatchCycle, TOKENS, extractTaskId };
+module.exports = { scanWalletForPayments, runPaymentWatchCycle, classifyIncoming, watcherPolicyFromEnv, TOKENS, extractTaskId };
