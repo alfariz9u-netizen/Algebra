@@ -100,7 +100,9 @@ class MarketplacePipeline {
       await this.agent.callConnector("colony", "postFinding", "PUBLISH", () =>
         this.agent.connectors.get("colony").postFinding({
           title,
-          body: `Capability used: ${outcome.capability}. QA score: ${outcome.meta?.qaScore ?? "n/a"}. Result summary: ${String(outcome.output || "").slice(0, 500)}`,
+          // Metadata only. The deliverable belongs to the client/marketplace: its text used to be posted
+          // verbatim (first 500 chars) to a PUBLIC feed.
+          body: `Capability used: ${outcome.capability}. QA score: ${outcome.meta?.qaScore ?? "n/a"}. Deliverable length: ${String(outcome.output || "").length} characters.`,
           colony: "general",
           postType: "finding",
         })
@@ -156,11 +158,22 @@ class MarketplacePipeline {
     // scoring summary and every strategy's toTask()/submit() downstream
     // loses the real listing fields (title, body, repository_url, number,
     // budget, ...).
-    const opportunities = await Promise.all(
-      rawList.map(async (raw) =>
-        normalizeOpportunity(await strategy.toOpportunity(raw), strategy.connectorName, raw)
-      )
+    // One malformed listing used to reject Promise.all and fail the WHOLE connector every cycle, forever.
+    // Each listing is scored on its own; a bad one is skipped (and counted), never fatal.
+    const listings = Array.isArray(rawList) ? rawList : [];
+    let malformed = 0;
+    const scoredOrNull = await Promise.all(
+      listings.map(async (raw) => {
+        try {
+          return normalizeOpportunity(await strategy.toOpportunity(raw), strategy.connectorName, raw);
+        } catch (err) {
+          malformed += 1;
+          console.warn(`[pipeline:${strategy.connectorName}] skipping malformed listing ${raw && raw.id}: ${err.message}`);
+          return null;
+        }
+      })
     );
+    const opportunities = scoredOrNull.filter(Boolean);
     for (const opp of opportunities) {
       this.agent.economics.record({ type: "task_discovered", connector: strategy.connectorName });
       if (this.learning) opp.successProbability = this.learning.calibratedSuccessProbability(strategy.connectorName, opp.successProbability);
@@ -191,6 +204,7 @@ class MarketplacePipeline {
       accepted: accepted.length,
       rejected: rejected.length,
       skippedKnownDead: skipped.length,
+      malformed,
       results,
     };
   }
@@ -198,7 +212,20 @@ class MarketplacePipeline {
   async _processOpportunity(strategy, opportunity) {
     this.agent.economics.record({ type: "task_accepted", connector: strategy.connectorName, expectedValueUsd: opportunity.expectedValue });
 
-    const task = await strategy.toTask(opportunity.raw); // may be async (AgenC fetches the job spec)
+    let task;
+    try {
+      task = await strategy.toTask(opportunity.raw); // may be async (AgenC fetches the job spec)
+    } catch (err) {
+      this.agent.economics.record({ type: "task_failed", connector: strategy.connectorName });
+      if (this.learning) this.learning.markOpportunityDead(strategy.connectorName, opportunity.id, `toTask failed: ${err.message}`);
+      return { opportunity, outcome: { status: "failed", reason: `toTask failed: ${err.message}` } };
+    }
+    // The task carries what the economics ledger needs. `deferEconomics` means: processTask() must NOT
+    // record task_completed/task_failed itself — whoever actually SUBMITS records it, exactly once
+    // (processTask + the pipeline both recording used to double-count every task's expected revenue).
+    if (task.rewardUsd === undefined) task.rewardUsd = opportunity.rewardUsd || 0;
+    if (!task.sourceConnector) task.sourceConnector = strategy.connectorName;
+    task.deferEconomics = true;
     const outcome = await this.agent.processTask(task);
 
     if (outcome.status === "pending_human_approval") {
@@ -207,7 +234,7 @@ class MarketplacePipeline {
     }
 
     if (outcome.status !== "success") {
-      this.agent.economics.record({ type: "task_failed", connector: strategy.connectorName });
+      this.agent.economics.record({ type: "task_failed", taskId: task.id, connector: strategy.connectorName });
       if (this.learning) this.learning.markOpportunityDead(strategy.connectorName, opportunity.id, `verification/QA failed: ${outcome.reason || "unknown"}`);
       return { opportunity, outcome };
     }
@@ -226,22 +253,32 @@ class MarketplacePipeline {
       );
       if (this.learning) {
         this.learning.recordSuccess(strategy.connectorName, strategy.submitOperation);
-        this.learning.recordAttempt(strategy.connectorName, { won: true });
+        // "Submitted" is not "won": a bid is only a win once the platform accepts it. Counting every
+        // submission as a win pushed the calibrated success probability toward 0.99 and made the agent
+        // over-confident. Bids count as an attempt now and as a win when acceptance is observed
+        // (recordWin); direct deliveries (submitKind "delivery") are wins when delivered.
+        this.learning.recordAttempt(strategy.connectorName, { won: strategy.submitKind === "delivery" });
+        // Same listing next cycle? Never again: it used to be re-submitted every 30 minutes (spam, wasted
+        // LLM calls, and a ban risk) for every strategy without its own memory.
+        this.learning.markOpportunityDead(strategy.connectorName, opportunity.id, "submitted");
       }
 
       this.agent.economics.record({
         type: "task_completed",
+        taskId: task.id,
         connector: strategy.connectorName,
         model: outcome.meta?.model,
-        revenueUsd: 0, // expectation only; real money is recorded by recordPayment()
-        expectedRevenueUsd: opportunity.rewardUsd || 0,
-        costUsd: opportunity.estimatedModelCostUsd || 0,
+        revenueUsd: 0, // real money is recorded by recordPayment() only
+        // A bid is an offer, not delivered work: only direct deliveries count as "owed to us".
+        expectedRevenueUsd: strategy.submitKind === "delivery" ? opportunity.rewardUsd || 0 : 0,
+        bidRewardUsd: strategy.submitKind === "delivery" ? undefined : opportunity.rewardUsd || 0,
+        costUsd: outcome.meta?.costUsd ?? opportunity.estimatedModelCostUsd ?? 0,
       });
 
       const learning = await this._shareLearning(strategy.connectorName, task, outcome);
       return { opportunity, outcome, submission, learning };
     } catch (err) {
-      this.agent.economics.record({ type: "task_failed", connector: strategy.connectorName });
+      this.agent.economics.record({ type: "task_failed", taskId: task.id, connector: strategy.connectorName });
       if (this.learning) {
         this.learning.recordAttempt(strategy.connectorName, { won: false });
         const failure = this.learning.recordFailure(strategy.connectorName, strategy.submitOperation, err);
@@ -284,8 +321,13 @@ class MarketplacePipeline {
       this.agent.connectors.get(connectorName).getJob(jobId)
     );
 
+    // The platform accepted our bid: THIS is a real win.
+    if (this.learning && this.learning.recordWin) this.learning.recordWin(connectorName);
+
     const task = {
       id: `moltmarket-deliver-${jobId}`,
+      deferEconomics: true,
+      rewardUsd: job.budget_usdc || 0,
       type: job.category || "documentProcessing",
       input: { spec: job.description, topic: job.title, content: job.description },
       untrustedContent: job.description,
@@ -298,7 +340,7 @@ class MarketplacePipeline {
       return { jobId, outcome, submission: { status: "pending_human_approval", riskLevel: outcome.riskLevel } };
     }
     if (outcome.status !== "success") {
-      this.agent.economics.record({ type: "task_failed", connector: connectorName });
+      this.agent.economics.record({ type: "task_failed", taskId: task.id, connector: connectorName });
       return { jobId, outcome };
     }
 
@@ -311,22 +353,20 @@ class MarketplacePipeline {
       const submission = await this.agent.callConnector(connectorName, "deliverWork", "SUBMIT_TASK", () =>
         this.agent.connectors.get(connectorName).deliverWork(jobId, { content: outcome.output })
       );
-      if (this.learning) {
-        this.learning.recordSuccess(connectorName, "deliverWork");
-        this.learning.recordAttempt(connectorName, { won: true });
-      }
+      if (this.learning) this.learning.recordSuccess(connectorName, "deliverWork");
       this.agent.economics.record({
         type: "task_completed",
+        taskId: task.id,
         connector: connectorName,
         model: outcome.meta?.model,
         revenueUsd: 0,
         expectedRevenueUsd: job.budget_usdc || 0,
-        costUsd: 0,
+        costUsd: outcome.meta?.costUsd ?? 0,
       });
       const learning = await this._shareLearning(connectorName, task, outcome);
       return { jobId, outcome, submission, learning };
     } catch (err) {
-      this.agent.economics.record({ type: "task_failed", connector: connectorName });
+      this.agent.economics.record({ type: "task_failed", taskId: task.id, connector: connectorName });
       if (this.learning) this.learning.recordFailure(connectorName, "deliverWork", err);
       return { jobId, outcome, submissionError: err.message };
     }
