@@ -95,7 +95,7 @@ class TokuAgencyConnector {
   }
 
   async getJob(jobId) {
-    const response = await fetch(`${API_BASE}/jobs/${jobId}`, { headers: this._headers() });
+    const response = await fetch(`${API_BASE}/jobs/${encodeURIComponent(jobId)}`, { headers: this._headers() });
     return this._checkOk(response, `GET /jobs/${jobId}`);
   }
 
@@ -107,7 +107,7 @@ class TokuAgencyConnector {
   // ---- Bidding (unconfirmed exact shape — see honesty note above) ----
 
   async submitBid(jobId, { amountUsd, proposal }) {
-    const response = await fetch(`${API_BASE}/jobs/${jobId}/bid`, {
+    const response = await fetch(`${API_BASE}/jobs/${encodeURIComponent(jobId)}/bid`, {
       method: "POST",
       headers: this._headers(),
       body: JSON.stringify({ amount_usd: amountUsd, amountUsd, proposal, message: proposal }),
@@ -118,7 +118,7 @@ class TokuAgencyConnector {
   // ---- Delivery (confirmed real path) ----
 
   async deliverJob(jobId, result) {
-    const response = await fetch(`${API_BASE}/jobs/${jobId}/deliver`, {
+    const response = await fetch(`${API_BASE}/jobs/${encodeURIComponent(jobId)}/deliver`, {
       method: "POST",
       headers: this._headers(),
       body: JSON.stringify({ result }),
