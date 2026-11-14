@@ -1,6 +1,9 @@
 "use strict";
 
-const { assertSafeUrl } = require("../core/ssrfGuard");
+const { safeFetch } = require("../core/ssrfGuard");
+
+const A2A_TIMEOUT_MS = Number(process.env.A2A_CLIENT_TIMEOUT_MS) > 0 ? Number(process.env.A2A_CLIENT_TIMEOUT_MS) : 15000;
+const A2A_MAX_BYTES = Number(process.env.A2A_CLIENT_MAX_BYTES) > 0 ? Number(process.env.A2A_CLIENT_MAX_BYTES) : 1024 * 1024;
 
 /**
  * Minimal real Agent2Agent (A2A) protocol client, per the official spec
@@ -23,11 +26,15 @@ class A2aClient {
   }
 
   async fetchAgentCard(baseUrl) {
-    const cardUrl = `${baseUrl.replace(/\/$/, "")}/.well-known/agent-card.json`;
-    await assertSafeUrl(cardUrl);
-    const response = await fetch(cardUrl);
+    const cardUrl = `${String(baseUrl).replace(/\/$/, "")}/.well-known/agent-card.json`;
+    // safeFetch: SSRF check on the URL and on every redirect hop, timeout, size cap.
+    const { response, text } = await safeFetch(cardUrl, {}, { timeoutMs: A2A_TIMEOUT_MS, maxBytes: A2A_MAX_BYTES });
     if (!response.ok) throw new Error(`Could not fetch agent card from ${baseUrl}: ${response.status}`);
-    return response.json();
+    try {
+      return JSON.parse(text);
+    } catch {
+      throw new Error(`Agent card from ${baseUrl} is not valid JSON.`);
+    }
   }
 
   /**
@@ -47,26 +54,28 @@ class A2aClient {
       throw new Error(`Refusing to message unverified agent card (missing: ${validation.missing.join(", ")})`);
     }
 
-    // The card's `url` came from an untrusted remote party — validate it
-    // before ever fetching it, regardless of what the card claims.
-    await assertSafeUrl(agentCard.url);
-
-    const response = await fetch(agentCard.url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        jsonrpc: "2.0",
-        id: taskId || Date.now(),
-        method: "message/send",
-        params: {
-          message: {
-            role: "user",
-            parts: [{ kind: "text", text }],
-          },
-        },
-      }),
-    });
-    const data = await response.json();
+    // The card's `url` came from an untrusted remote party — safeFetch validates it (and any redirect)
+    // before connecting, and bounds time and size.
+    const { response, text: raw } = await safeFetch(
+      agentCard.url,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: taskId || Date.now(),
+          method: "message/send",
+          params: { message: { role: "user", parts: [{ kind: "text", text }] } },
+        }),
+      },
+      { timeoutMs: A2A_TIMEOUT_MS, maxBytes: A2A_MAX_BYTES }
+    );
+    let data;
+    try {
+      data = JSON.parse(raw);
+    } catch {
+      throw new Error(`A2A agent returned a non-JSON response (HTTP ${response.status}).`);
+    }
     if (data.error) throw new Error(`A2A error: ${data.error.message}`);
     return data.result;
   }
