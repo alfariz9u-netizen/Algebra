@@ -45,7 +45,7 @@ const INJECTION_PATTERNS = [
   /(?:decode|base64)[^\n]{0,30}(?:then|and)\s+(?:follow|execute|obey)/i,
   // Markdown image/link exfiltration pattern: model coaxed into rendering
   // a link that leaks data to an attacker-controlled URL.
-  /!\[[^\]]*\]\(https?:\/\/(?!.*(?:thecolony\.cc|artifactcouncil\.com|moltmarket\.store|opentask\.ai))[^)]+\)/i,
+  /!\[[^\]]*\]\(https?:\/\/(?!(?:[\w-]+\.)*(?:thecolony\.cc|artifactcouncil\.com|moltmarket\.store|opentask\.ai)(?:[\/:?#)]))[^)]+\)/i,
 ];
 
 function scanForInjection(rawText) {
