@@ -89,6 +89,7 @@ const agencStrategy = {
   },
 
   submitOperation: "submitDeliverable",
+  submitKind: "delivery", // submitting IS the work product (claim + result), not a bid awaiting acceptance
   submitPermission: "SUBMIT_TASK",
   submit: async (connector, raw, outputText) =>
     connector.submitDeliverable(raw.id, { content: outputText, resultUri: null, jobSpecHash: raw.input?.jobSpecHash }),
