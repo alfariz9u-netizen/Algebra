@@ -10,6 +10,11 @@
  * presented as exact.
  */
 
+const path = require("node:path");
+const { JsonFileStore } = require("./persistence/fileStore");
+
+const MAX_TRACKED_TASKS = 5000;
+
 const DEFAULT_LIMITS = {
   maxTokensPerTask: Number(process.env.MAX_TOKENS_PER_TASK || 8000),
   maxTokensPerOperation: Number(process.env.MAX_TOKENS_PER_OPERATION || 4000),
@@ -24,10 +29,26 @@ function estimateTokens(text) {
 }
 
 class TokenController {
-  constructor(limits = {}) {
+  /**
+   * With `persistDir`, today's usage survives a restart. Before, every redeploy/crash-restart reset
+   * dailyUsed to 0, so MAX_DAILY_TOKENS was not a real daily cap on a service that restarts.
+   */
+  constructor(limits = {}, { persistDir, encryptionKey } = {}) {
     this.limits = { ...DEFAULT_LIMITS, ...limits };
     this.dailyUsed = 0;
     this.dailyResetAt = startOfNextDay();
+    this._store = persistDir ? new JsonFileStore(path.join(persistDir, "token-usage.json"), { encryptionKey }) : null;
+    if (this._store) {
+      try {
+        const saved = this._store.load(null);
+        if (saved && Number.isFinite(saved.dailyResetAt) && Date.now() < saved.dailyResetAt && Number.isFinite(saved.dailyUsed)) {
+          this.dailyUsed = saved.dailyUsed;
+          this.dailyResetAt = saved.dailyResetAt;
+        }
+      } catch (err) {
+        console.warn(`[tokenController] could not restore daily usage: ${err.message}`);
+      }
+    }
     this.perTaskUsage = new Map(); // taskId -> { tokens, llmCalls }
   }
 
@@ -92,7 +113,16 @@ class TokenController {
     const usage = this.perTaskUsage.get(taskId) || { tokens: 0, llmCalls: 0 };
     usage.tokens += actualTokens;
     usage.llmCalls += 1;
-    this.perTaskUsage.set(taskId, usage);
+    this.perTaskUsage.delete(taskId);
+    this.perTaskUsage.set(taskId, usage); // re-insert = most recently used
+    while (this.perTaskUsage.size > MAX_TRACKED_TASKS) this.perTaskUsage.delete(this.perTaskUsage.keys().next().value); // bounded memory
+    if (this._store) {
+      try {
+        this._store.save({ dailyUsed: this.dailyUsed, dailyResetAt: this.dailyResetAt });
+      } catch {
+        /* best effort */
+      }
+    }
     return usage;
   }
 
