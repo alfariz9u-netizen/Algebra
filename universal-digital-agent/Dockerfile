@@ -1,25 +1,29 @@
-# استخدام صورة Node.js خفيفة
+# Node.js 20 (slim) + Python 3 for the AgentBazaar / Agentverse bridges
 FROM node:20-slim
 
-# تثبيت Python 3 و pip
-RUN apt-get update && apt-get install -y \
+ENV NODE_ENV=production \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# Python 3 + pip
+RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     python3-pip \
     python3-venv \
     && rm -rf /var/lib/apt/lists/*
 
-# تعيين مجلد العمل
 WORKDIR /app
 
-# نسخ ملفات الحزم وتثبيت مكتبات Node.js
+# Dependencies first (cached layer while package.json is unchanged)
 COPY package*.json ./
-RUN npm install
+RUN npm install --omit=dev --legacy-peer-deps
 
-# نسخ باقي ملفات المشروع
+# Python packages used by src/connectors/python_bridge/*
+RUN pip3 install --upgrade --break-system-packages agentsbazaar uagents-core
+
+# Application code (see .dockerignore: no data/, node_modules, tests or secrets)
 COPY . .
 
-# تثبيت مكتبات Python المطلوبة
-RUN pip3 install --upgrade agentsbazaar uagents-core --break-system-packages
-
-# أمر التشغيل (تأكد من المسار الصحيح لملف التشغيل)
+# Render sets PORT; the combined server listens on it (health: GET /healthz)
 CMD ["node", "src/combinedServer.js"]
