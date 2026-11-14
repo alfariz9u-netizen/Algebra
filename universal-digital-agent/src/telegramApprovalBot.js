@@ -48,6 +48,7 @@
  */
 
 const path = require("node:path");
+const { intervalMs, positiveNumber } = require("./core/config");
 const ApprovalQueue = require("./core/approvalQueue");
 const UniversalAgent = require("./core/universalAgent");
 const { redact } = require("./core/auditLog");
@@ -118,8 +119,10 @@ class TelegramApprovalBot {
     allowedChatIds = process.env.TELEGRAM_ALLOWED_CHAT_IDS,
     persistDir = process.env.PERSIST_DIR,
     encryptionKey = process.env.PERSIST_ENCRYPTION_KEY || undefined,
-    notifyIntervalMs = Number(process.env.TELEGRAM_NOTIFY_INTERVAL_MS || 15000),
+    notifyIntervalMs = intervalMs(process.env.TELEGRAM_NOTIFY_INTERVAL_MS, 15000, { floorMs: 1000, name: "TELEGRAM_NOTIFY_INTERVAL_MS" }),
     fetchImpl = typeof fetch !== "undefined" ? fetch : undefined,
+    agent = null, // the process's SHARED agent (combinedServer passes it); otherwise one is built lazily and reused
+    allowedUserIds = process.env.TELEGRAM_ALLOWED_USER_IDS,
   } = {}) {
     if (!botToken) {
       throw new Error("TELEGRAM_BOT_TOKEN is not set. Create a bot via @BotFather and set the token.");
@@ -149,6 +152,9 @@ class TelegramApprovalBot {
 
     this.botToken = botToken;
     this.allowedChatIds = new Set(parsedAllowed);
+    // Optional explicit list of USERS who may approve (matters when the allowed chat is a group).
+    this.allowedUserIds = new Set(String(allowedUserIds || "").split(",").map((s) => s.trim()).filter(Boolean));
+    this._agent = agent;
     this.persistDir = persistDir;
     this.encryptionKey = encryptionKey;
     this.notifyIntervalMs = notifyIntervalMs;
@@ -191,8 +197,26 @@ class TelegramApprovalBot {
     return new ApprovalQueue({ persistDir: this.persistDir, encryptionKey: this.encryptionKey });
   }
 
+  // ONE agent per bot, reused. Building a new UniversalAgent for every command/button/auto-run reset the
+  // daily token budget and the rate limiters each time, so those limits never actually limited anything.
+  // (Approvals stay correct: ApprovalQueue re-reads its state from disk on every operation.)
   _freshAgent() {
-    return buildAgent();
+    if (!this._agent) this._agent = buildAgent();
+    return this._agent;
+  }
+
+  /**
+   * Who may act. The chat must be allowed AND, in a group/supergroup, the SENDER must be individually
+   * allowed (their user id in TELEGRAM_ALLOWED_USER_IDS, or listed in TELEGRAM_ALLOWED_CHAT_IDS):
+   * checking only chat.id let any member of an allowed group approve high-risk actions.
+   */
+  _isAuthorized(chat, from) {
+    if (!chat || !this.allowedChatIds.has(String(chat.id))) return false;
+    if (this.allowedUserIds.size > 0) return Boolean(from) && this.allowedUserIds.has(String(from.id));
+    if (chat.type === "group" || chat.type === "supergroup" || chat.type === "channel") {
+      return Boolean(from) && this.allowedChatIds.has(String(from.id));
+    }
+    return true; // private chat: chat.id is the user's own id
   }
 
   // -- Outbound: notify allowed chats about newly pending approvals -------
@@ -242,7 +266,7 @@ class TelegramApprovalBot {
     const chatId = msg.chat?.id;
     const text = (msg.text || "").trim();
 
-    if (!this.allowedChatIds.has(String(chatId))) {
+    if (!this._isAuthorized(msg.chat, msg.from)) {
       await this._send(chatId, "Not authorized.").catch(() => {});
       return;
     }
@@ -373,6 +397,10 @@ class TelegramApprovalBot {
           await this._send(chatId, "❌ agentBazaar connector is not registered.");
           return;
         }
+        if (typeof connector.register !== "function") {
+          await this._send(chatId, "❌ Registration is not implemented in this build (the connector has no register()). Register through AgentBazaar's own tools, then set AGENTBAZAAR_AGENT_SLUG.");
+          return;
+        }
         if (!process.env.SOLANA_PRIVATE_KEY) {
           await this._send(chatId, "❌ SOLANA_PRIVATE_KEY is not set in the environment.");
           return;
@@ -450,7 +478,8 @@ class TelegramApprovalBot {
       `kill switch: ${d.killSwitch.globalStopped ? "🔴 STOPPED" : "🟢 running"}` +
       `${d.killSwitch.stoppedConnectors.length ? ` (stopped: ${d.killSwitch.stoppedConnectors.join(", ")})` : ""}\n` +
       `pending approvals: ${d.pendingApprovals}\n` +
-      `economics: revenue $${d.economics.totalRevenueUsd.toFixed(2)}, cost $${d.economics.totalCostUsd.toFixed(2)}, profit $${d.economics.totalProfitUsd.toFixed(2)}\n` +
+      `economics: confirmed income $${d.economics.totalActualRevenueUsd.toFixed(2)}, cost $${d.economics.totalCostUsd.toFixed(2)}, net $${d.economics.totalProfitUsd.toFixed(2)}\n` +
+      `awaiting payment (delivered, unconfirmed): $${d.economics.pendingPaymentsUsd.toFixed(2)}\n` +
       `connectors: ${connectorSummary}\n` +
       `audit entries: ${d.auditEntryCount}`
     );
@@ -458,7 +487,7 @@ class TelegramApprovalBot {
 
   async _handleCallbackQuery(cq) {
     const chatId = cq.message?.chat?.id;
-    if (!this.allowedChatIds.has(String(chatId))) {
+    if (!this._isAuthorized(cq.message?.chat, cq.from)) {
       await this._answerCallback(cq.id, "Not authorized.", true);
       return;
     }
@@ -534,17 +563,21 @@ class TelegramApprovalBot {
           // with revenueUsd explicitly 0 so it can never inflate the real
           // totals. taskId enables the idempotent-recording guarantee
           // already built into record().
+          // taskId = the stored TASK's id (what the pipeline uses), not the listing's: one outcome, one event.
           agent.economics.record({
             type: "task_completed",
-            taskId: raw.id,
+            taskId: record.task.id,
             connector: strategy.connectorName,
+            model: result.meta?.model,
             revenueUsd: 0,
-            expectedRevenueUsd: raw.reward_usd ?? raw.budget_usdc ?? 0,
-            costUsd: 0,
+            expectedRevenueUsd: strategy.submitKind === "delivery" ? record.task.rewardUsd ?? raw.reward_usd ?? raw.budget_usdc ?? 0 : 0,
+            bidRewardUsd: strategy.submitKind === "delivery" ? undefined : record.task.rewardUsd ?? raw.reward_usd ?? raw.budget_usdc ?? 0,
+            costUsd: result.meta?.costUsd ?? 0,
           });
+          if (agent.learning) agent.learning.markOpportunityDead(strategy.connectorName, raw.id, "submitted");
           await this._send(chatId, `📤 Submitted to ${strategy.connectorName} for opportunity <code>${escapeHtml(String(raw.id))}</code>.`);
         } catch (submitErr) {
-          agent.economics.record({ type: "task_failed", taskId: raw.id, connector: strategy.connectorName });
+          agent.economics.record({ type: "task_failed", taskId: record.task.id, connector: strategy.connectorName });
           await this._send(chatId, `⚠️ Drafted OK but submitting to ${strategy.connectorName} failed: ${escapeHtml(submitErr.message)}`);
         }
       }
@@ -605,7 +638,7 @@ class TelegramApprovalBot {
   _startAutoScheduler() {
     if (String(process.env.AUTO_RUN_ENABLED).toLowerCase() !== "true") return;
 
-    const intervalMinutes = Number(process.env.AUTO_RUN_INTERVAL_MINUTES || 30);
+    const intervalMinutes = Math.max(1, positiveNumber(process.env.AUTO_RUN_INTERVAL_MINUTES, 30, { name: "AUTO_RUN_INTERVAL_MINUTES" }));
     const requestedKeys = (process.env.AUTO_RUN_STRATEGIES || "")
       .split(",")
       .map((s) => s.trim().toLowerCase())
