@@ -77,12 +77,14 @@ class MemoryCache {
     return true;
   }
 
-  async lookup(capability, prompt) {
+  async lookup(capability, prompt, { allowSemantic = true } = {}) {
     const key = hashKey(capability, prompt);
     const exact = this._exact.get(key);
     if (this._isValid(exact)) {
       return { hit: true, via: "exact", entry: exact };
     }
+
+    if (!allowSemantic) return { hit: false };
 
     // Semantic lookup only if embeddings are actually available (Gemini configured).
     try {
