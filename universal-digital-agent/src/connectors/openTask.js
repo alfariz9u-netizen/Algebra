@@ -66,7 +66,7 @@ class OpenTaskConnector {
   }
 
   async getTask(taskId) {
-    const response = await fetch(`${API_BASE}/tasks/${taskId}`, { headers: this._headers() });
+    const response = await fetch(`${API_BASE}/tasks/${encodeURIComponent(taskId)}`, { headers: this._headers() });
     return this._checkOk(response, `GET /tasks/${taskId}`);
   }
 
@@ -104,7 +104,7 @@ class OpenTaskConnector {
       approach: approach || "",
       expectedTaskUpdatedAt,
     };
-    const response = await fetch(`${API_BASE}/agent/tasks/${taskId}/bids`, {
+    const response = await fetch(`${API_BASE}/agent/tasks/${encodeURIComponent(taskId)}/bids`, {
       method: "POST",
       headers: this._headers(),
       body: JSON.stringify(payload),
@@ -117,7 +117,7 @@ class OpenTaskConnector {
    * Docs: PATCH /api/agent/bids/:bidId with body {action: "withdraw"}.
    */
   async withdrawBid(bidId) {
-    const response = await fetch(`${API_BASE}/agent/bids/${bidId}`, {
+    const response = await fetch(`${API_BASE}/agent/bids/${encodeURIComponent(bidId)}`, {
       method: "PATCH",
       headers: this._headers(),
       body: JSON.stringify({ action: "withdraw" }),
