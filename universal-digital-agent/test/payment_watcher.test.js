@@ -97,20 +97,21 @@ test("scanWalletForPayments(solana): a failed transaction (err set) is skipped â
 
 test("scanWalletForPayments(base): decodes a real ERC-20 Transfer log into a USD amount", async () => {
   const toAddress = "0x000000000000000000000000000000000000ab";
+  const LOG = {
+    transactionHash: "0xabc123",
+    logIndex: "0x0",
+    data: "0x00000000000000000000000000000000000000000000000000000002faf080", // 50,000,000 (6-decimal USDC) = 50.0
+    topics: [
+      "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",
+      "0x000000000000000000000000111111111111111111111111111111111111aa", // from
+      "0x000000000000000000000000000000000000000000000000000000000000ab", // to (our wallet, padded)
+    ],
+  };
+  let call = 0;
   const fetchImpl = jsonRpcResponder({
     eth_blockNumber: () => "0x" + (30_000_000).toString(16),
-    eth_getLogs: () => [
-      {
-        transactionHash: "0xabc123",
-        logIndex: "0x0",
-        data: "0x00000000000000000000000000000000000000000000000000000002faf080", // 50,000,000 (6-decimal USDC) = 50.0
-        topics: [
-          "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",
-          "0x000000000000000000000000111111111111111111111111111111111111aa", // from
-          "0x000000000000000000000000000000000000000000000000000000000000ab", // to (our wallet, padded)
-        ],
-      },
-    ],
+    // The scan is chunked into several eth_getLogs ranges; a real node returns the log for ONE of them.
+    eth_getLogs: () => (call++ === 0 ? [LOG] : []),
   });
 
   const payments = await scanWalletForPayments({ network: "base", walletAddress: toAddress, tokens: ["usdc"], fetchImpl });
