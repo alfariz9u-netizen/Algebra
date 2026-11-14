@@ -44,10 +44,29 @@
 
 const MIN_BOUNTY_USD = Number(process.env.GITHUB_BOUNTY_MIN_USD || 20);
 
+const MAX_BOUNTY_USD = Number(process.env.GITHUB_BOUNTY_MAX_USD) > 0 ? Number(process.env.GITHUB_BOUNTY_MAX_USD) : 5000;
+
+/**
+ * The amount must be tied to a bounty marker (💎 $N, "$N bounty/reward", "bounty: $N", or a "[$N]" title
+ * prefix). The old code took the FIRST "$N" anywhere in the issue text — "costs $5 to run" or an author
+ * writing "$9999" inflated the reward estimate. Unmarked or absurd amounts are "unknown" (rejected).
+ */
 function parseBountyUsd(issue) {
-  const text = `${issue.title || ""} ${issue.body || ""}`;
-  const match = text.match(/\$(\d+(?:\.\d+)?)/);
-  return match ? Number(match[1]) : null;
+  const text = `${issue.title || ""}\n${issue.body || ""}`;
+  const patterns = [
+    /💎\s*\$\s?(\d[\d,]*(?:\.\d+)?)/,
+    /\$\s?(\d[\d,]*(?:\.\d+)?)\s*(?:bounty|reward)\b/i,
+    /\b(?:bounty|reward)\b[^$\n]{0,20}\$\s?(\d[\d,]*(?:\.\d+)?)/i,
+    /^\s*\[\s*\$\s?(\d[\d,]*(?:\.\d+)?)\s*\]/,
+  ];
+  for (const re of patterns) {
+    const m = re.exec(text);
+    if (m) {
+      const n = Number(m[1].replace(/,/g, ""));
+      return Number.isFinite(n) && n > 0 && n <= MAX_BOUNTY_USD ? n : null;
+    }
+  }
+  return null;
 }
 
 /**
