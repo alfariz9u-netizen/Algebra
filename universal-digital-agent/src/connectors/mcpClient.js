@@ -27,11 +27,30 @@ const REQUEST_TIMEOUT_MS = Number(process.env.MCP_REQUEST_TIMEOUT_MS || 15000);
 
 let requestCounter = 0;
 
+/** Extracts the JSON-RPC response for `id` from a text/event-stream body. */
+function parseSseResponse(text, id) {
+  let fallback = null;
+  for (const block of String(text).split(/\r?\n\r?\n/)) {
+    const dataLines = block.split(/\r?\n/).filter((l) => l.startsWith("data:")).map((l) => l.slice(5).trimStart());
+    if (dataLines.length === 0) continue;
+    try {
+      const msg = JSON.parse(dataLines.join("\n"));
+      if (msg && msg.id === id) return msg;
+      if (msg && (msg.result !== undefined || msg.error)) fallback = msg;
+    } catch {
+      /* ignore non-JSON events */
+    }
+  }
+  if (fallback) return fallback;
+  throw new Error("MCP event-stream response contained no JSON-RPC result.");
+}
+
 class McpClient {
   constructor({ serverUrl, allowedTools = [] } = {}) {
     this.serverUrl = serverUrl;
     this.allowedTools = new Set(allowedTools); // explicit allow-list, deny by default
     this._initialized = false;
+    this._sessionId = null;
   }
 
   status() {
@@ -49,7 +68,7 @@ class McpClient {
     try {
       response = await fetch(this.serverUrl, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: this._headers(),
         body: JSON.stringify({ jsonrpc: "2.0", id, method, params }),
         signal: controller.signal,
       });
@@ -72,9 +91,34 @@ class McpClient {
       throw new Error(`MCP response body exceeds size limit (${rawText.length} > ${MAX_RESPONSE_BYTES} bytes).`);
     }
 
-    const data = JSON.parse(rawText);
+    const sid = response.headers.get("mcp-session-id");
+    if (sid) this._sessionId = sid;
+    const contentType = String(response.headers.get("content-type") || "");
+    const data = contentType.includes("text/event-stream") ? parseSseResponse(rawText, id) : JSON.parse(rawText);
     if (data.error) throw new Error(`MCP error (${method}): ${data.error.message}`);
     return data.result;
+  }
+
+  _headers() {
+    return {
+      "Content-Type": "application/json",
+      // Streamable-HTTP servers require BOTH media types in Accept and may reply with an SSE stream.
+      Accept: "application/json, text/event-stream",
+      ...(this._sessionId ? { "Mcp-Session-Id": this._sessionId } : {}),
+    };
+  }
+
+  /** JSON-RPC notification (no id, no response expected). Best effort. */
+  async _notify(method, params) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    try {
+      await fetch(this.serverUrl, { method: "POST", headers: this._headers(), body: JSON.stringify({ jsonrpc: "2.0", method, params }), signal: controller.signal });
+    } catch {
+      /* servers that don't care about the notification are fine */
+    } finally {
+      clearTimeout(timeout);
+    }
   }
 
   async initialize() {
@@ -84,6 +128,8 @@ class McpClient {
       clientInfo: { name: "universal-digital-agent", version: "0.1.0" },
     });
     this._initialized = true;
+    // The MCP lifecycle requires this after `initialize`; strict servers reject tools/list without it.
+    await this._notify("notifications/initialized");
     return result;
   }
 
