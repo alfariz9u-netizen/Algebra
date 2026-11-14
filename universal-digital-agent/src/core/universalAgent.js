@@ -180,7 +180,7 @@ class UniversalAgent {
     const resolvedEncryptionKey = encryptionKey || process.env.PERSIST_ENCRYPTION_KEY || undefined;
     this.modelRouter = new ModelRouter();
     this.memory = new MemoryCache(this.modelRouter, { persistDir, encryptionKey: resolvedEncryptionKey });
-    this.tokens = new TokenController();
+    this.tokens = new TokenController({}, { persistDir, encryptionKey: resolvedEncryptionKey });
     this.permissions = new PermissionSystem({ persistDir, encryptionKey: resolvedEncryptionKey });
     this.audit = new AuditLog({ persistDir, encryptionKey: resolvedEncryptionKey });
     this.killSwitch = new KillSwitch({ persistDir, encryptionKey: resolvedEncryptionKey });
@@ -188,7 +188,7 @@ class UniversalAgent {
       capacity: Number(process.env.CONNECTOR_RATE_LIMIT_CAPACITY || 10),
       refillPerSecond: Number(process.env.CONNECTOR_RATE_LIMIT_REFILL_PER_SEC || 1),
     });
-    this.economics = new EconomicIntelligence({ persistDir, encryptionKey: resolvedEncryptionKey });
+    this.economics = new EconomicIntelligence({ persistDir, encryptionKey: resolvedEncryptionKey, strictRevenue: true });
     // Real per-request free-tier quota counter (Groq/Gemini), shared by
     // every task this agent instance processes — see llmPricing.js for
     // why this exists and where its numbers come from.
@@ -337,7 +337,10 @@ class UniversalAgent {
       }
     }
 
-    const cacheResult = await this.memory.lookup(capability.name, userPrompt);
+    // Semantic (similar, not identical) cache hits are only safe for internal prompts. A paid marketplace
+    // task with a similar-looking prompt would otherwise be answered with ANOTHER customer's deliverable.
+    const allowSemantic = !(task.rewardUsd > 0) && !task.untrustedContent;
+    const cacheResult = await this.memory.lookup(capability.name, userPrompt, { allowSemantic });
     if (cacheResult.hit) {
       this.audit.record({
         agentId: this.agentId,
@@ -441,7 +444,7 @@ class UniversalAgent {
     const passed = verification.passed && qa.passed;
 
     if (!passed) {
-      this.economics.record({ type: "task_failed", taskId, model: generation.model, connector: task.sourceConnector });
+      if (!task.deferEconomics) this.economics.record({ type: "task_failed", taskId, model: generation.model, connector: task.sourceConnector });
       return this._fail(
         taskId,
         `Did not pass verification/QA. Verification: ${verification.checks.join("; ")}. QA: ${qa.message}`
@@ -466,16 +469,19 @@ class UniversalAgent {
     // sees less headroom left today), the real priced $ amount otherwise
     // — see llmPricing.js for the sourced per-token rates and the daily
     // quota tracker.
-    this.economics.record({
-      type: "task_completed",
-      taskId,
-      model: generation.model,
-      connector: task.sourceConnector,
-      // The reward is an expectation, not money received: only recordPayment() makes revenue.
-      revenueUsd: 0,
-      expectedRevenueUsd: task.rewardUsd || 0,
-      costUsd: estimateCostUsd(generation.provider, generation.model, generation.usage, this.llmQuota),
-    });
+    const costUsd = estimateCostUsd(generation.provider, generation.model, generation.usage, this.llmQuota);
+    if (!task.deferEconomics) {
+      this.economics.record({
+        type: "task_completed",
+        taskId,
+        model: generation.model,
+        connector: task.sourceConnector,
+        // The reward is an expectation, not money received: only recordPayment() makes revenue.
+        revenueUsd: 0,
+        expectedRevenueUsd: task.rewardUsd || 0,
+        costUsd,
+      });
+    }
 
     if (LESSON_STORE_ENABLED && supabase && supabase.status() === "CONNECTED") {
       const lessonOutcome = { status: "success", output: generation.text, meta: { qaScore: qa.score } };
@@ -515,11 +521,29 @@ class UniversalAgent {
       tokenUsage: actualTokens,
       model: generation.model,
       provider: generation.provider,
+      costUsd,
       lessonsRecalled: recalledLessons.length,
     });
   }
 
+  /**
+   * Serialized entry point: two tasks finishing together used to both pass the cooldown check (it is
+   * only updated AFTER the slow LLM + HTTP calls) and publish two posts inside the 30-minute limit.
+   */
   async _maybePublishMoltbookPost(task, capability, outputText, qaScore) {
+    if (this._moltbookPosting) {
+      console.log("[universalAgent] moltbook post skipped: another post is already in progress");
+      return;
+    }
+    this._moltbookPosting = true;
+    try {
+      await this._publishMoltbookPostUnlocked(task, capability, outputText, qaScore);
+    } finally {
+      this._moltbookPosting = false;
+    }
+  }
+
+  async _publishMoltbookPostUnlocked(task, capability, outputText, qaScore) {
     if (!MOLTBOOK_POST_ENABLED) return;
 
     // FIX: same unguarded-get() crash risk as the Supabase hook above —
@@ -555,7 +579,8 @@ class UniversalAgent {
           taskType,
           connector,
           capName,
-          outputSummary: trimmed.slice(0, 600),
+          // NOT the deliverable's text: that belongs to the client and the post is public. Only neutral facts.
+          outputSummary: `a deliverable of about ${trimmed.split(/\s+/).length} words was produced and delivered`,
           qaScore,
         }),
         "default"
@@ -822,7 +847,17 @@ class UniversalAgent {
         userPrompt,
         tier: capability.tier,
         tools,
-        executeTool: (name, args) => this.callConnector("mcp", "callTool", "USE_MCP_TOOL", () => mcp.callTool(name, args)),
+        // Tool output is attacker-influenced data (a web page, a document, another system's text). It is
+        // fed back to the model labeled as untrusted DATA, with the same injection scan as every other
+        // external text, and flagged in the audit log when it looks like an injection attempt.
+        executeTool: async (name, args) => {
+          const raw = await this.callConnector("mcp", "callTool", "USE_MCP_TOOL", () => mcp.callTool(name, args));
+          const { labeled, scan } = labelUntrustedContent(`mcp-tool:${name}`, typeof raw === "string" ? raw : JSON.stringify(raw ?? null));
+          if (scan.suspicious) {
+            this.audit.record({ agentId: this.agentId, connector: "mcp", action: `TOOL_OUTPUT_FLAGGED:${name}`, result: JSON.stringify(scan.matches), riskLevel: "HIGH" });
+          }
+          return labeled;
+        },
       });
       this.learning.recordSuccess("mcp", "callTool");
       for (const call of result.toolCallLog) {
