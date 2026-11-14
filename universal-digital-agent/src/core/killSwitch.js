@@ -96,6 +96,16 @@ class KillSwitch {
    * immediately, not just eventually.
    */
   assertCanAct(connectorName) {
+    // Operator override that does NOT depend on the (ephemeral on Render) local disk: set
+    // AGENT_KILL_SWITCH=true (everything) or AGENT_STOPPED_CONNECTORS=openTask,moltbook in the
+    // environment and the agent refuses to act after the next process start, even with empty state.
+    if (String(process.env.AGENT_KILL_SWITCH || "").toLowerCase() === "true") {
+      throw new Error("GLOBAL_KILL_SWITCH is active: AGENT_KILL_SWITCH=true in the environment.");
+    }
+    const envStopped = String(process.env.AGENT_STOPPED_CONNECTORS || "").split(",").map((s) => s.trim()).filter(Boolean);
+    if (connectorName && envStopped.includes(connectorName)) {
+      throw new Error(`Connector "${connectorName}" is stopped (AGENT_STOPPED_CONNECTORS).`);
+    }
     this._sync();
     if (this.globalStopped) {
       throw new Error(`GLOBAL_KILL_SWITCH is active${this._reason ? `: ${this._reason}` : ""}.`);
