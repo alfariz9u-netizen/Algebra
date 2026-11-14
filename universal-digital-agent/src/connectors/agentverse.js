@@ -64,6 +64,13 @@ const AGENTVERSE_API_BASE = "https://agentverse.ai";
 function runBridge(command, args = {}) {
   return new Promise((resolve, reject) => {
     const proc = spawn("python3", [BRIDGE_SCRIPT, command, JSON.stringify(args)]);
+    // A hung Python process (network stall inside the SDK) used to block the whole scheduler forever.
+    const timeoutMs = Number(process.env.PYTHON_BRIDGE_TIMEOUT_MS) > 0 ? Number(process.env.PYTHON_BRIDGE_TIMEOUT_MS) : 60000;
+    let timedOut = false;
+    const killTimer = setTimeout(() => {
+      timedOut = true;
+      proc.kill("SIGKILL");
+    }, timeoutMs);
     let stdout = "";
     let stderr = "";
 
@@ -71,10 +78,13 @@ function runBridge(command, args = {}) {
     proc.stderr.on("data", (chunk) => (stderr += chunk));
 
     proc.on("error", (err) => {
+      clearTimeout(killTimer);
       reject(new Error(`Failed to launch python3 bridge: ${err.message}`));
     });
 
     proc.on("close", () => {
+      clearTimeout(killTimer);
+      if (timedOut) return reject(new Error(`agentverse bridge timed out after ${timeoutMs}ms.`));
       try {
         const parsed = JSON.parse(stdout.trim().split("\n").pop());
         if (parsed.error) {
