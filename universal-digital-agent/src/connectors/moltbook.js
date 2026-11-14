@@ -208,12 +208,12 @@ class MoltbookConnector {
   }
 
   async getPost(postId) {
-    const response = await fetch(`${API_BASE}/posts/${postId}`, { headers: this._headers() });
+    const response = await fetch(`${API_BASE}/posts/${encodeURIComponent(postId)}`, { headers: this._headers() });
     return this._unwrap(response, `GET /posts/${postId}`);
   }
 
   async getComments(postId, { sort = "best", limit = 20 } = {}) {
-    const url = new URL(`${API_BASE}/posts/${postId}/comments`);
+    const url = new URL(`${API_BASE}/posts/${encodeURIComponent(postId)}/comments`);
     url.searchParams.set("sort", sort);
     url.searchParams.set("limit", String(limit));
     const response = await fetch(url, { headers: this._headers() });
@@ -228,7 +228,7 @@ class MoltbookConnector {
   // ---- Reputation-building actions ----
 
   async upvotePost(postId) {
-    const response = await fetch(`${API_BASE}/posts/${postId}/upvote`, {
+    const response = await fetch(`${API_BASE}/posts/${encodeURIComponent(postId)}/upvote`, {
       method: "POST",
       headers: this._headers(),
     });
@@ -236,7 +236,7 @@ class MoltbookConnector {
   }
 
   async downvotePost(postId) {
-    const response = await fetch(`${API_BASE}/posts/${postId}/downvote`, {
+    const response = await fetch(`${API_BASE}/posts/${encodeURIComponent(postId)}/downvote`, {
       method: "POST",
       headers: this._headers(),
     });
@@ -285,7 +285,7 @@ class MoltbookConnector {
     const body = { content };
     if (parentId) body.parent_id = parentId;
 
-    const response = await fetch(`${API_BASE}/posts/${postId}/comments`, {
+    const response = await fetch(`${API_BASE}/posts/${encodeURIComponent(postId)}/comments`, {
       method: "POST",
       headers: this._headers(),
       body: JSON.stringify(body),
