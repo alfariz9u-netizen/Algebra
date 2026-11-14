@@ -68,8 +68,15 @@ function verifyNoUnverifiedClaimSuppressed(text) {
  * style arithmetic claims found in the text and checks them, rather than
  * trusting the model's arithmetic.
  */
-function verifyArithmetic(text) {
-  const pattern = /(-?\d+(?:\.\d+)?)\s*([*+/-])\s*(-?\d+(?:\.\d+)?)\s*=\s*(-?\d+(?:\.\d+)?)/g;
+function verifyArithmetic(rawText) {
+  // Normalise how humans write numbers: "1,000 + 500 = 1,500" used to parse as "000 + 500 = 1" (a false
+  // failure of correct math), and "$" prefixes hid the second operand entirely.
+  const text = String(rawText || "")
+    .replace(/(\d),(?=\d{3}(?!\d))/g, "$1")
+    .replace(/[$€£]\s?/g, "");
+  // A chain such as "1 + 2 + 3 = 6" must not be sliced into the bogus claim "2 + 3 = 6": an operand that is
+  // itself preceded/followed by another operator is not a simple "A op B = C" claim and is skipped.
+  const pattern = /(?<![\d.]\s*[*+/-]\s*)(?<![\d.])(-?\d+(?:\.\d+)?)\s*([*+/-])\s*(-?\d+(?:\.\d+)?)\s*=\s*(-?\d+(?:\.\d+)?)(?!\s*[*+/-]\s*\d)/g;
   const checks = [];
   let passed = true;
   let match;
@@ -85,7 +92,9 @@ function verifyArithmetic(text) {
       case "*": actual = A * B; break;
       case "/": actual = A / B; break;
     }
-    const ok = Math.abs(actual - claimedVal) < 0.01;
+    // Tolerance follows the precision the author wrote: "100 / 3 = 33.3" is right to one decimal place.
+    const decimals = (claimed.split(".")[1] || "").length;
+    const ok = Number.isFinite(actual) && Math.abs(actual - claimedVal) <= 0.5 * 10 ** -decimals + 1e-9;
     checks.push(`${a} ${op} ${b} = ${claimed} -> ${ok ? "correct" : `incorrect (actual ${actual})`}`);
     if (!ok) passed = false;
   }
