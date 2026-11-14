@@ -26,6 +26,18 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { deriveKey, encrypt, decrypt, isEncryptedPayload } = require("./encryption");
 
+/** Moves an unreadable file aside (never deletes it) and returns the fallback. */
+function quarantine(filePath, reason, fallback) {
+  const target = `${filePath}.corrupt-${Date.now()}`;
+  try {
+    fs.renameSync(filePath, target);
+  } catch {
+    /* if even that fails, still return the fallback */
+  }
+  console.error(`[fileStore] ${filePath} is unreadable: ${reason}. Moved to ${target}; continuing with an empty state.`);
+  return fallback;
+}
+
 class JsonFileStore {
   constructor(filePath, { encryptionKey } = {}) {
     this.filePath = filePath;
@@ -42,8 +54,16 @@ class JsonFileStore {
       throw new Error(`Failed to load persisted state from ${this.filePath}: ${err.message}`);
     }
 
-    const parsed = JSON.parse(raw);
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (err) {
+      // A torn/corrupt snapshot (process killed mid-write on a non-atomic filesystem, disk full) used to
+      // throw here and crash-loop the whole service at boot. Keep the bad file for forensics, start clean.
+      return quarantine(this.filePath, `invalid JSON (${err.message})`, defaultValue);
+    }
     if (this._key && isEncryptedPayload(parsed)) {
+      // A wrong key or tampering must STILL throw: silently starting empty would overwrite real data.
       return JSON.parse(decrypt(parsed, this._key));
     }
     return parsed;
@@ -83,10 +103,22 @@ class AppendLog {
   loadAll() {
     try {
       const raw = fs.readFileSync(this.filePath, "utf8");
-      return raw
-        .split("\n")
-        .filter(Boolean)
-        .map((line) => this._deserializeLine(line));
+      const entries = [];
+      let skipped = 0;
+      for (const line of raw.split("\n").filter(Boolean)) {
+        try {
+          entries.push(this._deserializeLine(line));
+        } catch (err) {
+          // A torn last line (killed mid-append) must not make the whole history — or the boot — fail.
+          // An authentication failure on an ENCRYPTED line still means wrong key/tampering: surface it.
+          if (this._key && /authenticate|auth tag|unable to/i.test(err.message)) {
+            throw new Error(`Failed to load append log from ${this.filePath}: ${err.message}`);
+          }
+          skipped += 1;
+        }
+      }
+      if (skipped > 0) console.error(`[fileStore] ${this.filePath}: skipped ${skipped} unreadable line(s) (torn write?).`);
+      return entries;
     } catch (err) {
       if (err.code === "ENOENT") return [];
       throw new Error(`Failed to load append log from ${this.filePath}: ${err.message}`);
