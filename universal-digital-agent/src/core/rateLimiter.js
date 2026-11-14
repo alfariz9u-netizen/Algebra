@@ -20,9 +20,18 @@ class RateLimiter {
     this.buckets = new Map(); // key -> { tokens, lastRefill }
   }
 
+  /** Drops buckets that have fully refilled (identical to a fresh one) so per-IP keys can't pile up forever. */
+  _sweep() {
+    const now = this._now();
+    for (const [key, b] of this.buckets) {
+      if (b.tokens + ((now - b.lastRefill) / 1000) * this.refillPerSecond >= this.capacity) this.buckets.delete(key);
+    }
+  }
+
   _bucket(key) {
     let bucket = this.buckets.get(key);
     if (!bucket) {
+      if (this.buckets.size >= (this.maxKeys || 5000)) this._sweep();
       bucket = { tokens: this.capacity, lastRefill: this._now() };
       this.buckets.set(key, bucket);
     }
