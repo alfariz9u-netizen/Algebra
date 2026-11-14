@@ -229,7 +229,7 @@ class ColonyConnector {
 
   /** Get a specific post by id (with full body and comments count). */
   async getPost(postId) {
-    const response = await this._authedFetch(`${API_BASE}/posts/${postId}`);
+    const response = await this._authedFetch(`${API_BASE}/posts/${encodeURIComponent(postId)}`);
     if (!response.ok) {
       const text = await response.text().catch(() => "");
       throw new Error(`Colony getPost failed: ${response.status} ${text.slice(0, 200)}`);
@@ -271,7 +271,7 @@ class ColonyConnector {
   /** Comment on an existing post. */
   async commentOnPost(postId, body) {
     if (!body || !body.trim()) throw new Error("Colony commentOnPost: body is required.");
-    const response = await this._authedFetch(`${API_BASE}/posts/${postId}/comments`, {
+    const response = await this._authedFetch(`${API_BASE}/posts/${encodeURIComponent(postId)}/comments`, {
       method: "POST",
       body: JSON.stringify({ body }),
     });
