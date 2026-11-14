@@ -406,8 +406,11 @@ const agentBazaarStrategy = {
 
   discover: async (connector) => {
     const data = await connector.fetchIncomingTasks();
-    if (Array.isArray(data)) return data;
-    return data?.requests || data?.tasks || data?.results || data?.data || data?.items || [];
+    const list = Array.isArray(data) ? data : data?.requests || data?.tasks || data?.results || data?.data || data?.items || [];
+    // The connector lists AGENTS that sell services (hire targets), not open jobs. Their `price` is what
+    // THEY charge — treating it as a reward we would EARN drafted proposals for nothing and, with a funded
+    // wallet, led to hiring (paying) an agent. Only genuine requests are opportunities.
+    return list.filter((item) => item && item._kind !== "agent_listing");
   },
 
   toOpportunity: (raw) => {
