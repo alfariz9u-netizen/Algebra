@@ -46,6 +46,7 @@
  */
 
 const { buildAgent } = require("./index");
+const { intervalMs, positiveNumber } = require("./core/config");
 const { createServer } = require("./a2aServer");
 const MarketplacePipeline = require("./core/marketplacePipeline");
 const moltMarketStrategy = require("./core/strategies/moltMarket");
@@ -65,7 +66,9 @@ const agentBazaarStrategy = require("./core/strategies/agentBazaar");
 
 // Render sets PORT itself; A2A_SERVER_PORT is honored too for parity with a2aServer.js run standalone.
 const PORT = Number(process.env.PORT || process.env.A2A_SERVER_PORT || 8787);
-const CYCLE_MS = Number(process.env.MARKETPLACE_CYCLE_MS || 30 * 60 * 1000);
+const CYCLE_MS = intervalMs(process.env.MARKETPLACE_CYCLE_MS, 30 * 60 * 1000, { floorMs: 10000, name: "MARKETPLACE_CYCLE_MS" });
+// One strategy that hangs (a stuck Python bridge, a slow API) must not freeze the whole round forever.
+const STRATEGY_TIMEOUT_MS = positiveNumber(process.env.STRATEGY_CYCLE_TIMEOUT_MS, 10 * 60 * 1000, { name: "STRATEGY_CYCLE_TIMEOUT_MS" });
 // Real revenue confirmation (see paymentWatcher.js and
 // economicIntelligence.recordPayment()). Every 5 minutes by default — far
 // more frequent than the 24h lookback window that gets re-scanned each
@@ -73,7 +76,7 @@ const CYCLE_MS = Number(process.env.MARKETPLACE_CYCLE_MS || 30 * 60 * 1000);
 // window would otherwise roll past it. recordPayment()'s own
 // txSignature-based idempotency is what makes the repeated re-scanning
 // safe (see the tests in payment_watcher.test.js).
-const PAYMENT_WATCH_CYCLE_MS = Number(process.env.PAYMENT_WATCH_CYCLE_MS || 5 * 60 * 1000);
+const PAYMENT_WATCH_CYCLE_MS = intervalMs(process.env.PAYMENT_WATCH_CYCLE_MS, 5 * 60 * 1000, { floorMs: 10000, name: "PAYMENT_WATCH_CYCLE_MS" });
 
 // moltbookStrategy is appended last: it is pure reputation-building
 // (rewardUsd=0, reputationValue>0), so it should not displace or delay
@@ -92,20 +95,29 @@ const STRATEGIES = [
   moltbookStrategy, // ← جديد
 ];
 
-function startMarketplaceScheduler(agent) {
-  const pipeline = new MarketplacePipeline(agent);
-  const opts = {
-    minExpectedValue: Number(process.env.MIN_EXPECTED_VALUE_USD || 0),
-    maxOpportunities: Number(process.env.MAX_OPPORTUNITIES || 1),
-  };
+/**
+ * Builds the function that runs ONE round over `strategies`. Guarantees:
+ *  - never two rounds at once (setInterval does not wait for the previous round; a slow LLM or a hung
+ *    bridge used to make rounds overlap and process the same tasks twice);
+ *  - one strategy that hangs is abandoned after `timeoutMs` so the others still run;
+ *  - one strategy's failure never stops the rest.
+ */
+function makeRoundRunner({ pipeline, strategies, opts, timeoutMs }) {
+  let roundRunning = false;
 
-  async function runOneRound() {
-    for (const strategy of STRATEGIES) {
+  async function runRound() {
+    for (const strategy of strategies) {
+      let timer;
       try {
-        const cycle = await pipeline.runCycle(strategy, opts);
+        const cycle = await Promise.race([
+          pipeline.runCycle(strategy, opts),
+          new Promise((_, reject) => {
+            timer = setTimeout(() => reject(new Error(`cycle timed out after ${Math.round(timeoutMs / 1000)}s`)), timeoutMs);
+          }),
+        ]);
         if (cycle.status === "completed") {
           console.log(
-            `[cycle:${strategy.connectorName}] discovered=${cycle.discovered} accepted=${cycle.accepted} rejected=${cycle.rejected} skippedKnownDead=${cycle.skippedKnownDead}`
+            `[cycle:${strategy.connectorName}] discovered=${cycle.discovered} accepted=${cycle.accepted} rejected=${cycle.rejected} skippedKnownDead=${cycle.skippedKnownDead}${cycle.malformed ? ` malformed=${cycle.malformed}` : ""}`
           );
         } else if (cycle.status === "skipped_circuit_open") {
           console.log(`[cycle:${strategy.connectorName}] skipped — circuit open (${cycle.kind}), retry in ~${Math.round(cycle.retryAfterMs / 60000)}m`);
@@ -113,14 +125,37 @@ function startMarketplaceScheduler(agent) {
           console.log(`[cycle:${strategy.connectorName}] ${cycle.status}`);
         }
       } catch (err) {
-        // A connector with no credentials, or any other cycle-ending error, is
-        // logged once per round rather than crashing the scheduler (and taking
-        // the A2A server down with it) or repeating unnecessarily — see
-        // learningEngine.js for why this connector may back off further on its own.
+        // A connector with no credentials, or any other cycle-ending error, is logged once per round
+        // rather than crashing the scheduler (see learningEngine.js for the per-connector backoff).
         console.error(`[cycle:${strategy.connectorName}] cycle failed: ${err.message}`);
+      } finally {
+        clearTimeout(timer);
       }
     }
   }
+
+  return async function runOneRound() {
+    if (roundRunning) {
+      console.warn("[scheduler] previous round still running — skipping this tick.");
+      return false;
+    }
+    roundRunning = true;
+    try {
+      await runRound();
+      return true;
+    } finally {
+      roundRunning = false;
+    }
+  };
+}
+
+function startMarketplaceScheduler(agent) {
+  const pipeline = new MarketplacePipeline(agent);
+  const opts = {
+    minExpectedValue: Number.isFinite(Number(process.env.MIN_EXPECTED_VALUE_USD)) ? Number(process.env.MIN_EXPECTED_VALUE_USD || 0) : 0,
+    maxOpportunities: Math.max(1, Math.floor(positiveNumber(process.env.MAX_OPPORTUNITIES, 1, { name: "MAX_OPPORTUNITIES" }))),
+  };
+  const runOneRound = makeRoundRunner({ pipeline, strategies: STRATEGIES, opts, timeoutMs: STRATEGY_TIMEOUT_MS });
 
   runOneRound().catch((err) => console.error("initial marketplace round failed:", err.message));
   const timer = setInterval(() => {
@@ -141,7 +176,18 @@ function startMarketplaceScheduler(agent) {
 function startPaymentWatcher(agent) {
   const { runPaymentWatchCycle } = require("./core/paymentWatcher");
 
+  let running = false;
   async function runOneCycle() {
+    if (running) return; // a slow RPC must not stack scans on top of each other
+    running = true;
+    try {
+      await scanOnce();
+    } finally {
+      running = false;
+    }
+  }
+
+  async function scanOnce() {
     const result = await runPaymentWatchCycle(agent.economics);
     if (result.scanned.length === 0) return; // no wallet configured — nothing to do, no need to log every 5 minutes
     for (const s of result.scanned) {
@@ -160,14 +206,14 @@ function startPaymentWatcher(agent) {
   return () => clearInterval(timer);
 }
 
-function startTelegramBot() {
+function startTelegramBot(agent) {
   if (!process.env.TELEGRAM_BOT_TOKEN) {
     console.log("TELEGRAM_BOT_TOKEN not set — running without the Telegram approval bot.");
     return null;
   }
   try {
     const TelegramApprovalBot = require("./telegramApprovalBot");
-    const bot = new TelegramApprovalBot();
+    const bot = new TelegramApprovalBot({ agent }); // share the process's agent: one budget, one economics ledger
     bot.start().catch((err) => console.error("Telegram bot loop exited unexpectedly:", err.message));
     return bot;
   } catch (err) {
@@ -215,7 +261,7 @@ async function main() {
   });
   maybeRegisterOnAgentverse(agent);
 
-  const bot = startTelegramBot();
+  const bot = startTelegramBot(agent);
   const stopScheduler = startMarketplaceScheduler(agent);
   const stopPaymentWatcher = startPaymentWatcher(agent);
 
@@ -241,4 +287,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { main, startMarketplaceScheduler, startTelegramBot, startPaymentWatcher };
+module.exports = { main, STRATEGIES, makeRoundRunner, startMarketplaceScheduler, startTelegramBot, startPaymentWatcher };
