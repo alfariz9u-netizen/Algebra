@@ -2,6 +2,10 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const { JsonFileStore } = require("./persistence/fileStore");
+const { SupabaseState, WriteBehindQueue } = require("./persistence/supabaseState");
+
+// Rows of the Supabase `learning_state` table (key -> jsonb value).
+const REMOTE_KEYS = ["circuits", "deadOpportunities", "connectorStats"];
 
 function freshState() { return { circuits: {}, deadOpportunities: {}, connectorStats: {} }; }
 
@@ -32,7 +36,29 @@ function jaccard(a, b) {
 }
 
 class LearningEngine {
-  constructor({ persistDir, encryptionKey, now = () => Date.now() } = {}) {
+  /**
+   * STORAGE: circuits, deadOpportunities and connectorStats live in memory
+   * (the cache every method reads) and in `persistDir/learning-state.json`
+   * (the fallback). When SUPABASE_URL/SUPABASE_SERVICE_KEY are set they are
+   * also written to the `learning_state` table (debounced, so a burst of
+   * recordFailure/recordAttempt calls is one write), `await init()` loads
+   * them after a redeploy wiped the disk, and _sync() re-pulls at most once
+   * per LEARNING_REMOTE_TTL_MS so Supabase isn't queried on every call.
+   * Conflict rule: the side with the newer timestamp wins (last writer wins).
+   */
+  constructor({ persistDir, encryptionKey, now = () => Date.now(), supabase } = {}) {
+    this._remote = supabase || new SupabaseState();
+    this._remoteEnabled = this._remote.enabled;
+    this._queue = new WriteBehindQueue({ label: "learning", reconcile: () => this._pushNow() });
+    const ttl = Number(process.env.LEARNING_REMOTE_TTL_MS ?? 30000);
+    this._remoteTtlMs = Number.isFinite(ttl) && ttl >= 0 ? ttl : 30000;
+    const debounce = Number(process.env.LEARNING_REMOTE_DEBOUNCE_MS ?? 500);
+    this._debounceMs = Number.isFinite(debounce) && debounce >= 0 ? debounce : 500;
+    this._lastRemotePull = 0;
+    this._lastLocalWriteAt = 0;
+    this._pushTimer = null;
+    this._dirty = false;
+    this._initPromise = null;
     this._store = persistDir ? new JsonFileStore(path.join(persistDir, "learning-state.json"), { encryptionKey }) : null;
     this._now = now;
     const s = this._store ? this._store.load(freshState()) : freshState();
@@ -53,6 +79,7 @@ class LearningEngine {
   // in between. Falls back to the original always-reload behavior if
   // stat() fails for any reason other than the file not existing yet.
   _sync() {
+    this._maybeRefreshRemote();
     if (!this._store) return;
     try {
       const mtimeMs = fs.statSync(this._store.filePath).mtimeMs;
@@ -68,7 +95,110 @@ class LearningEngine {
     this.deadOpportunities = { ...(s.deadOpportunities || {}) };
     this.connectorStats = { ...(s.connectorStats || {}) };
   }
-  _persist() { if (!this._store) return; this._store.save({ circuits: this.circuits, deadOpportunities: this.deadOpportunities, connectorStats: this.connectorStats }); }
+  _persist() {
+    if (this._store) {
+      this._store.save({ circuits: this.circuits, deadOpportunities: this.deadOpportunities, connectorStats: this.connectorStats });
+      try {
+        this._lastSyncedMtimeMs = fs.statSync(this._store.filePath).mtimeMs; // our own write is not a foreign change
+      } catch { /* ignore */ }
+    }
+    this._lastLocalWriteAt = Date.now();
+    this._scheduleRemotePush();
+  }
+
+  // ---- Supabase replication -------------------------------------------------
+
+  /** Loads (and merges) Supabase's state into memory. Never rejects. */
+  init() {
+    if (!this._remoteEnabled) return Promise.resolve();
+    if (!this._initPromise) this._initPromise = this._queue.push(() => this._pullAndMerge({ force: true })).then(() => undefined);
+    return this._initPromise;
+  }
+
+  /** Writes any debounced local changes to Supabase now and waits for the queue (tests, shutdown). */
+  async flush() {
+    if (this._pushTimer) {
+      clearTimeout(this._pushTimer);
+      this._pushTimer = null;
+      this._queuePush();
+    }
+    await this._queue.flush();
+  }
+
+  _scheduleRemotePush() {
+    if (!this._remoteEnabled) return;
+    this._dirty = true;
+    if (this._pushTimer) return;
+    this._pushTimer = setTimeout(() => {
+      this._pushTimer = null;
+      this._queuePush();
+    }, this._debounceMs);
+    if (this._pushTimer.unref) this._pushTimer.unref();
+  }
+
+  _queuePush() {
+    this._queue.push(() => this._pushNow());
+  }
+
+  async _pushNow() {
+    const stamp = new Date().toISOString();
+    const rows = REMOTE_KEYS.map((key) => ({ key, value: JSON.parse(JSON.stringify(this[key])), updated_at: stamp }));
+    this._dirty = false;
+    try {
+      await this._remote.upsert("learning_state", rows, { onConflict: "key", mode: "merge" });
+    } catch (err) {
+      this._dirty = true; // keep the "unsent changes" flag so a pull can't overwrite them
+      throw err;
+    }
+  }
+
+  _maybeRefreshRemote() {
+    if (!this._remoteEnabled || Date.now() - this._lastRemotePull < this._remoteTtlMs) return;
+    this._lastRemotePull = Date.now();
+    this._queue.push(() => this._pullAndMerge({ force: false }));
+  }
+
+  async _pullAndMerge({ force }) {
+    const rows = await this._remote.selectAll("learning_state", "select=*");
+    this._lastRemotePull = Date.now();
+    // Unsent local changes always win over a pull (otherwise our own debounced write would be undone).
+    if (!force && (this._dirty || this._pushTimer)) return;
+    const localTs = this._localTimestamp();
+    let adopted = false;
+    let needPush = false;
+    for (const key of REMOTE_KEYS) {
+      const row = rows.find((r) => r.key === key);
+      if (!row) {
+        if (Object.keys(this[key]).length > 0) needPush = true; // Supabase has none of this yet
+        continue;
+      }
+      const remoteTs = new Date(row.updated_at).getTime() || 0;
+      if (remoteTs >= localTs) {
+        this[key] = { ...(row.value || {}) };
+        adopted = true;
+      } else {
+        needPush = true; // our copy is newer (e.g. recorded while Supabase was down)
+      }
+    }
+    if (adopted && this._store) {
+      this._store.save({ circuits: this.circuits, deadOpportunities: this.deadOpportunities, connectorStats: this.connectorStats });
+      try {
+        this._lastSyncedMtimeMs = fs.statSync(this._store.filePath).mtimeMs;
+      } catch { /* ignore */ }
+    }
+    if (needPush) await this._pushNow();
+  }
+
+  /** When did this process's copy last change? Newer of the local file's mtime and our last in-memory write. */
+  _localTimestamp() {
+    let t = this._lastLocalWriteAt;
+    if (this._store) {
+      try {
+        t = Math.max(t, fs.statSync(this._store.filePath).mtimeMs);
+      } catch { /* no file yet */ }
+    }
+    return t;
+  }
 
   checkCircuit(connector, operation) {
     this._sync();
@@ -124,6 +254,15 @@ class LearningEngine {
     this._sync();
     const s = this.connectorStats[connector] || { attempts: 0, wins: 0 };
     s.attempts += 1; if (won) s.wins += 1;
+    this.connectorStats[connector] = s; this._persist();
+  }
+
+  /** A bid was ACCEPTED by the platform (the attempt itself was already counted when it was submitted). */
+  recordWin(connector) {
+    this._sync();
+    const s = this.connectorStats[connector] || { attempts: 0, wins: 0 };
+    s.wins += 1;
+    s.attempts = Math.max(s.attempts, s.wins);
     this.connectorStats[connector] = s; this._persist();
   }
 
