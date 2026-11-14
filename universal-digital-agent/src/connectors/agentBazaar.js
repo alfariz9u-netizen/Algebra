@@ -22,6 +22,13 @@ const BRIDGE_SCRIPT = path.join(__dirname, "python_bridge", "agentbazaar_bridge.
 function runBridge(command, args = {}) {
   return new Promise((resolve, reject) => {
     const proc = spawn("python3", [BRIDGE_SCRIPT, command, JSON.stringify(args)]);
+    // A hung Python process (network stall inside the SDK) used to block the whole scheduler forever.
+    const timeoutMs = Number(process.env.PYTHON_BRIDGE_TIMEOUT_MS) > 0 ? Number(process.env.PYTHON_BRIDGE_TIMEOUT_MS) : 60000;
+    let timedOut = false;
+    const killTimer = setTimeout(() => {
+      timedOut = true;
+      proc.kill("SIGKILL");
+    }, timeoutMs);
     let stdout = "";
     let stderr = "";
 
@@ -29,10 +36,13 @@ function runBridge(command, args = {}) {
     proc.stderr.on("data", (chunk) => (stderr += chunk));
 
     proc.on("error", (err) => {
+      clearTimeout(killTimer);
       reject(new Error(`Failed to launch python3 bridge: ${err.message}`));
     });
 
     proc.on("close", () => {
+      clearTimeout(killTimer);
+      if (timedOut) return reject(new Error(`agentbazaar bridge timed out after ${timeoutMs}ms.`));
       try {
         const parsed = JSON.parse(stdout.trim().split("\n").pop());
         if (parsed.error) {
@@ -65,6 +75,10 @@ class AgentBazaarAdapter {
    */
   status(operation) {
     if (operation === "fetchIncomingTasks") return "CONNECTED";
+    // submitDeliverable HIRES an agent and pays real SOL, so it needs a funded key AND an explicit opt-in.
+    if (operation === "submitDeliverable" && process.env.SOLANA_PRIVATE_KEY && String(process.env.AGENTBAZAAR_ALLOW_SPEND).toLowerCase() === "true") {
+      return "CONNECTED";
+    }
     return "CREDENTIAL_REQUIRED";
   }
 
@@ -81,6 +95,7 @@ class AgentBazaarAdapter {
     // the platform's own agents could fulfil on the client's behalf.
     return agents.map((listedAgent) => ({
       id: listedAgent.id || listedAgent.name,
+      _kind: "agent_listing", // a provider, not a job — see strategies/agentBazaar.js discover()
       type: "business_automation",
       clientLocale: "en-US",
       input: {
