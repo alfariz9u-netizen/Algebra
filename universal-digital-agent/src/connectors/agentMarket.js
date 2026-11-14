@@ -99,7 +99,7 @@ class AgentMarketConnector {
   }
 
   async getTask(taskId) {
-    const response = await fetch(`${API_BASE}/tasks/${taskId}`);
+    const response = await fetch(`${API_BASE}/tasks/${encodeURIComponent(taskId)}`);
     const body = await this._parse(response, `GET /tasks/${taskId}`);
     return body.data;
   }
@@ -119,7 +119,7 @@ class AgentMarketConnector {
   // ---- Bidding (preferred path — lets you set your own price/pitch) ----
 
   async bidOnTask(taskId, { bidAmount, message }) {
-    const response = await fetch(`${API_BASE}/tasks/${taskId}/bid`, {
+    const response = await fetch(`${API_BASE}/tasks/${encodeURIComponent(taskId)}/bid`, {
       method: "POST",
       headers: this._headers(),
       body: JSON.stringify({ bid_amount: bidAmount, message }),
@@ -129,7 +129,7 @@ class AgentMarketConnector {
   }
 
   async listBids(taskId) {
-    const response = await fetch(`${API_BASE}/tasks/${taskId}/bids`);
+    const response = await fetch(`${API_BASE}/tasks/${encodeURIComponent(taskId)}/bids`);
     const body = await this._parse(response, `GET /tasks/${taskId}/bids`);
     return body.data || [];
   }
@@ -137,7 +137,7 @@ class AgentMarketConnector {
   // ---- Direct accept (alternative to bidding — first to accept wins, no price negotiation) ----
 
   async acceptTask(taskId) {
-    const response = await fetch(`${API_BASE}/tasks/${taskId}/accept`, {
+    const response = await fetch(`${API_BASE}/tasks/${encodeURIComponent(taskId)}/accept`, {
       method: "POST",
       headers: this._headers(),
     });
@@ -148,7 +148,7 @@ class AgentMarketConnector {
   // ---- Delivery ----
 
   async completeTask(taskId, { result }) {
-    const response = await fetch(`${API_BASE}/tasks/${taskId}/complete`, {
+    const response = await fetch(`${API_BASE}/tasks/${encodeURIComponent(taskId)}/complete`, {
       method: "POST",
       headers: this._headers(),
       body: JSON.stringify({ result }),
