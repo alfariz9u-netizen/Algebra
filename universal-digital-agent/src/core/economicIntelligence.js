@@ -110,7 +110,13 @@ class EconomicIntelligence {
    * Supabase's history into memory at startup, so data survives a redeploy
    * that wipes the local disk. Supabase failures never throw out of here.
    */
-  constructor({ persistDir, encryptionKey, supabase, maxFinancialIds } = {}) {
+  constructor({ persistDir, encryptionKey, supabase, maxFinancialIds, strictRevenue = false, maxExpectedUsd } = {}) {
+    // STRICT REVENUE (UniversalAgent turns this on): revenue can ONLY come from recordPayment() (a real,
+    // confirmed payment). record() can no longer smuggle in `revenueUsd` or a fake `payment_received`, an
+    // absurd advertised reward cannot inflate the "expected" figure, and revenue persisted by older
+    // versions (which booked hopes as income) is reported separately instead of being added to profit.
+    this.strictRevenue = Boolean(strictRevenue);
+    this._maxExpectedUsd = Number(maxExpectedUsd) > 0 ? Number(maxExpectedUsd) : Number(process.env.ECONOMICS_MAX_EXPECTED_USD) > 0 ? Number(process.env.ECONOMICS_MAX_EXPECTED_USD) : 10000;
     this._maxFinancialIds = resolveMaxFinancialIds(maxFinancialIds);
     this._remote = supabase || new SupabaseState();
     this._remoteEnabled = this._remote.enabled;
@@ -205,6 +211,18 @@ class EconomicIntelligence {
    */
   record(event) {
     const entry = { ...(this._remoteEnabled ? { id: crypto.randomUUID() } : {}), timestamp: Date.now(), ...event };
+    if (this.strictRevenue) {
+      if (entry.type === "payment_received") {
+        throw new Error("economics.record: payment_received can only be written by recordPayment() (real, confirmed money).");
+      }
+      if (entry.type === "task_completed") {
+        entry.revenueUsd = 0; // delivered work is not income
+        const exp = Number(entry.expectedRevenueUsd);
+        entry.expectedRevenueUsd = Number.isFinite(exp) && exp > 0 ? Math.min(exp, this._maxExpectedUsd) : 0;
+        const cost = Number(entry.costUsd);
+        entry.costUsd = Number.isFinite(cost) && cost > 0 ? cost : 0;
+      }
+    }
     if (isIndexed(entry)) {
       const dedupeKey = financialKey(entry);
       if (this._recordedFinancialTaskIds.has(dedupeKey)) {
@@ -276,13 +294,16 @@ class EconomicIntelligence {
     const expected = r6(this.rollup.totalExpectedRevenueUsd + this._live.totalExpectedRevenueUsd);
     const actual = r6(this.rollup.totalConfirmedPaymentsUsd + this._live.totalConfirmedPaymentsUsd);
     // Money counts as revenue only once it really arrived.
-    const revenue = r6(legacyRevenue + actual);
+    // Strict mode: income persisted by pre-fix versions was an expectation booked as money — never add it to profit.
+    const revenue = this.strictRevenue ? actual : r6(legacyRevenue + actual);
 
     return {
       countsByType: byType,
       totalRevenueUsd: revenue,
       totalCostUsd: cost,
       totalProfitUsd: r6(revenue - cost),
+      // Old, unverifiable "revenue" figures (booked at submission time by earlier versions); excluded in strict mode.
+      ...(this.strictRevenue ? { legacyUnverifiedRevenueUsd: r6(legacyRevenue) } : {}),
       // Advertised rewards of delivered work: a pipeline estimate, never revenue.
       totalExpectedRevenueUsd: expected,
       // Payments really received (backed by recordPayment()).
