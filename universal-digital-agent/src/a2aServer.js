@@ -92,6 +92,21 @@ function buildAgentCard() {
   };
 }
 
+/**
+ * The rate-limit key. Behind a reverse proxy (Render) every request has the proxy's address, so one
+ * noisy caller would exhaust the bucket for everybody. When running behind a trusted proxy
+ * (A2A_TRUST_PROXY=true, or Render's RENDER env var) use the RIGHT-most X-Forwarded-For entry — the
+ * one the proxy itself appended; anything to its left is client-supplied and spoofable.
+ */
+function clientKey(req) {
+  const trust = String(process.env.A2A_TRUST_PROXY || (process.env.RENDER ? "true" : "false")).toLowerCase() === "true";
+  if (trust) {
+    const parts = String(req.headers["x-forwarded-for"] || "").split(",").map((x) => x.trim()).filter(Boolean);
+    if (parts.length) return parts[parts.length - 1];
+  }
+  return req.socket.remoteAddress || "unknown";
+}
+
 function safeEqual(a, b) {
   const bufA = Buffer.from(String(a));
   const bufB = Buffer.from(String(b));
@@ -150,8 +165,9 @@ async function handleA2aRequest(agent, rawBody, { remoteAddress = "unknown" } = 
     untrustedContent: text,
     untrustedSource: `a2a:${callerUrl || "unknown-remote-agent"}`,
     sourceConnector: "a2a-inbound",
-    // Self-reported by the caller, unverified — see HONESTY NOTE (payment) above.
-    rewardUsd: Number(params?.message?.metadata?.rewardUsd) || 0,
+    // The caller's own claim about payment is unverified. It inflated the "expected revenue" dashboard
+    // for anyone who set metadata.rewardUsd, so it is ignored unless the operator opts in.
+    rewardUsd: process.env.A2A_TRUST_CLAIMED_REWARD === "true" ? Math.max(0, Number(params?.message?.metadata?.rewardUsd) || 0) : 0,
   };
 
   let result;
@@ -234,22 +250,25 @@ function createServer(agent, { rateLimiter } = {}) {
       return send(413, { jsonrpc: "2.0", id: null, error: { code: -32000, message: `Request body too large (max ${MAX_BODY_BYTES} bytes).` } });
     }
 
-    const remoteAddress = req.socket.remoteAddress || "unknown";
+    const remoteAddress = clientKey(req);
     if (!inboundLimiter.tryConsume(remoteAddress)) {
       return send(429, { jsonrpc: "2.0", id: null, error: { code: -32000, message: "Rate limit exceeded. Slow down." } });
     }
 
-    let body = "";
+    const chunks = [];
+    let received = 0;
     let tooLarge = false;
     req.on("data", (chunk) => {
-      body += chunk;
-      if (body.length > MAX_BODY_BYTES) {
+      received += chunk.length;
+      chunks.push(chunk);
+      if (received > MAX_BODY_BYTES) {
         tooLarge = true;
         req.destroy(); // no response sent on this path — a client lying about content-length gets a reset connection, not a crafted error
       }
     });
     req.on("end", async () => {
       if (tooLarge) return;
+      const body = Buffer.concat(chunks).toString("utf8");
       try {
         send(200, await handleA2aRequest(agent, body, { remoteAddress }));
       } catch (err) {
@@ -260,10 +279,12 @@ function createServer(agent, { rateLimiter } = {}) {
   });
 }
 
-function start() {
+async function start() {
   const agent = buildAgent();
+  await agent.ready; // load durable state (Supabase) before accepting requests
   const server = createServer(agent);
-  server.listen(PORT, () => {
+  await new Promise((resolve) => server.listen(PORT, resolve));
+  {
     console.log(`A2A server listening on port ${PORT}`);
     console.log(`Agent card: ${PUBLIC_URL}/.well-known/agent-card.json`);
     if (!SHARED_SECRET) {
@@ -272,10 +293,10 @@ function start() {
           "Every request still passes through the full risk/approval/budget gate, but set a shared secret to cut down on noise/abuse."
       );
     }
-  });
+  }
   return { server, agent };
 }
 
 module.exports = { createServer, buildAgentCard, handleA2aRequest, start };
 
-if (require.main === module) start();
+if (require.main === module) start().catch((err) => { console.error("[a2aServer] fatal startup error:", err); process.exit(1); });
