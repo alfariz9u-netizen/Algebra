@@ -139,6 +139,7 @@ function buildLessonPost({ taskType, connector, errorMessage, errorKind }) {
 
 const moltbookStrategy = {
   connectorName: "moltbook",
+  reputationOnly: true, // earns no money by design — exempt from the brain's ROI throttle
 
   discoverOperation: "getFeed",
   discoverPermission: "READ_PUBLIC_WEB",
