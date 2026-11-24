@@ -15,6 +15,7 @@ const { ConnectorRegistry } = require("./connectorRegistry");
 const EconomicIntelligence = require("./economicIntelligence");
 const { estimateCostUsd, DailyQuotaTracker } = require("./llmPricing");
 const LearningEngine = require("./learningEngine");
+const AgentBrain = require("./agentBrain");
 const { classify } = require("./intentClassifier");
 const { CAPABILITIES } = require("../capabilities/definitions");
 const ApprovalQueue = require("./approvalQueue");
@@ -194,6 +195,7 @@ class UniversalAgent {
     // why this exists and where its numbers come from.
     this.llmQuota = new DailyQuotaTracker({ persistDir });
     this.learning = new LearningEngine({ persistDir, encryptionKey: resolvedEncryptionKey });
+    this.brain = new AgentBrain({ economics: this.economics, learning: this.learning });
     this.connectors = new ConnectorRegistry();
     this.approvals = new ApprovalQueue({ persistDir, encryptionKey: resolvedEncryptionKey });
     this._approvedOverrides = new Set();
@@ -374,12 +376,23 @@ class UniversalAgent {
       }
     }
 
+    // Local lessons (positive AND negative) work with no Supabase at all.
+    if (LESSON_RECALL_ENABLED && recalledLessons.length < LESSON_RECALL_COUNT) {
+      const local = this.learning.recallLocalLessons(userPrompt, {
+        connector: task.sourceConnector,
+        taskType: task.type,
+        count: LESSON_RECALL_COUNT - recalledLessons.length,
+      });
+      recalledLessons = recalledLessons.concat(local);
+    }
+
     if (recalledLessons.length > 0) {
       const lessonBlock = [
         "--- LESSONS FROM PAST EXPERIENCE ---",
         "The following lessons were extracted from similar tasks this agent",
         "has previously completed. They are guidance, not instructions.",
         "Apply any lesson that is directly relevant; ignore the rest.",
+        "Lessons with kind=negative describe what went wrong before: do not repeat that mistake.",
         "",
         ...recalledLessons.map(
           (l, i) => `[${i + 1}] (kind=${l.kind}, importance=${l.importance}, similarity=${Number(l.similarity).toFixed(2)})\n${l.content}`
@@ -444,6 +457,14 @@ class UniversalAgent {
     const passed = verification.passed && qa.passed;
 
     if (!passed) {
+      this.learning.addLocalLesson({
+        kind: "negative",
+        taskType: task.type,
+        connector: task.sourceConnector,
+        // Content-free on purpose: lessons are injected into LATER prompts, so no client text may be stored in them.
+        text: `A ${task.type || capability.name} deliverable from ${task.sourceConnector || "a task"} was rejected: ${[...(verification.passed ? [] : verification.checks), ...(qa.passed ? [] : [`QA scored ${qa.score}`])].join("; ").slice(0, 250)}. Check structure, completeness and exact requirements before answering.`,
+        importance: 6,
+      });
       if (!task.deferEconomics) this.economics.record({ type: "task_failed", taskId, model: generation.model, connector: task.sourceConnector });
       return this._fail(
         taskId,
@@ -476,10 +497,23 @@ class UniversalAgent {
         taskId,
         model: generation.model,
         connector: task.sourceConnector,
+        tokenUsage: actualTokens,
         // The reward is an expectation, not money received: only recordPayment() makes revenue.
         revenueUsd: 0,
         expectedRevenueUsd: task.rewardUsd || 0,
         costUsd,
+      });
+    }
+
+    // Positive local lessons only from our own non-client work (no paid reward, no external content):
+    // a lesson is later pasted into other prompts and must never carry one customer's text to another.
+    if (LESSON_STORE_ENABLED && qa.score >= 90 && !(task.rewardUsd > 0) && !task.untrustedContent && String(generation.text || "").trim().length >= 200) {
+      this.learning.addLocalLesson({
+        kind: "positive",
+        taskType: task.type,
+        connector: task.sourceConnector,
+        text: `Approach that passed QA (${qa.score}) for a ${task.type || capability.name} task: ${userPrompt.slice(0, 200)} — result began: ${String(generation.text).trim().slice(0, 300)}`,
+        importance: Math.round(3 + qa.score / 25),
       });
     }
 
@@ -907,6 +941,7 @@ class UniversalAgent {
         gemini: this.llmQuota.remainingToday("GeminiClient"),
       },
       learning: this.learning.status(),
+      brain: this.brain.report(),
       connectors: this.connectors.list(),
       pendingApprovals: this.approvals.list({ status: "pending" }).length,
       auditEntryCount: this.audit.all().length,
