@@ -35,6 +35,8 @@ function normalizeOpportunity(scored, sourceConnector, originalRaw) {
     estimatedModelCostUsd: scored.estimatedModelCostUsd ?? 0,
     platformFeeUsd: scored.platformFeeUsd ?? 0,
     successProbability: scored.successProbability ?? 0.5,
+    // Share of an advertised reward that really gets paid (set by the brain from confirmed payments; 1 = take it at face value).
+    realizationRate: scored.realizationRate ?? 1,
     estimatedCompletionMinutes: scored.estimatedCompletionMinutes ?? scored.estimatedEffortMinutes ?? null,
     riskLevel: scored.riskLevel || "MEDIUM",
     reputationValue: scored.reputationValue ?? 0,
@@ -62,7 +64,7 @@ function totalCost(opportunity) {
 
 function expectedValue(opportunity) {
   const reward = opportunity.rewardUsd || 0;
-  return reward * opportunity.successProbability - totalCost(opportunity);
+  return reward * opportunity.successProbability * (opportunity.realizationRate ?? 1) - totalCost(opportunity);
 }
 
 /**
