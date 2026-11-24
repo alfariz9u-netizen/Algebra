@@ -58,7 +58,8 @@ function legacyEventId(e, occurrence) {
   return `${h.slice(0, 8)}-${h.slice(8, 12)}-4${h.slice(13, 16)}-8${h.slice(17, 20)}-${h.slice(20, 32)}`;
 }
 
-const emptyRollup = () => ({ countsByType: {}, totalRevenueUsd: 0, totalCostUsd: 0, totalExpectedRevenueUsd: 0, totalConfirmedPaymentsUsd: 0 });
+const emptyRollup = () => ({ countsByType: {}, totalRevenueUsd: 0, totalCostUsd: 0, totalExpectedRevenueUsd: 0, totalConfirmedPaymentsUsd: 0, byConnector: {} });
+const emptyConnectorStats = () => ({ completed: 0, failed: 0, costUsd: 0, tokens: 0, expectedUsd: 0, paidUsd: 0 });
 
 // The idempotency index (`_recordedFinancialTaskIds`) is a Map of
 // "<type>:<taskId>" -> event timestamp, in insertion order, capped at
@@ -132,6 +133,7 @@ class EconomicIntelligence {
     // Older persisted rollups won't have these two fields — default them.
     this.rollup.totalExpectedRevenueUsd = this.rollup.totalExpectedRevenueUsd || 0;
     this.rollup.totalConfirmedPaymentsUsd = this.rollup.totalConfirmedPaymentsUsd || 0;
+    this.rollup.byConnector = this.rollup.byConnector || {};
 
     // Incremental mirror of whatever is currently in `this.events`, kept in
     // sync by record()/prune() so summary() never has to rescan events.
@@ -260,6 +262,11 @@ class EconomicIntelligence {
     if (typeof amountUsd !== "number" || !Number.isFinite(amountUsd) || !(amountUsd > 0)) {
       throw new Error(`economics.recordPayment: amountUsd must be a positive number, got ${amountUsd}.`);
     }
+    // Stamp the connector now: once the task's own event is pruned, the link would be lost for good.
+    if (!connector) {
+      const done = this.events.find((e) => e.type === "task_completed" && e.taskId === taskId && e.connector);
+      if (done) connector = done.connector;
+    }
     const dupe = { duplicate: true, type: "payment_received", taskId };
     if (txSignature && this._recordedTxSignatures.has(txSignature)) return { ...dupe, txSignature };
     const entry = {
@@ -314,14 +321,74 @@ class EconomicIntelligence {
     };
   }
 
-  /** Which connector/platform has the best average profit (based on currently-retained detail only — rolled-up events lose per-platform breakdown by design, since only the totals are preserved). */
+  /**
+   * Per-connector scoreboard built ONLY from facts: delivered work, cost, tokens, the advertised
+   * reward ("expected" — a hope, never income) and money that really arrived (payment_received).
+   * Lifetime totals survive pruning through `rollup.byConnector`.
+   *
+   * `graceMs`: expected revenue younger than this is "not yet due" and is excluded from
+   * `matureExpectedUsd`, so a task delivered a minute ago is not counted as "never paid".
+   * A payment is attributed to the connector of its own event, or else of the task it settles.
+   */
+  connectorPerformance({ graceMs = Number(process.env.PAYMENT_GRACE_MS || 3 * 24 * 60 * 60 * 1000), now = Date.now() } = {}) {
+    const out = {};
+    const get = (c) => (out[c] = out[c] || { ...emptyConnectorStats(), matureExpectedUsd: 0 });
+    for (const [c, r] of Object.entries(this.rollup.byConnector || {})) {
+      const o = get(c);
+      for (const k of Object.keys(emptyConnectorStats())) o[k] += r[k] || 0;
+      o.matureExpectedUsd += r.expectedUsd || 0; // rolled-up events are old by definition
+    }
+    const connectorOfTask = new Map();
+    for (const e of this.events) if (e.type === "task_completed" && e.taskId && e.connector) connectorOfTask.set(e.taskId, e.connector);
+    for (const e of this.events) {
+      if (e.type === "task_completed" && e.connector) {
+        const o = get(e.connector);
+        o.completed += 1;
+        o.costUsd += e.costUsd || 0;
+        o.tokens += e.tokenUsage || 0;
+        o.expectedUsd += e.expectedRevenueUsd || 0;
+        if (now - e.timestamp >= graceMs) o.matureExpectedUsd += e.expectedRevenueUsd || 0;
+      } else if (e.type === "task_failed" && e.connector) {
+        get(e.connector).failed += 1;
+      } else if (e.type === "payment_received") {
+        const c = e.connector || connectorOfTask.get(e.taskId);
+        if (c) get(c).paidUsd += e.amountUsd || 0;
+      }
+    }
+    for (const o of Object.values(out)) {
+      for (const k of Object.keys(o)) o[k] = r6(o[k]);
+      o.profitUsd = r6(o.paidUsd - o.costUsd);
+      o.realizationRate = o.matureExpectedUsd > 0 ? r6(Math.min(1, o.paidUsd / o.matureExpectedUsd)) : null;
+    }
+    return out;
+  }
+
+  /** Expected revenue that is past its grace period with no matching payment — a hope that did not come true. */
+  overdueExpectedUsd({ graceMs = Number(process.env.PAYMENT_GRACE_MS || 3 * 24 * 60 * 60 * 1000), now = Date.now() } = {}) {
+    const paidTasks = new Set(this.events.filter((e) => e.type === "payment_received" && e.taskId).map((e) => e.taskId));
+    let total = 0;
+    for (const e of this.events) {
+      if (e.type !== "task_completed" || !(e.expectedRevenueUsd > 0)) continue;
+      if (now - e.timestamp >= graceMs && !paidTasks.has(e.taskId)) total += e.expectedRevenueUsd;
+    }
+    return r6(total);
+  }
+
+  /** Which connector/platform has the best average REAL profit (confirmed payments minus cost). */
   bestPlatform() {
     const byPlatform = {};
-    for (const e of this.events) {
-      if (e.type !== "task_completed" || !e.connector) continue;
-      byPlatform[e.connector] = byPlatform[e.connector] || { profit: 0, count: 0 };
-      byPlatform[e.connector].profit += (e.revenueUsd || 0) - (e.costUsd || 0);
-      byPlatform[e.connector].count += 1;
+    for (const [connector, p] of Object.entries(this.connectorPerformance())) {
+      if (!p.completed) continue;
+      byPlatform[connector] = { profit: p.paidUsd - p.costUsd, count: p.completed };
+    }
+    // legacy (pre-strict) revenue booked on the event itself still counts for non-strict ledgers
+    if (!this.strictRevenue) {
+      for (const e of this.events) {
+        if (e.type === "task_completed" && e.connector && e.revenueUsd) {
+          byPlatform[e.connector] = byPlatform[e.connector] || { profit: 0, count: 0 };
+          byPlatform[e.connector].profit += e.revenueUsd;
+        }
+      }
     }
     let best = null;
     for (const [connector, stats] of Object.entries(byPlatform)) {
@@ -373,7 +440,16 @@ class EconomicIntelligence {
       kept = kept.slice(-maxEntries);
     }
 
+    const connectorOfTask = new Map();
+    for (const e of this.events) if (e.type === "task_completed" && e.taskId && e.connector) connectorOfTask.set(e.taskId, e.connector);
     for (const e of toRemove) {
+      const rc = e.connector || (e.type === "payment_received" ? connectorOfTask.get(e.taskId) : undefined);
+      if (rc) {
+        const b = (this.rollup.byConnector[rc] = this.rollup.byConnector[rc] || emptyConnectorStats());
+        if (e.type === "task_completed") { b.completed += 1; b.costUsd += e.costUsd || 0; b.tokens += e.tokenUsage || 0; b.expectedUsd += e.expectedRevenueUsd || 0; }
+        else if (e.type === "task_failed") b.failed += 1;
+        else if (e.type === "payment_received") b.paidUsd += e.amountUsd || 0;
+      }
       this.rollup.countsByType[e.type] = (this.rollup.countsByType[e.type] || 0) + 1;
       if (e.type === "task_completed") {
         this.rollup.totalRevenueUsd += e.revenueUsd || 0;
