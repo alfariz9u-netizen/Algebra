@@ -5,9 +5,24 @@ const { JsonFileStore } = require("./persistence/fileStore");
 const { SupabaseState, WriteBehindQueue } = require("./persistence/supabaseState");
 
 // Rows of the Supabase `learning_state` table (key -> jsonb value).
-const REMOTE_KEYS = ["circuits", "deadOpportunities", "connectorStats"];
+const REMOTE_KEYS = ["circuits", "deadOpportunities", "connectorStats", "contentFingerprints", "lessons"];
 
-function freshState() { return { circuits: {}, deadOpportunities: {}, connectorStats: {} }; }
+function freshState() { return { circuits: {}, deadOpportunities: {}, connectorStats: {}, contentFingerprints: {}, lessons: [] }; }
+
+const MAX_FINGERPRINTS = Number(process.env.LEARNING_MAX_FINGERPRINTS || 5000);
+const MAX_LOCAL_LESSONS = Number(process.env.LEARNING_MAX_LOCAL_LESSONS || 200);
+
+/**
+ * Order- and noise-insensitive fingerprint of a listing's text: the same job re-posted under a new id
+ * (or with a different timestamp/number in the title) maps to the same value, so it is not drafted —
+ * and paid for in tokens — a second time. Returns null for text too short to identify anything.
+ */
+function contentFingerprint(text) {
+  const tokens = String(text || "").toLowerCase().replace(/[0-9]+/g, " ").split(/[^\p{L}]+/u).filter((w) => w.length > 2);
+  if (tokens.length < 4) return null;
+  const uniq = [...new Set(tokens)].sort();
+  return require("node:crypto").createHash("sha1").update(uniq.join(" ")).digest("hex").slice(0, 20);
+}
 
 function classifyError(err) {
   const msg = String((err && err.message) || err || "");
@@ -65,6 +80,8 @@ class LearningEngine {
     this.circuits = { ...(s.circuits || {}) };
     this.deadOpportunities = { ...(s.deadOpportunities || {}) };
     this.connectorStats = { ...(s.connectorStats || {}) };
+    this.contentFingerprints = { ...(s.contentFingerprints || {}) };
+    this.lessons = Array.isArray(s.lessons) ? [...s.lessons] : [];
   }
   // FIX (performance, optional): _sync() used to do a full file read +
   // JSON.parse (+ decrypt, when PERSIST_ENCRYPTION_KEY is set) on EVERY
@@ -94,10 +111,15 @@ class LearningEngine {
     this.circuits = { ...(s.circuits || {}) };
     this.deadOpportunities = { ...(s.deadOpportunities || {}) };
     this.connectorStats = { ...(s.connectorStats || {}) };
+    this.contentFingerprints = { ...(s.contentFingerprints || {}) };
+    this.lessons = Array.isArray(s.lessons) ? [...s.lessons] : [];
+  }
+  _snapshot() {
+    return { circuits: this.circuits, deadOpportunities: this.deadOpportunities, connectorStats: this.connectorStats, contentFingerprints: this.contentFingerprints, lessons: this.lessons };
   }
   _persist() {
     if (this._store) {
-      this._store.save({ circuits: this.circuits, deadOpportunities: this.deadOpportunities, connectorStats: this.connectorStats });
+      this._store.save(this._snapshot());
       try {
         this._lastSyncedMtimeMs = fs.statSync(this._store.filePath).mtimeMs; // our own write is not a foreign change
       } catch { /* ignore */ }
@@ -169,19 +191,19 @@ class LearningEngine {
     for (const key of REMOTE_KEYS) {
       const row = rows.find((r) => r.key === key);
       if (!row) {
-        if (Object.keys(this[key]).length > 0) needPush = true; // Supabase has none of this yet
+        if (Object.keys(this[key]).length > 0) needPush = true; // (arrays: length via keys too) // Supabase has none of this yet
         continue;
       }
       const remoteTs = new Date(row.updated_at).getTime() || 0;
       if (remoteTs >= localTs) {
-        this[key] = { ...(row.value || {}) };
+        this[key] = Array.isArray(this[key]) ? (Array.isArray(row.value) ? row.value : []) : { ...(row.value || {}) };
         adopted = true;
       } else {
         needPush = true; // our copy is newer (e.g. recorded while Supabase was down)
       }
     }
     if (adopted && this._store) {
-      this._store.save({ circuits: this.circuits, deadOpportunities: this.deadOpportunities, connectorStats: this.connectorStats });
+      this._store.save(this._snapshot());
       try {
         this._lastSyncedMtimeMs = fs.statSync(this._store.filePath).mtimeMs;
       } catch { /* ignore */ }
@@ -273,6 +295,78 @@ class LearningEngine {
     return Math.min(0.99, Math.max(0.01, r));
   }
 
+  // ---- Content-level duplicate guard ---------------------------------------
+
+  /** Has a listing with this (normalized) text already been handled on this connector? */
+  isContentSeen(connector, text) {
+    this._sync();
+    const fp = contentFingerprint(text);
+    return !!(fp && this.contentFingerprints[`${connector}::${fp}`]);
+  }
+
+  markContentSeen(connector, text, id) {
+    this._sync();
+    const fp = contentFingerprint(text);
+    if (!fp) return false;
+    this.contentFingerprints[`${connector}::${fp}`] = { at: this._now(), id: id == null ? null : String(id) };
+    const keys = Object.keys(this.contentFingerprints);
+    if (keys.length > MAX_FINGERPRINTS) {
+      keys.sort((a, b) => this.contentFingerprints[a].at - this.contentFingerprints[b].at)
+        .slice(0, keys.length - MAX_FINGERPRINTS)
+        .forEach((k) => delete this.contentFingerprints[k]);
+    }
+    this._persist();
+    return true;
+  }
+
+  /** Splits opportunities into new ones and re-posts of listings already handled (same text, new id). */
+  partitionDuplicateContent(connector, opps, textOf) {
+    this._sync();
+    const fresh = [], duplicates = [];
+    const batch = new Set();
+    for (const o of opps) {
+      const fp = contentFingerprint(textOf(o));
+      const dup = fp && (this.contentFingerprints[`${connector}::${fp}`] || batch.has(fp));
+      if (dup) duplicates.push(o); else { fresh.push(o); if (fp) batch.add(fp); }
+    }
+    return { fresh, duplicates };
+  }
+
+  // ---- Local lessons (work without Supabase; positive AND negative) ----------
+
+  /**
+   * kind "positive": an approach that passed QA/was accepted. kind "negative": what failed and why.
+   * Identical lessons are merged (hits++) instead of stored again; the store is bounded.
+   */
+  addLocalLesson({ kind = "positive", taskType, connector, text, importance = 5 } = {}) {
+    const body = String(text || "").trim().slice(0, 700);
+    if (body.length < 20) return { stored: false, reason: "too short" };
+    this._sync();
+    const dup = this.lessons.find((l) => l.kind === kind && l.connector === (connector || null) && l.taskType === (taskType || null) && jaccard(l.text, body) > 0.85);
+    if (dup) { dup.hits = (dup.hits || 1) + 1; dup.importance = Math.min(10, Math.max(dup.importance, importance)); dup.at = this._now(); this._persist(); return { stored: false, merged: true, id: dup.id }; }
+    const id = `L${this._now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+    this.lessons.push({ id, kind, taskType: taskType || null, connector: connector || null, text: body, importance, hits: 1, at: this._now() });
+    if (this.lessons.length > MAX_LOCAL_LESSONS) {
+      this.lessons.sort((a, b) => (b.importance + Math.log2(1 + (b.hits || 1))) - (a.importance + Math.log2(1 + (a.hits || 1))) || b.at - a.at);
+      this.lessons.length = MAX_LOCAL_LESSONS;
+    }
+    this._persist();
+    return { stored: true, id };
+  }
+
+  recallLocalLessons(query, { connector, taskType, count = 3, minSimilarity = 0.12 } = {}) {
+    this._sync();
+    const q = String(query || "");
+    if (!q.trim() || !this.lessons.length) return [];
+    return this.lessons
+      .filter((l) => (!connector || !l.connector || l.connector === connector) && (!taskType || !l.taskType || l.taskType === taskType))
+      .map((l) => ({ l, sim: jaccard(q, l.text) }))
+      .filter((x) => x.sim >= minSimilarity)
+      .sort((a, b) => (b.sim * (1 + b.l.importance / 10)) - (a.sim * (1 + a.l.importance / 10)))
+      .slice(0, count)
+      .map(({ l, sim }) => ({ id: l.id, content: l.text, kind: l.kind, importance: l.importance, similarity: sim, local: true }));
+  }
+
   async rememberTaskOutcome(supabase, { taskType, connector, capability, outcome, rewardUsd } = {}) {
     if (!supabase || supabase.status() !== "CONNECTED") return { stored: false, reason: "supabase not connected" };
     if (!outcome || outcome.status !== "success") return { stored: false, reason: "not successful" };
@@ -361,9 +455,10 @@ class LearningEngine {
 
   status() {
     this._sync();
-    return { circuits: this.circuits, deadOpportunityCount: Object.keys(this.deadOpportunities).length, connectorStats: this.connectorStats };
+    return { circuits: this.circuits, deadOpportunityCount: Object.keys(this.deadOpportunities).length, connectorStats: this.connectorStats, knownContentCount: Object.keys(this.contentFingerprints).length, localLessonCount: this.lessons.length };
   }
 }
 
 module.exports = LearningEngine;
 module.exports.classifyError = classifyError;
+module.exports.contentFingerprint = contentFingerprint;
