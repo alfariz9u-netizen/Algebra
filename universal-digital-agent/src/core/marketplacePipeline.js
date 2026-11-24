@@ -66,6 +66,32 @@ class MarketplacePipeline {
     return { needsApproval, riskLevel: riskEngine.classify(permissionAction) };
   }
 
+  /** Texts that identify a listing across re-posts (title/description fields vary by platform). */
+  _listingText(opp) {
+    const r = (opp && opp.raw) || {};
+    return [r.title, r.name, r.summary, r.description, r.body, r.content, r.spec].filter((v) => typeof v === "string").join(" ").slice(0, 2000);
+  }
+
+  /** Never process this listing again — neither by id nor by content when it comes back with a new id. */
+  _retire(strategy, opportunity, reason) {
+    if (!this.learning) return;
+    this.learning.markOpportunityDead(strategy.connectorName, opportunity.id, reason);
+    this.learning.markContentSeen(strategy.connectorName, this._listingText(opportunity), opportunity.id);
+  }
+
+  /** Record what went wrong as a lesson so the next similar task is not drafted the same way (no LLM involved). */
+  _learnFromFailure(strategy, task, reason) {
+    if (!this.learning || !this.learning.addLocalLesson) return;
+    // Content-free: only the task type, connector and failure reason (lessons are pasted into later prompts).
+    this.learning.addLocalLesson({
+      kind: "negative",
+      taskType: task && task.type,
+      connector: strategy.connectorName,
+      text: `A ${(task && task.type) || "task"} from ${strategy.connectorName} failed: ${String(reason).slice(0, 200)}. Do not repeat the same approach; check the exact requirements first.`,
+      importance: 6,
+    });
+  }
+
   async _shareLearning(connectorName, task, outcome) {
     if (this.agent.connectors.status("colony") !== "CONNECTED") {
       return { shared: false, reason: "colony not connected" };
@@ -139,6 +165,15 @@ class MarketplacePipeline {
       return { status: "skipped_circuit_open", stage: "submit", ...submitGate };
     }
 
+    // The brain decides — from REAL paid results — whether this connector deserves tokens this cycle.
+    const brain = this.agent.brain;
+    const plan = brain
+      ? brain.planCycle(strategy, { maxOpportunities, minExpectedValue })
+      : { run: true, maxOpportunities, minExpectedValue, realizationRate: 1, mode: "no_brain", reason: "" };
+    if (!plan.run) return { status: "skipped_low_roi", stage: "plan", mode: plan.mode, reason: plan.reason };
+    maxOpportunities = plan.maxOpportunities;
+    minExpectedValue = plan.minExpectedValue;
+
     let rawList;
     try {
       rawList = await this.agent.callConnector(
@@ -177,6 +212,10 @@ class MarketplacePipeline {
     for (const opp of opportunities) {
       this.agent.economics.record({ type: "task_discovered", connector: strategy.connectorName });
       if (this.learning) opp.successProbability = this.learning.calibratedSuccessProbability(strategy.connectorName, opp.successProbability);
+      if (brain) {
+        opp.realizationRate = plan.realizationRate; // an advertised reward is a hope: discount by what this connector really pays
+        if (!opp.estimatedModelCostUsd) opp.estimatedModelCostUsd = brain.avgCostUsd(strategy.connectorName);
+      }
     }
 
     const { accepted, rejected } = rankOpportunities(opportunities, { minExpectedValue });
@@ -193,8 +232,13 @@ class MarketplacePipeline {
       ? this.learning.partitionKnownDead(strategy.connectorName, accepted)
       : { toProcess: accepted, skipped: [] };
 
+    // Same listing re-posted under a new id (or twice in one batch): never draft it again.
+    const { fresh, duplicates } = this.learning
+      ? this.learning.partitionDuplicateContent(strategy.connectorName, toProcess, (o) => this._listingText(o))
+      : { fresh: toProcess, duplicates: [] };
+
     const results = [];
-    for (const opp of toProcess.slice(0, maxOpportunities)) {
+    for (const opp of fresh.slice(0, maxOpportunities)) {
       results.push(await this._processOpportunity(strategy, opp));
     }
 
@@ -204,6 +248,8 @@ class MarketplacePipeline {
       accepted: accepted.length,
       rejected: rejected.length,
       skippedKnownDead: skipped.length,
+      skippedDuplicateContent: duplicates.length,
+      plan: { mode: plan.mode, maxOpportunities, realizationRate: plan.realizationRate },
       malformed,
       results,
     };
@@ -217,7 +263,7 @@ class MarketplacePipeline {
       task = await strategy.toTask(opportunity.raw); // may be async (AgenC fetches the job spec)
     } catch (err) {
       this.agent.economics.record({ type: "task_failed", connector: strategy.connectorName });
-      if (this.learning) this.learning.markOpportunityDead(strategy.connectorName, opportunity.id, `toTask failed: ${err.message}`);
+      this._retire(strategy, opportunity, `toTask failed: ${err.message}`);
       return { opportunity, outcome: { status: "failed", reason: `toTask failed: ${err.message}` } };
     }
     // The task carries what the economics ledger needs. `deferEconomics` means: processTask() must NOT
@@ -229,13 +275,14 @@ class MarketplacePipeline {
     const outcome = await this.agent.processTask(task);
 
     if (outcome.status === "pending_human_approval") {
-      if (this.learning) this.learning.markOpportunityDead(strategy.connectorName, opportunity.id, "awaiting/resolved via human approval queue — never re-drafted once queued");
+      this._retire(strategy, opportunity, "awaiting/resolved via human approval queue — never re-drafted once queued");
       return { opportunity, outcome, submission: { status: "pending_human_approval", riskLevel: outcome.riskLevel } };
     }
 
     if (outcome.status !== "success") {
       this.agent.economics.record({ type: "task_failed", taskId: task.id, connector: strategy.connectorName });
-      if (this.learning) this.learning.markOpportunityDead(strategy.connectorName, opportunity.id, `verification/QA failed: ${outcome.reason || "unknown"}`);
+      this._retire(strategy, opportunity, `verification/QA failed: ${outcome.reason || "unknown"}`);
+      this._learnFromFailure(strategy, task, outcome.reason || "verification/QA failed");
       return { opportunity, outcome };
     }
 
@@ -260,7 +307,7 @@ class MarketplacePipeline {
         this.learning.recordAttempt(strategy.connectorName, { won: strategy.submitKind === "delivery" });
         // Same listing next cycle? Never again: it used to be re-submitted every 30 minutes (spam, wasted
         // LLM calls, and a ban risk) for every strategy without its own memory.
-        this.learning.markOpportunityDead(strategy.connectorName, opportunity.id, "submitted");
+        this._retire(strategy, opportunity, "submitted");
       }
 
       this.agent.economics.record({
@@ -268,6 +315,7 @@ class MarketplacePipeline {
         taskId: task.id,
         connector: strategy.connectorName,
         model: outcome.meta?.model,
+        tokenUsage: outcome.meta?.tokenUsage || 0,
         revenueUsd: 0, // real money is recorded by recordPayment() only
         // A bid is an offer, not delivered work: only direct deliveries count as "owed to us".
         expectedRevenueUsd: strategy.submitKind === "delivery" ? opportunity.rewardUsd || 0 : 0,
@@ -282,7 +330,8 @@ class MarketplacePipeline {
       if (this.learning) {
         this.learning.recordAttempt(strategy.connectorName, { won: false });
         const failure = this.learning.recordFailure(strategy.connectorName, strategy.submitOperation, err);
-        if (failure.perListing) this.learning.markOpportunityDead(strategy.connectorName, opportunity.id, err.message);
+        if (failure.perListing) this._retire(strategy, opportunity, err.message);
+        if (failure.perListing) this._learnFromFailure(strategy, task, err.message);
       }
       return { opportunity, outcome, submissionError: err.message };
     }
@@ -359,6 +408,7 @@ class MarketplacePipeline {
         taskId: task.id,
         connector: connectorName,
         model: outcome.meta?.model,
+        tokenUsage: outcome.meta?.tokenUsage || 0,
         revenueUsd: 0,
         expectedRevenueUsd: job.budget_usdc || 0,
         costUsd: outcome.meta?.costUsd ?? 0,
